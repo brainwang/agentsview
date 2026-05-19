@@ -104,6 +104,10 @@ patch_tauri_version() {
   local semver
   semver="$(version_to_semver "$version")"
   if [ -z "$semver" ]; then
+    if [ -n "${AGENTSVIEW_VERSION:-}" ]; then
+      echo "Error: AGENTSVIEW_VERSION is set to invalid version: '$AGENTSVIEW_VERSION'. Must be valid semver (e.g., 0.30.0)." >&2
+      exit 1
+    fi
     echo "Skipping tauri.conf.json version patch (non-tag build: $version)"
     return 0
   fi
