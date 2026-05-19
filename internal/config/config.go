@@ -183,7 +183,8 @@ func Default() (Config, error) {
 		agentDirSource:                 agentDirSource,
 		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next"},
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
-		EventsCoalesceInterval:         10 * time.Second,
+		DisableUpdateCheck:              true,
+		EventsCoalesceInterval:          10 * time.Second,
 	}, nil
 }
 
