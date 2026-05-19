@@ -1,6 +1,10 @@
 # codefree-o-agent
 
-## ADDED Requirements
+## Purpose
+
+Support codefree-o (a fork of opencode with different default paths and SQLite database) as a first-class agent type in agentsview, including session file discovery, parsing, sync engine dispatch, file watching, frontend display, session resume, and configuration.
+
+## Requirements
 
 ### Requirement: Agent type registration
 The system SHALL register `codefree-o` as a supported agent type in the parser registry with the type identifier `"codefree-o"`.
@@ -61,7 +65,7 @@ The sync engine SHALL handle codefree-o sessions in all relevant dispatch points
 
 #### Scenario: DB-backed sync
 - **WHEN** `SyncAll` runs and codefree-o directories are configured
-- **THEN** codefree-o SQLite databases SHALL be synchronized in the DB-backed phase, after opencode and before Warp
+- **THEN** codefree-o SQLite databases SHALL be synchronized in the DB-backed phase, after Piebald and before LinkSubagentSessions
 
 #### Scenario: Single session re-sync
 - **WHEN** a session with prefix `"codefree-o:"` triggers a single-session re-sync

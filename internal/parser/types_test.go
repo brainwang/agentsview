@@ -232,6 +232,12 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"codefree-o prefix",
+			"codefree-o:sess-id",
+			AgentCodefreeO,
+			true,
+		},
+		{
 			"unknown prefix",
 			"future:sess-id",
 			"",

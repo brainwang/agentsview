@@ -42,7 +42,7 @@
 ## 7. Verification
 
 - [x] 7.1 Run `go build ./...` to verify backend compiles
-- [ ] 7.2 Check frontend TypeScript compiles without errors (requires `npm install` in frontend/)
+- [x] 7.2 Check frontend TypeScript compiles without errors
 - [ ] 7.3 Test UI renders codefree-o sessions with correct label and color (manual)
 - [ ] 7.4 Verify resume command generates `codefree-o --session <id>` (manual)
 
