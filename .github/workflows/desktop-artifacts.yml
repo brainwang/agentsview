@@ -27,36 +27,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: macOS (aarch64)
-            os: macos-15
-            bundle: app
-            target_triple: aarch64-apple-darwin
-            artifact_name: agentsview-desktop-macos-aarch64
-            artifact_dir: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
-          - name: macOS (x86_64)
-            os: macos-15
-            bundle: app
-            target_triple: x86_64-apple-darwin
-            artifact_name: agentsview-desktop-macos-x86_64
-            artifact_dir: desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/macos/
+          # - name: macOS (aarch64)
+          #   os: macos-15
+          #   bundle: app
+          #   target_triple: aarch64-apple-darwin
+          #   artifact_name: agentsview-desktop-macos-aarch64
+          #   artifact_dir: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
+          # - name: macOS (x86_64)
+          #   os: macos-15
+          #   bundle: app
+          #   target_triple: x86_64-apple-darwin
+          #   artifact_name: agentsview-desktop-macos-x86_64
+          #   artifact_dir: desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/macos/
           - name: Windows
             os: windows-latest
             bundle: nsis
             target_triple: ""
             artifact_name: agentsview-desktop-windows
             artifact_dir: desktop/src-tauri/target/release/bundle/nsis/
-          - name: Linux
-            os: ubuntu-22.04
-            bundle: appimage
-            target_triple: ""
-            artifact_name: agentsview-desktop-linux
-            artifact_dir: desktop/src-tauri/target/release/bundle/appimage/
-          - name: Linux (arm64)
-            os: ubuntu-22.04-arm
-            bundle: appimage
-            target_triple: aarch64-unknown-linux-gnu
-            artifact_name: agentsview-desktop-linux-arm64
-            artifact_dir: desktop/src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/
+          # - name: Linux
+          #   os: ubuntu-22.04
+          #   bundle: appimage
+          #   target_triple: ""
+          #   artifact_name: agentsview-desktop-linux
+          #   artifact_dir: desktop/src-tauri/target/release/bundle/appimage/
+          # - name: Linux (arm64)
+          #   os: ubuntu-22.04-arm
+          #   bundle: appimage
+          #   target_triple: aarch64-unknown-linux-gnu
+          #   artifact_name: agentsview-desktop-linux-arm64
+          #   artifact_dir: desktop/src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
