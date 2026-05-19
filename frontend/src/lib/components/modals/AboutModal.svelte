@@ -59,6 +59,10 @@
         <span class="about-label">Author</span>
         <span class="about-value">Wes McKinney</span>
       </div>
+      <div class="about-row">
+        <span class="about-label"></span>
+        <span class="about-value">Bow (Codefree)</span>
+      </div>
       {#if sync.serverVersion}
         <div class="about-row">
           <span class="about-label">Version</span>
