@@ -17,6 +17,7 @@
     openclaw: "OpenClaw",
     kimi: "Kimi",
     piebald: "Piebald",
+    "codefree-o": "Codefree-O",
   };
 </script>
 

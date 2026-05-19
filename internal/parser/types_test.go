@@ -287,6 +287,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentPiebald,
 		AgentWarp,
 		AgentPositron,
+		AgentCodefreeO,
 	}
 
 	registered := make(map[AgentType]bool)

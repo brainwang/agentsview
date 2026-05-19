@@ -17,6 +17,8 @@ RESUME_AGENTS["opencode"] = (id) =>
   `opencode --session ${shellQuote(id)}`;
 RESUME_AGENTS["amp"] = (id) =>
   `amp --resume ${shellQuote(id)}`;
+RESUME_AGENTS["codefree-o"] = (id) =>
+  `codefree-o --session ${shellQuote(id)}`;
 
 /**
  * Agents whose resume commands require server-resolved parameters

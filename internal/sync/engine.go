@@ -438,6 +438,11 @@ func (e *Engine) classifyOnePath(
 	); ok {
 		return df, true
 	}
+	if df, ok := e.classifyCodefreeOPath(
+		path, pathExists,
+	); ok {
+		return df, true
+	}
 	if !pathExists {
 		return parser.DiscoveredFile{}, false
 	}
@@ -991,6 +996,142 @@ func (e *Engine) classifyOpenCodePath(
 			return parser.DiscoveredFile{
 				Path:  sessionPath,
 				Agent: parser.AgentOpenCode,
+			}, true
+		}
+	}
+	return parser.DiscoveredFile{}, false
+}
+
+func (e *Engine) classifyCodefreeOPath(
+	path string, pathExists bool,
+) (parser.DiscoveredFile, bool) {
+	sep := string(filepath.Separator)
+
+	// codefree-o storage:
+	//   <codefreeoDir>/.local/share/storage/session/<project>/<session>.json
+	//   <codefreeoDir>/.local/share/storage/message/<session>/<message>.json
+	//   <codefreeoDir>/.local/share/storage/part/<message>/<part>.json
+	for _, cfoDir := range e.agentDirs[parser.AgentCodefreeO] {
+		if cfoDir == "" {
+			continue
+		}
+		rel, ok := isUnder(cfoDir, path)
+		if !ok {
+			continue
+		}
+		base := filepath.Base(rel)
+		relSlash := filepath.ToSlash(rel)
+		if relSlash == ".local/share/codefree.db" ||
+			strings.HasPrefix(base, "codefree.db-") {
+			dbPath := filepath.Join(cfoDir, ".local", "share", "codefree.db")
+			if info, err := os.Stat(dbPath); err == nil &&
+				!info.IsDir() {
+				return parser.DiscoveredFile{
+					Path:  dbPath,
+					Agent: parser.AgentCodefreeO,
+				}, true
+			}
+			continue
+		}
+		if parser.ResolveCodefreeOSource(cfoDir).Mode !=
+			parser.CodefreeoSourceStorage {
+			continue
+		}
+		parts := strings.Split(rel, sep)
+		switch {
+		case pathExists &&
+			len(parts) == 6 &&
+			parts[0] == ".local" &&
+			parts[1] == "share" &&
+			parts[2] == "storage" &&
+			parts[3] == "session" &&
+			strings.HasSuffix(parts[5], ".json"):
+			return parser.DiscoveredFile{
+				Path:  path,
+				Agent: parser.AgentCodefreeO,
+			}, true
+		case len(parts) == 6 &&
+			parts[0] == ".local" &&
+			parts[1] == "share" &&
+			parts[2] == "storage" &&
+			parts[3] == "message" &&
+			strings.HasSuffix(parts[5], ".json"):
+			sessionPath := parser.FindCodefreeOSourceFile(
+				cfoDir, parts[4],
+			)
+			if sessionPath == "" {
+				continue
+			}
+			return parser.DiscoveredFile{
+				Path:  sessionPath,
+				Agent: parser.AgentCodefreeO,
+			}, true
+		case len(parts) == 6 &&
+			parts[0] == ".local" &&
+			parts[1] == "share" &&
+			parts[2] == "storage" &&
+			parts[3] == "part" &&
+			strings.HasSuffix(parts[5], ".json"):
+			sessionID := ""
+			if pathExists {
+				sessionID = readCodefreeoStorageSessionID(path)
+			}
+			if sessionID == "" {
+				sessionID =
+					findCodefreeoStorageSessionIDByMessageID(
+						cfoDir, parts[5],
+					)
+			}
+			if sessionID == "" {
+				continue
+			}
+			sessionPath := parser.FindCodefreeOSourceFile(
+				cfoDir, sessionID,
+			)
+			if sessionPath == "" {
+				continue
+			}
+			return parser.DiscoveredFile{
+				Path:  sessionPath,
+				Agent: parser.AgentCodefreeO,
+			}, true
+		case !pathExists &&
+			len(parts) == 5 &&
+			parts[0] == ".local" &&
+			parts[1] == "share" &&
+			parts[2] == "storage" &&
+			parts[3] == "message":
+			sessionPath := parser.FindCodefreeOSourceFile(
+				cfoDir, parts[4],
+			)
+			if sessionPath == "" {
+				continue
+			}
+			return parser.DiscoveredFile{
+				Path:  sessionPath,
+				Agent: parser.AgentCodefreeO,
+			}, true
+		case !pathExists &&
+			len(parts) == 5 &&
+			parts[0] == ".local" &&
+			parts[1] == "share" &&
+			parts[2] == "storage" &&
+			parts[3] == "part":
+			sessionID := findCodefreeoStorageSessionIDByMessageID(
+				cfoDir, parts[4],
+			)
+			if sessionID == "" {
+				continue
+			}
+			sessionPath := parser.FindCodefreeOSourceFile(
+				cfoDir, sessionID,
+			)
+			if sessionPath == "" {
+				continue
+			}
+			return parser.DiscoveredFile{
+				Path:  sessionPath,
+				Agent: parser.AgentCodefreeO,
 			}, true
 		}
 	}
@@ -1797,8 +1938,67 @@ func (e *Engine) syncAllLocked(
 		return stats
 	}
 
+	// Sync codefree-o sessions (DB-backed, not file-based).
+	tCFO := time.Now()
+	cfoPending := e.syncCodefreeo(ctx)
+	if len(cfoPending) > 0 {
+		stats.TotalSessions += len(cfoPending)
+		tWrite := time.Now()
+		var cfoWritten int
+		if writeMode == syncWriteBulk {
+			var failedWrites int
+			cfoWritten, _, failedWrites = e.writeBatch(
+				cfoPending, writeMode, true,
+			)
+			for range failedWrites {
+				stats.RecordFailed()
+			}
+		} else {
+			resolveWorktreeProject := e.loadWorktreeProjectResolver()
+			for _, pw := range cfoPending {
+				if ctx.Err() != nil {
+					break
+				}
+				pw.sess.Agent = parser.AgentCodefreeO
+				pw.sess.ID = strings.Replace(
+					pw.sess.ID, "opencode:", "codefree-o:", 1,
+				)
+				switch err := e.writeSessionFullWithResolver(
+					pw, resolveWorktreeProject,
+				); {
+				case err == nil:
+					cfoWritten++
+				case isIntentionalSessionSkip(err),
+					errors.Is(err, errSessionPreserved):
+				default:
+					stats.RecordFailed()
+				}
+			}
+		}
+		stats.RecordSynced(cfoWritten)
+		if verbose {
+			log.Printf(
+				"codefree-o write: %d sessions in %s",
+				len(cfoPending),
+				time.Since(tWrite).Round(time.Millisecond),
+			)
+		}
+	}
+	if verbose {
+		log.Printf(
+			"codefree-o sync: %s",
+			time.Since(tCFO).Round(time.Millisecond),
+		)
+	}
+	advanceDBProgress(e.countDBBackedProgressTotal(parser.AgentCodefreeO), cfoPending)
+
+	if ctx.Err() != nil {
+		stats.Aborted = true
+		return stats
+	}
+
 	// Link subagent child sessions to their parents after all DB-backed
-	// agent writes (Warp, Forge, Piebald). LinkSubagentSessions is idempotent — its
+	// agent writes (Warp, Forge, Piebald, codefree-o). LinkSubagentSessions is idempotent — its
 	// WHERE filter and partial index make it a cheap no-op when nothing new
 	// was written — so no guard is needed.
 	if err := e.db.LinkSubagentSessions(); err != nil {
@@ -1892,6 +2092,11 @@ func discoveredFileMtime(
 			return parser.OpenCodeSourceMtime(file.Path)
 		}
 	}
+	if file.Agent == parser.AgentCodefreeO {
+		if _, _, ok := parser.ParseCodefreeoSQLiteVirtualPath(file.Path); ok {
+			return parser.CodefreeoSourceMtime(file.Path)
+		}
+	}
 
 	info, err := os.Stat(file.Path)
 	if err != nil {
@@ -1970,6 +2175,8 @@ func (e *Engine) countDBBackedProgressTotal(agent parser.AgentType) int {
 			total += e.countOneForgeSessions(dir)
 		case parser.AgentPiebald:
 			total += e.countOnePiebaldSessions(dir)
+		case parser.AgentCodefreeO:
+			total += e.countOneCodefreeoSessions(dir)
 		}
 	}
 	return total
@@ -2003,6 +2210,12 @@ func (e *Engine) countDBBackedSessions(ctx context.Context) int {
 			continue
 		}
 		total += e.countOnePiebaldSessions(dir)
+	}
+	for _, dir := range e.agentDirs[parser.AgentCodefreeO] {
+		if dir == "" {
+			continue
+		}
+		total += e.countOneCodefreeoSessions(dir)
 	}
 	return total
 }
@@ -2062,6 +2275,277 @@ func (e *Engine) syncOneOpenCode(
 	}
 
 	return pending
+}
+
+// syncCodefreeo syncs sessions from codefree-o SQLite databases.
+func (e *Engine) syncCodefreeo(
+	ctx context.Context,
+) []pendingWrite {
+	var allPending []pendingWrite
+	for _, dir := range e.agentDirs[parser.AgentCodefreeO] {
+		if ctx.Err() != nil {
+			break
+		}
+		if dir == "" {
+			continue
+		}
+		allPending = append(
+			allPending, e.syncOneCodefreeo(ctx, dir)...,
+		)
+	}
+	return allPending
+}
+
+// syncOneCodefreeo handles a single codefree-o directory.
+func (e *Engine) syncOneCodefreeo(
+	ctx context.Context, dir string,
+) []pendingWrite {
+	dbPath := filepath.Join(dir, ".local", "share", "codefree.db")
+	changed := e.codefreeoPendingSessionIDs(dir)
+	if len(changed) == 0 {
+		return nil
+	}
+
+	var pending []pendingWrite
+	for _, sid := range changed {
+		if ctx.Err() != nil {
+			break
+		}
+		sess, msgs, err := parser.ParseOpenCodeSession(
+			dbPath, sid, e.machine,
+		)
+		if err != nil {
+			log.Printf(
+				"codefree-o session %s: %v", sid, err,
+			)
+			continue
+		}
+		if sess == nil {
+			continue
+		}
+		pending = append(pending, pendingWrite{
+			sess: *sess,
+			msgs: msgs,
+		})
+	}
+
+	return pending
+}
+
+func (e *Engine) codefreeoPendingSessionIDs(dir string) []string {
+	dbPath := filepath.Join(dir, ".local", "share", "codefree.db")
+	if info, err := os.Stat(dbPath); err != nil || info.IsDir() {
+		return nil
+	}
+
+	metas, err := parser.ListOpenCodeSessionMeta(dbPath)
+	if err != nil {
+		log.Printf("sync codefree-o: %v", err)
+		return nil
+	}
+	storageIDs := parser.CodefreeoStorageSessionIDs(dir)
+	var changed []string
+	for _, m := range metas {
+		if _, ok := storageIDs[m.SessionID]; ok {
+			continue
+		}
+		_, storedMtime, ok := e.db.GetFileInfoByPath(m.VirtualPath)
+		if ok && storedMtime == m.FileMtime &&
+			e.db.GetDataVersionByPath(m.VirtualPath) >= db.CurrentDataVersion() {
+			continue
+		}
+		changed = append(changed, m.SessionID)
+	}
+	return changed
+}
+
+func (e *Engine) countOneCodefreeoSessions(dir string) int {
+	dbPath := filepath.Join(dir, ".local", "share", "codefree.db")
+	if info, err := os.Stat(dbPath); err != nil || info.IsDir() {
+		return 0
+	}
+	metas, err := parser.ListOpenCodeSessionMeta(dbPath)
+	if err != nil {
+		log.Printf("sync codefree-o: %v", err)
+		return 0
+	}
+	storageIDs := parser.CodefreeoStorageSessionIDs(dir)
+	count := 0
+	for _, m := range metas {
+		if _, ok := storageIDs[m.SessionID]; !ok {
+			count++
+		}
+	}
+	return count
+}
+
+// processCodefreeo processes a single codefree-o discovered file.
+func (e *Engine) processCodefreeo(
+	file parser.DiscoveredFile, info os.FileInfo,
+) processResult {
+	if dbPath, sessionID, ok := parser.ParseCodefreeoSQLiteVirtualPath(file.Path); ok {
+		sess, msgs, err := parser.ParseOpenCodeSession(
+			dbPath, sessionID, e.machine,
+		)
+		if err != nil {
+			return processResult{err: err}
+		}
+		if sess == nil {
+			return processResult{}
+		}
+		return processResult{
+			results: []parser.ParseResult{
+				{Session: *sess, Messages: msgs},
+			},
+		}
+	}
+	if filepath.Base(file.Path) == "codefree.db" {
+		metas, err := parser.ListOpenCodeSessionMeta(file.Path)
+		if err != nil {
+			return processResult{err: err}
+		}
+		storageIDs := parser.CodefreeoStorageSessionIDs(
+			filepath.Dir(file.Path),
+		)
+		var results []parser.ParseResult
+		for _, meta := range metas {
+			if _, ok := storageIDs[meta.SessionID]; ok {
+				continue
+			}
+			_, storedMtime, ok := e.db.GetFileInfoByPath(meta.VirtualPath)
+			if ok && storedMtime == meta.FileMtime &&
+				e.db.GetDataVersionByPath(meta.VirtualPath) >=
+					db.CurrentDataVersion() {
+				continue
+			}
+			sess, msgs, err := parser.ParseOpenCodeSession(
+				file.Path, meta.SessionID, e.machine,
+			)
+			if err != nil {
+				log.Printf(
+					"codefree-o sqlite watch session %s: %v",
+					meta.SessionID, err,
+				)
+				continue
+			}
+			if sess == nil {
+				continue
+			}
+			results = append(results, parser.ParseResult{
+				Session:  *sess,
+				Messages: msgs,
+			})
+		}
+		return processResult{results: results}
+	}
+	if e.shouldSkipCodefreeoByPath(file.Path) {
+		return processResult{skip: true}
+	}
+
+	sess, msgs, err := parser.ParseOpenCodeFile(
+		file.Path, e.machine,
+	)
+	if err != nil {
+		return processResult{err: err}
+	}
+	if sess == nil {
+		return processResult{}
+	}
+
+	hash, err := ComputeFileHash(file.Path)
+	if err == nil && sess.File.Hash == "" {
+		sess.File.Hash = hash
+	}
+
+	sess.File.Inode, sess.File.Device = getFileIdentity(info)
+
+	// Set agent type to codefree-o since ParseOpenCodeFile returns AgentOpenCode.
+	sess.Agent = parser.AgentCodefreeO
+	// Replace ID prefix from opencode: to codefree-o:.
+	sess.ID = strings.Replace(sess.ID, "opencode:", "codefree-o:", 1)
+
+	return processResult{
+		results: []parser.ParseResult{
+			{Session: *sess, Messages: msgs},
+		},
+	}
+}
+
+func (e *Engine) shouldSkipCodefreeoByPath(path string) bool {
+	lookupPath := path
+	if e.pathRewriter != nil {
+		lookupPath = e.pathRewriter(path)
+	}
+
+	_, storedMtime, ok := e.db.GetFileInfoByPath(lookupPath)
+	if !ok {
+		return false
+	}
+
+	sourceMtime, err := parser.CodefreeoSourceMtime(path)
+	if err != nil || sourceMtime == 0 {
+		return false
+	}
+	if storedMtime != sourceMtime {
+		return false
+	}
+	if e.db.GetDataVersionByPath(lookupPath) <
+		db.CurrentDataVersion() {
+		return false
+	}
+	return true
+}
+
+// syncSingleCodefreeo re-syncs a single codefree-o session.
+func (e *Engine) syncSingleCodefreeo(
+	sessionID string,
+) error {
+	rawID := strings.TrimPrefix(sessionID, "codefree-o:")
+
+	var lastErr error
+	for _, dir := range e.agentDirs[parser.AgentCodefreeO] {
+		if dir == "" {
+			continue
+		}
+		dbPath := filepath.Join(dir, ".local", "share", "codefree.db")
+		if info, err := os.Stat(dbPath); err != nil ||
+			info.IsDir() {
+			continue
+		}
+		sess, msgs, err := parser.ParseOpenCodeSession(
+			dbPath, rawID, e.machine,
+		)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if sess == nil {
+			continue
+		}
+		sess.Agent = parser.AgentCodefreeO
+		sess.ID = strings.Replace(sess.ID, "opencode:", "codefree-o:", 1)
+		if err := e.writeSessionFull(
+			pendingWrite{sess: *sess, msgs: msgs},
+		); err != nil &&
+			!isIntentionalSessionSkip(err) &&
+			!errors.Is(err, errSessionPreserved) {
+			return fmt.Errorf("write session %s: %w",
+				sess.ID, err)
+		} else if errors.Is(err, errSessionPreserved) {
+			return err
+		}
+		return nil
+	}
+
+	if len(e.agentDirs[parser.AgentCodefreeO]) == 0 {
+		return fmt.Errorf("codefree-o dir not configured")
+	}
+	if lastErr != nil {
+		return fmt.Errorf(
+			"codefree-o session %s: %w", sessionID, lastErr,
+		)
+	}
+	return fmt.Errorf("codefree-o session %s not found", sessionID)
 }
 
 // startWorkers fans out file processing across a worker pool
@@ -2370,6 +2854,8 @@ func (e *Engine) processFile(
 		res = e.processHermes(file, info)
 	case parser.AgentPositron:
 		res = e.processPositron(file, info)
+	case parser.AgentCodefreeO:
+		res = e.processCodefreeo(file, info)
 	default:
 		res = processResult{
 			err: fmt.Errorf(
@@ -2385,29 +2871,53 @@ func (e *Engine) processFile(
 func (e *Engine) shouldCacheSkip(
 	file parser.DiscoveredFile,
 ) bool {
-	if file.Agent != parser.AgentOpenCode {
+	if file.Agent == parser.AgentOpenCode {
+		if filepath.Base(file.Path) == "opencode.db" {
+			return false
+		}
+		if _, _, ok := parser.ParseOpenCodeSQLiteVirtualPath(file.Path); ok {
+			return false
+		}
+		for _, dir := range e.agentDirs[parser.AgentOpenCode] {
+			if dir == "" {
+				continue
+			}
+			if parser.ResolveOpenCodeSource(dir).Mode !=
+				parser.OpenCodeSourceStorage {
+				continue
+			}
+			if rel, ok := isUnder(dir, file.Path); ok {
+				rel = filepath.ToSlash(rel)
+				return !strings.HasPrefix(
+					rel, "storage/session/",
+				)
+			}
+		}
 		return true
 	}
-	if filepath.Base(file.Path) == "opencode.db" {
-		return false
-	}
-	if _, _, ok := parser.ParseOpenCodeSQLiteVirtualPath(file.Path); ok {
-		return false
-	}
-	for _, dir := range e.agentDirs[parser.AgentOpenCode] {
-		if dir == "" {
-			continue
+	if file.Agent == parser.AgentCodefreeO {
+		if filepath.Base(file.Path) == "codefree.db" {
+			return false
 		}
-		if parser.ResolveOpenCodeSource(dir).Mode !=
-			parser.OpenCodeSourceStorage {
-			continue
+		if _, _, ok := parser.ParseCodefreeoSQLiteVirtualPath(file.Path); ok {
+			return false
 		}
-		if rel, ok := isUnder(dir, file.Path); ok {
-			rel = filepath.ToSlash(rel)
-			return !strings.HasPrefix(
-				rel, "storage/session/",
-			)
+		for _, dir := range e.agentDirs[parser.AgentCodefreeO] {
+			if dir == "" {
+				continue
+			}
+			if parser.ResolveCodefreeOSource(dir).Mode !=
+				parser.CodefreeoSourceStorage {
+				continue
+			}
+			if rel, ok := isUnder(dir, file.Path); ok {
+				rel = filepath.ToSlash(rel)
+				return !strings.HasPrefix(
+					rel, ".local/share/storage/session/",
+				)
+			}
 		}
+		return true
 	}
 	return true
 }
@@ -4131,6 +4641,11 @@ func isOpenCodeSQLiteVirtualPath(path string) bool {
 	return ok
 }
 
+func isCodefreeoSQLiteVirtualPath(path string) bool {
+	_, _, ok := parser.ParseCodefreeoSQLiteVirtualPath(path)
+	return ok
+}
+
 func derefString(s *string) string {
 	if s == nil {
 		return ""
@@ -4563,6 +5078,8 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 			return e.syncSingleForge(sessionID)
 		case parser.AgentPiebald:
 			return e.syncSinglePiebald(sessionID)
+		case parser.AgentCodefreeO:
+			return e.syncSingleCodefreeo(sessionID)
 		default:
 			err = e.syncSingleOpenCode(sessionID)
 			if errors.Is(err, errSessionPreserved) {
@@ -4587,6 +5104,10 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 			return nil
 		}
 		return err
+	}
+	if def.Type == parser.AgentCodefreeO &&
+		isCodefreeoSQLiteVirtualPath(path) {
+		return e.syncSingleCodefreeo(sessionID)
 	}
 
 	agent := def.Type
@@ -4787,6 +5308,45 @@ func findOpenCodeStorageSessionIDByMessageID(
 ) string {
 	messageRoot := filepath.Join(
 		openCodeDir, "storage", "message",
+	)
+	entries, err := os.ReadDir(messageRoot)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(
+			messageRoot, entry.Name(), messageID+".json",
+		)
+		if info, err := os.Stat(path); err == nil &&
+			!info.IsDir() {
+			return entry.Name()
+		}
+	}
+	return ""
+}
+
+func readCodefreeoStorageSessionID(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var data struct {
+		SessionID string `json:"sessionID"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return ""
+	}
+	return data.SessionID
+}
+
+func findCodefreeoStorageSessionIDByMessageID(
+	cfoDir, messageID string,
+) string {
+	messageRoot := filepath.Join(
+		cfoDir, ".local", "share", "storage", "message",
 	)
 	entries, err := os.ReadDir(messageRoot)
 	if err != nil {

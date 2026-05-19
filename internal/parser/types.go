@@ -34,6 +34,7 @@ const (
 	AgentPiebald       AgentType = "piebald"
 	AgentWarp          AgentType = "warp"
 	AgentPositron      AgentType = "positron"
+	AgentCodefreeO     AgentType = "codefree-o"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -126,6 +127,22 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverOpenCodeSessions,
 		FindSourceFunc: FindOpenCodeSourceFile,
+	},
+	{
+		Type:        AgentCodefreeO,
+		DisplayName: "Codefree-O",
+		EnvVar:      "CODEFREE_O_DIR",
+		ConfigKey:   "codefree_o_dirs",
+		DefaultDirs: []string{".codefree-o"},
+		IDPrefix:    "codefree-o:",
+		WatchSubdirs: []string{
+			".local/share/storage/session",
+			".local/share/storage/message",
+			".local/share/storage/part",
+		},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverCodefreeOSessions,
+		FindSourceFunc: FindCodefreeOSourceFile,
 	},
 	{
 		Type:           AgentOpenHands,

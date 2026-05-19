@@ -33,6 +33,11 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "kiro-ide", color: "var(--accent-lime)", label: "Kiro IDE" },
   { name: "cortex", color: "var(--accent-cyan)", label: "Cortex Code" },
   { name: "piebald", color: "var(--accent-orange)", label: "Piebald" },
+  {
+    name: "codefree-o",
+    color: "var(--accent-purple)",
+    label: "Codefree-O",
+  },
 ];
 
 const agentColorMap = new Map(
