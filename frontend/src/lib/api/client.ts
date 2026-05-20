@@ -608,14 +608,10 @@ export function getMarkdownExportUrl(
 export async function downloadExport(sessionId: string): Promise<void> {
   const url = getExportUrl(sessionId);
   const token = getAuthToken();
-  if (!token) {
-    // Local connection — simple navigation is fine.
-    window.open(url, "_blank");
-    return;
-  }
-  // Remote connection — use fetch with Authorization header
-  // to avoid putting the token in the URL.
-  const res = await fetch(url, authHeaders());
+  // Use fetch in both local and remote connections so the
+  // download works inside Tauri's WebView2 (where window.open
+  // is blocked) as well as in regular browsers.
+  const res = await fetch(url, token ? authHeaders() : undefined);
   if (!res.ok) {
     throw new ApiError(res.status, `Export failed: ${res.status}`);
   }
@@ -626,7 +622,7 @@ export async function downloadExport(sessionId: string): Promise<void> {
   // Extract filename from Content-Disposition if available.
   const cd = res.headers.get("Content-Disposition");
   const match = cd?.match(/filename="?([^"]+)"?/);
-  a.download = match?.[1] ?? `session-${sessionId}.md`;
+  a.download = match?.[1] ?? `session-${sessionId}.html`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
