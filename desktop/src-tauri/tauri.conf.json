@@ -29,6 +29,7 @@
     "copyright": "Copyright 2026 Wes McKinney",
     "shortDescription": "Local viewer for AI agent sessions",
     "longDescription": "AgentsView is a local web viewer for AI agent coding sessions.",
+    "createUpdaterArtifacts": "v1Compatible",
     "externalBin": [
       "binaries/agentsview"
     ],
@@ -42,6 +43,14 @@
     "macOS": {
       "entitlements": "./Entitlements.plist",
       "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "NOT_SET",
+      "endpoints": [
+        "https://github.com/wesm/agentsview/releases/download/updater/latest.json"
+      ]
     }
   }
 }

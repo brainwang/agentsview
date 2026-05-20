@@ -67,7 +67,6 @@ pub fn run() {
         .setup(|app| {
             launch_backend(app)?;
             setup_menu(app)?;
-            schedule_auto_update_check(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())
