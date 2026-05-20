@@ -1,9 +1,10 @@
 name: Desktop Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+  # push:
+  #   tags:
+  #     - 'v*'
 
 permissions:
   contents: read

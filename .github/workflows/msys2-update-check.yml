@@ -5,8 +5,8 @@ name: MSYS2 Update Check
 # If this workflow fails, update the pinned SHA and packages in ci.yml.
 
 on:
-  schedule:
-    - cron: "0 9 * * 1"  # Every Monday at 09:00 UTC
+  # schedule:
+  #   - cron: "0 9 * * 1"  # Every Monday at 09:00 UTC
   workflow_dispatch:
 
 jobs:
