@@ -288,6 +288,15 @@ type exportMessage struct {
 	Role        string
 	Timestamp   string
 	ContentHTML template.HTML
+	ToolCalls   []exportToolCall
+}
+
+type exportToolCall struct {
+	Category  string
+	Name      string
+	InputHTML template.HTML
+	Output    string
+	HasOutput bool
 }
 
 var exportTmpl = template.Must(
@@ -472,6 +481,50 @@ main { max-width: 900px; margin: 0 auto; padding: 16px; }
   font-family: var(--font-mono);
   font-size: 12px; color: var(--text-secondary);
 }
+.tool-call-block {
+  border-left: 2px solid var(--accent-amber);
+  background: var(--tool-bg);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.tool-call-header {
+  padding: 6px 10px; cursor: pointer;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  display: flex; align-items: center; gap: 6px;
+}
+.tool-call-header:hover { color: var(--text-primary); }
+.tool-call-cat {
+  font-weight: 600;
+  color: var(--accent-amber);
+}
+.tool-call-name {
+  color: var(--text-muted);
+}
+.tool-call-body {
+  padding: 0 10px 8px 10px;
+}
+.tool-call-section {
+  margin-top: 4px;
+}
+.tool-call-label {
+  font-size: 11px; font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+.tool-call-pre {
+  background: var(--code-bg);
+  color: var(--code-text);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px; overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+  margin: 0;
+}
 #sort-toggle:checked ~ main .messages {
   flex-direction: column-reverse;
 }
@@ -536,7 +589,7 @@ footer a:hover { text-decoration: underline; }
 </header>
 <main><div class="messages">
 {{- range .Messages}}
-<div class="message {{.RoleClass}}{{.ExtraClass}}"><div class="message-header"><span class="message-role">{{.Role}}</span><span class="message-time">{{.Timestamp}}</span></div><div class="message-content">{{.ContentHTML}}</div></div>
+<div class="message {{.RoleClass}}{{.ExtraClass}}"><div class="message-header"><span class="message-role">{{.Role}}</span><span class="message-time">{{.Timestamp}}</span></div><div class="message-content">{{.ContentHTML}}</div>{{range .ToolCalls}}<details class="tool-call-block"><summary class="tool-call-header"><span class="tool-call-cat">{{.Category}}</span> <span class="tool-call-name">{{.Name}}</span></summary><div class="tool-call-body">{{if .InputHTML}}<div class="tool-call-section"><div class="tool-call-label">input</div><pre class="tool-call-pre">{{.InputHTML}}</pre></div>{{end}}{{if .HasOutput}}<div class="tool-call-section"><div class="tool-call-label">output</div><pre class="tool-call-pre">{{.Output}}</pre></div>{{end}}</div></details>{{end}}</div>
 {{- end}}
 </div></main>
 <footer>Exported from <a href="https://github.com/wesm/agentsview">agentsview</a></footer>
@@ -575,12 +628,25 @@ func generateExportHTML(
 			extraClass = " thinking-only"
 		}
 
+		var toolCalls []exportToolCall
+		for _, tc := range m.ToolCalls {
+			etc := exportToolCall{
+				Category:  tc.Category,
+				Name:      tc.ToolName,
+				InputHTML: template.HTML(formatToolInputForExport(tc.InputJSON)),
+				Output:    tc.ResultContent,
+				HasOutput: tc.ResultContent != "",
+			}
+			toolCalls = append(toolCalls, etc)
+		}
+
 		data.Messages[i] = exportMessage{
 			RoleClass:   roleClass,
 			ExtraClass:  extraClass,
 			Role:        m.Role,
 			Timestamp:   formatTimestamp(m.Timestamp),
 			ContentHTML: template.HTML(formatContentForExport(m.Content)),
+			ToolCalls:   toolCalls,
 		}
 	}
 
@@ -628,6 +694,21 @@ func isThinkingOnly(content string) bool {
 	without := thinkingMarkedRe.ReplaceAllString(content, "")
 	without = thinkingLegacyRe.ReplaceAllString(without, "")
 	return strings.TrimSpace(without) == ""
+}
+
+func formatToolInputForExport(inputJSON string) string {
+	if inputJSON == "" {
+		return ""
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(inputJSON), &parsed); err != nil {
+		return html.EscapeString(inputJSON)
+	}
+	pretty, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return html.EscapeString(inputJSON)
+	}
+	return html.EscapeString(string(pretty))
 }
 
 // parseTimestamp tries RFC3339Nano then RFC3339.
