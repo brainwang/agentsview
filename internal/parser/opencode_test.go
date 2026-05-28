@@ -828,6 +828,68 @@ func TestParseOpenCodeDB_ToolParts(t *testing.T) {
 	}})
 }
 
+func TestParseOpenCodeDB_ToolOutput(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/tmp/proj")
+	seeder.AddSession("ses_output", "prj_1", "", "", 1700000000000, 1700000030000)
+
+	seeder.AddMessage("msg_u", "ses_output", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_output", 1700000000000, 1700000000000, `{"type":"text","text":"run ls"}`)
+
+	seeder.AddMessage("msg_a", "ses_output", 1700000010000, 1700000012000, `{"role":"assistant"}`)
+	seeder.AddPart("prt_t", "msg_a", "ses_output", 1700000011000, 1700000011000,
+		`{"type":"tool","tool":"bash","callID":"call_bash_1","state":{"status":"completed","input":{"command":"ls"},"output":"file1.go\nfile2.go\n"}}`)
+
+	sessions, err := ParseOpenCodeDB(dbPath, "m")
+	if err != nil {
+		t.Fatalf("ParseOpenCodeDB: %v", err)
+	}
+
+	assertEq(t, "sessions len", len(sessions), 1)
+	msgs := sessions[0].Messages
+	assertEq(t, "messages len", len(msgs), 2)
+
+	ast := msgs[1]
+	assertEq(t, "HasToolUse", ast.HasToolUse, true)
+	assertEq(t, "ToolCalls len", len(ast.ToolCalls), 1)
+	assertEq(t, "ToolResults len", len(ast.ToolResults), 1)
+
+	tr := ast.ToolResults[0]
+	assertEq(t, "ToolUseID", tr.ToolUseID, "call_bash_1")
+	assertEq(t, "ContentLength", tr.ContentLength, len("file1.go\nfile2.go\n"))
+	assertEq(t, "ContentRaw non-empty", tr.ContentRaw != "", true)
+
+	decoded := DecodeContent(tr.ContentRaw)
+	assertEq(t, "decoded output", decoded, "file1.go\nfile2.go\n")
+}
+
+func TestParseOpenCodeDB_ToolNoOutput(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/tmp/proj")
+	seeder.AddSession("ses_noout", "prj_1", "", "", 1700000000000, 1700000030000)
+
+	seeder.AddMessage("msg_u", "ses_noout", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_noout", 1700000000000, 1700000000000, `{"type":"text","text":"hi"}`)
+
+	seeder.AddMessage("msg_a", "ses_noout", 1700000010000, 1700000012000, `{"role":"assistant"}`)
+	seeder.AddPart("prt_t", "msg_a", "ses_noout", 1700000011000, 1700000011000,
+		`{"type":"tool","tool":"bash","callID":"call_1","state":{"input":{"command":"echo"}}}`)
+
+	sessions, err := ParseOpenCodeDB(dbPath, "m")
+	if err != nil {
+		t.Fatalf("ParseOpenCodeDB: %v", err)
+	}
+
+	assertEq(t, "sessions len", len(sessions), 1)
+	ast := sessions[0].Messages[1]
+	assertEq(t, "ToolCalls len", len(ast.ToolCalls), 1)
+	assertEq(t, "ToolResults len", len(ast.ToolResults), 0)
+}
+
 func TestParseOpenCodeDB_EmptySession(t *testing.T) {
 	dbPath, seeder, db := newTestDB(t)
 	defer db.Close()

@@ -751,6 +751,7 @@ func buildOpenCodeMessage(
 	var (
 		texts       []string
 		toolCalls   []ParsedToolCall
+		toolResults []ParsedToolResult
 		hasThinking bool
 		hasToolUse  bool
 	)
@@ -765,9 +766,12 @@ func buildOpenCodeMessage(
 			}
 		case "tool":
 			hasToolUse = true
-			tc := extractOpenCodeToolCall(p.data)
-			if tc.ToolName != "" {
-				toolCalls = append(toolCalls, tc)
+			tr := extractOpenCodeToolCall(p.data)
+			if tr.Call.ToolName != "" {
+				toolCalls = append(toolCalls, tr.Call)
+				if tr.Result != nil {
+					toolResults = append(toolResults, *tr.Result)
+				}
 			}
 		case "reasoning":
 			text := extractOpenCodeText(p.data)
@@ -790,6 +794,7 @@ func buildOpenCodeMessage(
 		HasToolUse:    hasToolUse,
 		ContentLength: len(content),
 		ToolCalls:     toolCalls,
+		ToolResults:   toolResults,
 	}
 }
 
@@ -833,31 +838,57 @@ type openCodeToolData struct {
 
 // openCodeToolState holds the nested state of a tool call.
 type openCodeToolState struct {
-	Input json.RawMessage `json:"input"`
+	Input  json.RawMessage `json:"input"`
+	Output string          `json:"output"`
 }
 
-func extractOpenCodeToolCall(data string) ParsedToolCall {
+// openCodeToolResult holds both the tool call and its result.
+type openCodeToolResult struct {
+	Call   ParsedToolCall
+	Result *ParsedToolResult
+}
+
+func extractOpenCodeToolCall(data string) openCodeToolResult {
 	var d openCodeToolData
 	if err := json.Unmarshal([]byte(data), &d); err != nil {
-		return ParsedToolCall{}
+		return openCodeToolResult{}
 	}
 
-	var inputJSON string
+	var (
+		inputJSON string
+		output    string
+	)
 	if len(d.State) > 0 {
 		var state openCodeToolState
 		if err := json.Unmarshal(d.State, &state); err == nil {
 			if len(state.Input) > 0 {
 				inputJSON = string(state.Input)
 			}
+			output = state.Output
 		}
 	}
 
-	return ParsedToolCall{
+	call := ParsedToolCall{
 		ToolUseID: d.CallID,
 		ToolName:  d.ToolName,
 		Category:  NormalizeToolCategory(d.ToolName),
 		InputJSON: inputJSON,
 	}
+
+	var result *ParsedToolResult
+	if output != "" && d.CallID != "" {
+		contentLen := len(output)
+		contentRaw, _ := json.Marshal([]map[string]string{
+			{"type": "text", "text": output},
+		})
+		result = &ParsedToolResult{
+			ToolUseID:     d.CallID,
+			ContentLength: contentLen,
+			ContentRaw:    string(contentRaw),
+		}
+	}
+
+	return openCodeToolResult{Call: call, Result: result}
 }
 
 type openCodeStorageTime struct {
