@@ -81,7 +81,8 @@ import (
 //
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 27
+// (28: OpenCode tool output extraction from state.output.)
+const dataVersion = 28
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
