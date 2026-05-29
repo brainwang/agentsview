@@ -464,6 +464,57 @@ func TestGenerateExportHTML_NilStartedAt(t *testing.T) {
 	}
 }
 
+func TestGenerateExportHTML_ToolCalls(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.MessageCount = 2
+	})
+	msgs := []db.Message{
+		{
+			SessionID: "test-id", Ordinal: 0,
+			Role: "user", Content: "Run a command",
+			Timestamp: "2025-01-15T10:00:00Z",
+		},
+		{
+			SessionID: "test-id", Ordinal: 1,
+			Role:      "assistant",
+			Content:   "Running command...",
+			Timestamp: "2025-01-15T10:00:05Z",
+			ToolCalls: []db.ToolCall{
+				{
+					ToolName:  "bash",
+					Category:  "Bash",
+					InputJSON: `{"command":"ls -la"}`,
+					ResultContent: "total 8\ndrwxr-xr-x  2 user user 4096 Jan 15 10:00 .\n-rw-r--r--  1 user user  123 Jan 15 10:00 file.txt",
+				},
+				{
+					ToolName:  "read",
+					Category:  "Read",
+					InputJSON: `{"path":"/tmp/test.txt"}`,
+					ResultContent: "Hello, world!",
+				},
+			},
+		},
+	}
+
+	html := generateExportHTML(session, msgs)
+
+	assertContainsAll(t, html, []string{
+		`class="tool-call-block"`,
+		`class="tool-call-cat"`,
+		"Bash",
+		"Read",
+		`class="tool-call-name"`,
+		"bash",
+		"read",
+		`class="tool-call-label">input`,
+		`class="tool-call-label">output`,
+		"ls -la",
+		"total 8",
+		"Hello, world!",
+	})
+}
+
 func TestGenerateExportMarkdown_Structure(t *testing.T) {
 	t.Parallel()
 	session := testSession(func(s *db.Session) {

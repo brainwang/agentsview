@@ -568,7 +568,7 @@ footer a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
-<input type="checkbox" id="thinking-toggle" class="toggle-input">
+<input type="checkbox" id="thinking-toggle" class="toggle-input" checked>
 <input type="checkbox" id="sort-toggle" class="toggle-input">
 <header>
 <div class="header-content">
