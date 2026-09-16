@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build:
     name: Desktop Build (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}-with-cache
     env:
       AGENTSVIEW_VERSION: ${{ inputs.version }}
       AGENTSVIEW_TARGET_TRIPLE: ${{ matrix.target_triple }}    
