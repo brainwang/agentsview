@@ -89,3 +89,5 @@ graphify-out/
 
 # AI
 .opencode/
+opencode.json
+.codefree/
