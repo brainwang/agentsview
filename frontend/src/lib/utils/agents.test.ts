@@ -61,6 +61,7 @@ describe("KNOWN_AGENTS", () => {
       "omnigent",
       "codebuff",
       "freebuff",
+      "codefree-o",
     ]);
   });
 

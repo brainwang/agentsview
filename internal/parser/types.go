@@ -76,6 +76,7 @@ const (
 	AgentReasonix       AgentType = "reasonix"
 	AgentEvener         AgentType = "evener"
 	AgentIcodemate      AgentType = "icodemate"
+	AgentCodefreeO      AgentType = "codefree-o"
 	AgentRooCode        AgentType = "roocode"
 	AgentPoolside       AgentType = "poolside"
 	AgentOmnigent       AgentType = "omnigent"
@@ -269,6 +270,27 @@ var Registry = []AgentDef{
 		},
 		FileBased:      true,
 		WatchRootsFunc: ResolveOpenCodeWatchRoots,
+	},
+	{
+		// Codefree-O is a fork of OpenCode with an identical storage
+		// layout but a different root (".codefree-o/.local/share" so
+		// the on-disk tree is .codefree-o/.local/share/storage/session
+		// and the SQLite fallback is codefree.db) and a codefree-o:
+		// ID prefix. The OpenCode-format provider owns parsing and
+		// relabels results through relabelOpenCodeSessionAsCodefreeO.
+		Type:        AgentCodefreeO,
+		DisplayName: "Codefree-O",
+		EnvVar:      "CODEFREE_O_DIR",
+		ConfigKey:   "codefree_o_dirs",
+		DefaultDirs: []string{".codefree-o/.local/share"},
+		IDPrefix:    "codefree-o:",
+		WatchSubdirs: []string{
+			"storage/session",
+			"storage/message",
+			"storage/part",
+		},
+		FileBased:      true,
+		WatchRootsFunc: ResolveCodefreeOWatchRoots,
 	},
 	{
 		Type:        AgentOpenCodeReview,

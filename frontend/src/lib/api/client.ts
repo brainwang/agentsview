@@ -335,15 +335,11 @@ export async function downloadInsightExport(insightId: number): Promise<void> {
 }
 
 async function downloadAuthenticatedExport(url: string, fallbackFilename: string): Promise<void> {
+  // Use fetch in both local and remote connections so the
+  // download works inside Tauri's WebView2 (where window.open
+  // is blocked) as well as in regular browsers.
   const token = getAuthToken();
-  if (!token) {
-    // Local connection — simple navigation is fine.
-    window.open(url, "_blank");
-    return;
-  }
-  // Remote connection — use fetch with Authorization header
-  // to avoid putting the token in the URL.
-  const res = await fetch(url, authHeaders());
+  const res = await fetch(url, token ? authHeaders() : undefined);
   if (!res.ok) {
     throw new ApiError(res.status, `Export failed: ${res.status}`);
   }

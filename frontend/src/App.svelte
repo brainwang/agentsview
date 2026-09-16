@@ -743,7 +743,6 @@
     sync.loadStatus();
     sync.loadStats();
     sync.loadVersion();
-    sync.checkForUpdate();
     sync.startPolling();
 
     const healthCleanup = setupVisibilityHealthCheck(getBase, {

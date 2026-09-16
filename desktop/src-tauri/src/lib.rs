@@ -271,7 +271,7 @@ pub fn run() {
                             err.to_string().as_str(),
                         );
                     } else {
-                        schedule_auto_update_check(app.handle().clone());
+                        // Auto update check on startup disabled.
                     }
                 }
                 Err(DataVersionPreflightError::TooNew(message)) => {
@@ -2765,6 +2765,7 @@ impl Drop for UpdateGuard {
     }
 }
 
+#[allow(dead_code)]
 fn schedule_auto_update_check(handle: AppHandle) {
     let disabled = std::env::var("AGENTSVIEW_DESKTOP_AUTOUPDATE")
         .map(|v| v == "0")

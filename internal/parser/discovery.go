@@ -164,6 +164,10 @@ var (
 		agent: AgentIcodemate, dbName: "icodemate.db",
 		sessionSubdir: "session_diff",
 	}
+	codefreeOFmt = openCodeFormat{
+		agent: AgentCodefreeO, dbName: "codefree.db",
+		sessionSubdir: "session",
+	}
 )
 
 func resolveOpenCodeFormatSource(
@@ -468,6 +472,28 @@ func ResolveMiMoCodeWatchRoots(root string) []string {
 
 func MiMoCodeSQLiteVirtualPath(dbPath, sessionID string) string {
 	return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+}
+
+// ResolveCodefreeOSource detects whether a Codefree-O root is using
+// file-backed storage (storage/session) or legacy SQLite storage
+// (codefree.db). Codefree-O is a fork of OpenCode and reuses the
+// OpenCode-format resolver with its own DB filename.
+func ResolveCodefreeOSource(root string) OpenCodeSource {
+	return resolveOpenCodeFormatSource(codefreeOFmt, root)
+}
+
+func ResolveCodefreeOWatchRoots(root string) []string {
+	return resolveOpenCodeFormatWatchRoots(codefreeOFmt, root)
+}
+
+func CodefreeOSQLiteVirtualPath(dbPath, sessionID string) string {
+	return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+}
+
+func ParseCodefreeOSQLiteVirtualPath(
+	sourcePath string,
+) (dbPath, sessionID string, ok bool) {
+	return parseOpenCodeFormatVirtualPath(codefreeOFmt.dbName, sourcePath)
 }
 
 // ResolveCodexShallowWatchRoots returns directories that should be watched

@@ -1214,6 +1214,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newMiMoCodeProviderFactory(def)
 	case AgentIcodemate:
 		return newIcodemateProviderFactory(def)
+	case AgentCodefreeO:
+		return newCodefreeOProviderFactory(def)
 	case AgentOpenHands:
 		return newOpenHandsProviderFactory(def)
 	case AgentOpenCode:
