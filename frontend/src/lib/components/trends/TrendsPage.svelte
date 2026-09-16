@@ -1,8 +1,27 @@
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import { onMount } from "svelte";
   import { trends } from "../../stores/trends.svelte.js";
+  import { settings } from "../../stores/settings.svelte.js";
   import { getBasePath } from "../../stores/router.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
+  import {
+    yokedDates,
+    panelDateState,
+    rangeToPanelDate,
+    type PanelDateState,
+  } from "../../stores/yokedDates.svelte.js";
+  import { rollingRange } from "../../utils/dates.js";
+  import { chartSeriesColorMap } from "../../utils/chartPalette.js";
   import type { TrendsGranularity } from "../../api/types.js";
+  import { ChartColumnIcon, ChevronDownIcon } from "../../icons.js";
+  import { Spinner, Toggle } from "@kenn-io/kit-ui";
+  import RangePicker from "../shared/RangePicker.svelte";
+  import {
+    resolveRange,
+    selectionFromRange,
+    type RangeSelection,
+  } from "../shared/rangeSelection.js";
   import TermTable from "./TermTable.svelte";
   import TrendsLineChart from "./TrendsLineChart.svelte";
 
@@ -20,29 +39,81 @@
     "var(--trend-indigo)",
     "var(--trend-black)",
   ] as const;
+  const TREND_WINDOW_PARAM = "window_days";
+  const DEFAULT_TREND_WINDOW_DAYS = 365;
 
   let activeTerm: string | null = $state(null);
+  let trendsWindowDays: number | null = $state(DEFAULT_TREND_WINDOW_DAYS);
+  // Keep bare defaults out of history so a later mount cannot mistake them
+  // for a user selection, deep link, or shared seed.
+  let trendsDateIntentEstablished = false;
+  const trendsPanelDate = $derived(currentTrendsPanelDate());
 
-  function colorFor(_term: string, index: number): string {
-    return TREND_PALETTE[index % TREND_PALETTE.length]!;
+  const GRANULARITIES: TrendsGranularity[] = ["day", "week", "month"];
+  let groupByOpen = $state(false);
+  let groupByEl: HTMLDivElement | undefined = $state();
+
+  function pickGranularity(g: TrendsGranularity) {
+    groupByOpen = false;
+    if (g !== trends.granularity) void setGranularity(g);
+  }
+
+  function onGroupByDocClick(e: MouseEvent) {
+    if (groupByEl && !groupByEl.contains(e.target as Node)) {
+      groupByOpen = false;
+    }
+  }
+
+  function onGroupByKey(e: KeyboardEvent) {
+    if (e.key === "Escape") groupByOpen = false;
+  }
+
+  const termColorMap = $derived(chartSeriesColorMap(
+    (trends.response?.series ?? []).map((item) => item.term),
+    settings.chartPalette,
+    (_term, index) => TREND_PALETTE[index % TREND_PALETTE.length]!,
+  ));
+
+  function colorFor(term: string, index: number): string {
+    return termColorMap.get(term) ??
+      TREND_PALETTE[index % TREND_PALETTE.length]!;
   }
 
   function isGranularity(value: string | null): value is TrendsGranularity {
     return value === "day" || value === "week" || value === "month";
   }
 
-  function applyQueryParams() {
+  function parseTrendWindowDays(raw: string | null): number | null {
+    if (!raw) return null;
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isInteger(n) || n <= 0 || String(n) !== raw) {
+      return null;
+    }
+    return n;
+  }
+
+  function applyQueryParams(): boolean {
     const q = new URLSearchParams(window.location.search);
     const from = q.get("from");
     const to = q.get("to");
+    const windowDays = parseTrendWindowDays(q.get(TREND_WINDOW_PARAM));
     const granularity = q.get("granularity");
     const normalized = q.get("normalized");
     const terms = q.getAll("term").map((s) => s.trim()).filter(Boolean);
-    if (from) trends.from = from;
-    if (to) trends.to = to;
+    if (windowDays !== null) {
+      const range = rollingRange(windowDays);
+      trends.from = range.from;
+      trends.to = range.to;
+      trendsWindowDays = windowDays;
+    } else if (from || to) {
+      if (from) trends.from = from;
+      if (to) trends.to = to;
+      trendsWindowDays = null;
+    }
     if (isGranularity(granularity)) trends.granularity = granularity;
     trends.normalized = normalized === "true";
     if (terms.length > 0) trends.termText = terms.join("\n");
+    return windowDays !== null || q.has("from") || q.has("to");
   }
 
   function writeUrl() {
@@ -51,8 +122,13 @@
     if (current.has("desktop")) {
       q.set("desktop", current.get("desktop") ?? "");
     }
-    q.set("from", trends.from);
-    q.set("to", trends.to);
+    if (trendsDateIntentEstablished) {
+      q.set("from", trends.from);
+      q.set("to", trends.to);
+      if (trendsWindowDays !== null) {
+        q.set(TREND_WINDOW_PARAM, String(trendsWindowDays));
+      }
+    }
     q.set("granularity", trends.granularity);
     if (trends.normalized) {
       q.set("normalized", "true");
@@ -66,27 +142,65 @@
     window.history.replaceState(null, "", url);
   }
 
+  function materializeRollingWindow(): void {
+    if (trendsWindowDays === null) return;
+    const yokeEstablished = yokedDates.range !== null;
+    const range = rollingRange(trendsWindowDays);
+    if (trends.from === range.from && trends.to === range.to) return;
+    trends.from = range.from;
+    trends.to = range.to;
+    if (yokeEstablished) {
+      updateYokeFromTrends(panelDateState(range.from, range.to, {
+        mode: "rolling",
+        windowDays: trendsWindowDays,
+      }));
+    }
+  }
+
   async function refresh() {
+    materializeRollingWindow();
     writeUrl();
     await trends.fetchTerms();
   }
 
-  async function setFromDate(event: Event) {
-    trends.from = (event.currentTarget as HTMLInputElement).value;
+  const earliestSession = $derived(sync.stats?.earliest_session ?? null);
+
+  const rangeSelection = $derived.by((): RangeSelection => {
+    if (trendsWindowDays !== null) {
+      return { mode: "relative", days: trendsWindowDays };
+    }
+    return selectionFromRange(trends.from, trends.to, earliestSession);
+  });
+
+  async function applyRange(sel: RangeSelection) {
+    const range = resolveRange(sel, earliestSession);
+    trends.from = range.from;
+    trends.to = range.to;
+    trendsDateIntentEstablished = true;
+    const yokeState = yokeStateForSelection(sel, range);
+    trendsWindowDays = yokeState?.mode === "rolling"
+      ? yokeState.windowDays ?? null
+      : null;
+    updateYokeFromTrends(yokeState);
     await refresh();
   }
 
-  async function setToDate(event: Event) {
-    trends.to = (event.currentTarget as HTMLInputElement).value;
-    await refresh();
-  }
-
-  function setNormalized(event: Event) {
-    trends.normalized = (event.currentTarget as HTMLInputElement).checked;
-    writeUrl();
+  function yokeStateForSelection(
+    sel: RangeSelection,
+    range: { from: string; to: string },
+  ): PanelDateState | null {
+    if (sel.mode === "relative" && sel.days > 0) {
+      return panelDateState(range.from, range.to, {
+        mode: "rolling",
+        windowDays: sel.days,
+      });
+    }
+    return panelDateState(range.from, range.to, { mode: "fixed" });
   }
 
   async function resetTerms() {
+    materializeRollingWindow();
+    writeUrl();
     await trends.resetTerms();
     writeUrl();
   }
@@ -96,61 +210,83 @@
     await refresh();
   }
 
+  function currentTrendsPanelDate(): PanelDateState | null {
+    if (trendsWindowDays !== null) {
+      return panelDateState(trends.from, trends.to, {
+        mode: "rolling",
+        windowDays: trendsWindowDays,
+      });
+    }
+    return panelDateState(trends.from, trends.to, { mode: "fixed" });
+  }
+
+  function updateYokeFromTrends(
+    state: PanelDateState | null = trendsPanelDate,
+  ): void {
+    if (state) yokedDates.updateFromPanel(state);
+  }
+
+  function seedTrendsYoke(): void {
+    const seed = yokedDates.seedForPanel();
+    const state = seed ? rangeToPanelDate(seed) : null;
+    if (!state) return;
+    trendsDateIntentEstablished = true;
+    trends.from = state.from;
+    trends.to = state.to;
+    trendsWindowDays = state.mode === "rolling"
+      ? state.windowDays ?? null
+      : null;
+  }
+
   onMount(() => {
-    applyQueryParams();
+    const hasDateParams = applyQueryParams();
+    trendsDateIntentEstablished = hasDateParams;
+    if (hasDateParams) {
+      updateYokeFromTrends();
+    } else {
+      seedTrendsYoke();
+    }
+    materializeRollingWindow();
     writeUrl();
     trends.fetchTerms();
+    document.addEventListener("click", onGroupByDocClick);
+    document.addEventListener("keydown", onGroupByKey);
+    return () => {
+      trends.cancelInFlightReads();
+      document.removeEventListener("click", onGroupByDocClick);
+      document.removeEventListener("keydown", onGroupByKey);
+    };
   });
 </script>
 
 <section class="trends-page">
   <div class="page-head">
     <div>
-      <h1>Trends</h1>
-      <p>{trends.response?.from ?? trends.from} to {trends.response?.to ?? trends.to}</p>
+      <h1>{m.trends_title()}</h1>
+      <p>{m.trends_date_range({ from: trends.response?.from ?? trends.from, to: trends.response?.to ?? trends.to })}</p>
     </div>
     <div class="head-actions">
-      <button class="secondary" onclick={resetTerms}>Reset</button>
+      <button class="secondary" onclick={resetTerms}>{m.trends_reset()}</button>
       <button class="primary" onclick={refresh} disabled={trends.loading.terms}>
-        {trends.loading.terms ? "Refreshing" : "Refresh"}
+        {trends.loading.terms ? m.trends_refreshing() : m.trends_refresh()}
       </button>
     </div>
   </div>
 
   <div class="toolbar">
-    <label>
-      <span>From</span>
-      <input type="date" bind:value={trends.from} onchange={setFromDate} />
-    </label>
-    <label>
-      <span>To</span>
-      <input type="date" bind:value={trends.to} onchange={setToDate} />
-    </label>
-    <div class="granularity" aria-label="Granularity">
-      {#each ["day", "week", "month"] as value}
-        <button
-          class:active={trends.granularity === value}
-          onclick={() => setGranularity(value as TrendsGranularity)}
-        >
-          {value}
-        </button>
-      {/each}
-    </div>
-    <label class="normalize-toggle">
-      <input
-        type="checkbox"
-        bind:checked={trends.normalized}
-        onchange={setNormalized}
-      />
-      <span>Normalize by number of messages</span>
-    </label>
+    <RangePicker
+      selection={rangeSelection}
+      busy={trends.loading.terms}
+      {earliestSession}
+      onSelect={applyRange}
+    />
   </div>
 
   <div class="content-grid">
     <div class="query-panel">
       <label class="terms-label" for="trend-terms">
-        <span>Terms</span>
-        <span class="terms-hint">one per line</span>
+        <span>{m.trends_terms()}</span>
+        <span class="terms-hint">{m.trends_one_per_line()}</span>
       </label>
       <textarea
         id="trend-terms"
@@ -164,6 +300,48 @@
     </div>
 
     <div class="chart-panel" aria-busy={trends.loading.terms}>
+      <div class="chart-options">
+        <div class="group-by" bind:this={groupByEl}>
+          <button
+            class="group-trigger"
+            onclick={() => (groupByOpen = !groupByOpen)}
+            aria-haspopup="menu"
+            aria-expanded={groupByOpen}
+          >
+            <ChartColumnIcon size="13" strokeWidth="2" aria-hidden="true" />
+            {m.trends_group_by()} <span class="gval">{trends.granularity}</span>
+            <ChevronDownIcon
+              class={groupByOpen ? "g-chev open" : "g-chev"}
+              size="11"
+              strokeWidth="2.2"
+              aria-hidden="true"
+            />
+          </button>
+          {#if groupByOpen}
+            <div class="group-menu" role="menu">
+              {#each GRANULARITIES as g (g)}
+                <button
+                  class="group-item"
+                  class:active={trends.granularity === g}
+                  role="menuitemradio"
+                  aria-checked={trends.granularity === g}
+                  onclick={() => pickGranularity(g)}
+                >
+                  {g}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <Toggle
+          checked={trends.normalized}
+          onchange={(checked) => {
+            trends.normalized = checked;
+            writeUrl();
+          }}
+          label={m.trends_normalize()}
+        />
+      </div>
       <TrendsLineChart
         buckets={trends.response?.buckets ?? []}
         series={trends.response?.series ?? []}
@@ -174,8 +352,8 @@
       />
       {#if trends.loading.terms}
         <div class="loading-overlay" role="status" aria-live="polite">
-          <span class="loading-spinner" aria-hidden="true"></span>
-          <span>Computing trends...</span>
+          <span aria-hidden="true"><Spinner size={18} /></span>
+          <span>{m.trends_computing()}</span>
         </div>
       {/if}
     </div>
@@ -195,18 +373,19 @@
 
 <style>
   .trends-page {
-    --trend-blue: #2563eb;
-    --trend-gold: #d97706;
-    --trend-purple: #7c3aed;
-    --trend-green: #059669;
-    --trend-magenta: #db2777;
-    --trend-slate: #475569;
-    --trend-red: #dc2626;
-    --trend-cyan: #0891b2;
+    --trend-blue: var(--accent-blue);
+    --trend-gold: var(--accent-amber);
+    --trend-purple: var(--accent-purple);
+    --trend-green: var(--accent-green);
+    --trend-magenta: var(--accent-pink);
+    --trend-slate: var(--text-secondary);
+    --trend-red: var(--accent-red);
+    --trend-cyan: var(--accent-cyan);
+    /* kit-ui-check-ignore: brown slot of the 12-hue categorical series palette; nearest token --accent-orange would collide with the amber slot */
     --trend-brown: #92400e;
-    --trend-lime: #65a30d;
-    --trend-indigo: #4338ca;
-    --trend-black: #111827;
+    --trend-lime: var(--accent-lime);
+    --trend-indigo: var(--accent-indigo);
+    --trend-black: var(--text-primary);
     max-width: 1180px;
     margin: 0 auto;
     padding: 22px;
@@ -214,18 +393,8 @@
   }
 
   :global(:root.dark) .trends-page {
-    --trend-blue: #60a5fa;
-    --trend-gold: #fbbf24;
-    --trend-purple: #c084fc;
-    --trend-green: #4ade80;
-    --trend-magenta: #f472b6;
-    --trend-slate: #cbd5e1;
-    --trend-red: #f87171;
-    --trend-cyan: #22d3ee;
+    /* kit-ui-check-ignore: dark-mode counterpart of the suppressed brown palette slot above */
     --trend-brown: #fb923c;
-    --trend-lime: #a3e635;
-    --trend-indigo: #818cf8;
-    --trend-black: #f8fafc;
   }
 
   .page-head {
@@ -251,15 +420,13 @@
   }
 
   .head-actions,
-  .toolbar,
-  .granularity {
+  .toolbar {
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
   button,
-  input,
   textarea {
     font: inherit;
   }
@@ -292,7 +459,7 @@
   .primary {
     background: var(--accent-blue);
     border-color: var(--accent-blue);
-    color: white;
+    color: var(--accent-blue-foreground);
   }
 
   .primary:hover:not(:disabled) {
@@ -308,13 +475,12 @@
 
   label {
     display: grid;
-    gap: 5px;
+    gap: var(--space-2);
     color: var(--text-muted);
     font-size: 11px;
     font-weight: 600;
   }
 
-  input,
   textarea {
     border: 1px solid var(--border-default);
     border-radius: 6px;
@@ -322,52 +488,86 @@
     color: var(--text-primary);
   }
 
-  input {
-    height: 32px;
-    padding: 0 8px;
-    font-size: 12px;
-  }
-
-  .granularity {
-    align-self: end;
-    height: 32px;
-    padding: 2px;
-    border: 1px solid var(--border-default);
-    border-radius: 7px;
-    background: var(--bg-surface);
-  }
-
-  .granularity button {
-    height: 26px;
-    min-width: 54px;
-    padding: 0 10px;
-    border: 0;
-    background: transparent;
-    color: var(--text-muted);
-    text-transform: capitalize;
-    font-size: 12px;
-  }
-
-  .granularity button.active {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .normalize-toggle {
-    align-self: end;
-    height: 32px;
+  .chart-options {
     display: flex;
     align-items: center;
-    gap: 7px;
-    color: var(--text-primary);
-    font-size: 12px;
-    font-weight: 500;
+    justify-content: flex-end;
+    gap: var(--space-5);
+    padding: 2px 2px 10px;
   }
 
-  .normalize-toggle input {
-    width: 14px;
-    height: 14px;
-    padding: 0;
+  .group-by {
+    position: relative;
+  }
+
+  .group-trigger {
+    height: 26px;
+    padding: 0 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .group-trigger:hover:not(:disabled) {
+    background: var(--bg-surface-hover);
+    color: var(--text-secondary);
+  }
+
+  .group-trigger .gval {
+    color: var(--text-secondary);
+    font-weight: 500;
+    text-transform: capitalize;
+  }
+
+  :global(.g-chev) {
+    color: var(--text-muted);
+    transition: transform 0.15s;
+  }
+
+  :global(.g-chev.open) {
+    transform: rotate(180deg);
+  }
+
+  .group-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 20;
+    min-width: 124px;
+    padding: 4px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-muted);
+    border-radius: 7px;
+    box-shadow: var(--shadow-md);
+  }
+
+  .group-item {
+    width: 100%;
+    height: 28px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    text-align: left;
+    text-transform: capitalize;
+  }
+
+  .group-item:hover:not(:disabled) {
+    background: var(--bg-surface-hover);
+  }
+
+  .group-item.active {
+    color: var(--accent-blue);
+    font-weight: 500;
   }
 
   .content-grid {
@@ -376,7 +576,7 @@
     grid-template-areas:
       "query chart"
       "table chart";
-    gap: 14px;
+    gap: var(--space-6);
     align-items: start;
   }
 
@@ -443,22 +643,7 @@
     pointer-events: none;
   }
 
-  .loading-spinner {
-    width: 18px;
-    height: 18px;
-    border: 2px solid var(--border-default);
-    border-top-color: var(--accent-blue);
-    border-radius: 999px;
-    animation: trends-spin 800ms linear infinite;
-  }
-
-  @keyframes trends-spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-
-  @media (max-width: 820px) {
+  @media (max-width: 900px) {
     .trends-page {
       padding: 16px;
     }

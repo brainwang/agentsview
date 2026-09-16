@@ -1,8 +1,12 @@
 package timeutil
 
 import (
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPtr(t *testing.T) {
@@ -32,18 +36,11 @@ func TestPtr(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := Ptr(tt.in)
 			if tt.want == nil {
-				if got != nil {
-					t.Errorf("Ptr() = %v, want nil", *got)
-				}
+				assert.Nil(t, got)
 				return
 			}
-			if got == nil {
-				t.Fatalf("Ptr() returned nil, want %q", *tt.want)
-				return
-			}
-			if *got != *tt.want {
-				t.Errorf("Ptr() = %q, want %q", *got, *tt.want)
-			}
+			require.NotNil(t, got)
+			assert.Equal(t, *tt.want, *got)
 		})
 	}
 }
@@ -60,9 +57,7 @@ func TestFormat(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := Format(tt.in); got != tt.want {
-				t.Errorf("Format() = %q, want %q", got, tt.want)
-			}
+			assert.Equal(t, tt.want, Format(tt.in))
 		})
 	}
 }
@@ -84,9 +79,7 @@ func TestIsValidDate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := IsValidDate(tt.in); got != tt.want {
-				t.Errorf("IsValidDate(%q) = %v, want %v", tt.in, got, tt.want)
-			}
+			assert.Equal(t, tt.want, IsValidDate(tt.in))
 		})
 	}
 }
@@ -107,9 +100,239 @@ func TestIsValidTimestamp(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := IsValidTimestamp(tt.in); got != tt.want {
-				t.Errorf("IsValidTimestamp(%q) = %v, want %v", tt.in, got, tt.want)
+			assert.Equal(t, tt.want, IsValidTimestamp(tt.in))
+		})
+	}
+}
+
+func TestParseSince(t *testing.T) {
+	now := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name string
+		in   string
+		want time.Time
+	}{
+		{"hours", "3h", now.Add(-3 * time.Hour)},
+		{"days", "14d", now.Add(-14 * 24 * time.Hour)},
+		{"weeks", "2w", now.Add(-14 * 24 * time.Hour)},
+		{"months", "3m", now.AddDate(0, -3, 0)},
+		{"years", "1y", now.AddDate(-1, 0, 0)},
+		{"single digit unit", "1d", now.Add(-24 * time.Hour)},
+		{
+			"absolute date is midnight in now's location",
+			"2026-01-01",
+			time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseSince(now, tt.in)
+			require.NoError(t, err)
+			assert.True(t, tt.want.Equal(got),
+				"ParseSince(%q) = %v, want %v", tt.in, got, tt.want)
+		})
+	}
+}
+
+// TestParseSince_MonthArithmeticCrossesYearBoundary verifies month/year units
+// use calendar-aware AddDate rather than a fixed-duration approximation, so
+// "2m" from mid-January lands in the previous November/year rather than a
+// rough 60-day subtraction.
+func TestParseSince_MonthArithmeticCrossesYearBoundary(t *testing.T) {
+	now := time.Date(2026, 1, 15, 8, 30, 0, 0, time.UTC)
+	got, err := ParseSince(now, "2m")
+	require.NoError(t, err)
+	want := time.Date(2025, 11, 15, 8, 30, 0, 0, time.UTC)
+	assert.True(t, want.Equal(got), "got %v, want %v", got, want)
+}
+
+// TestParseSince_AbsoluteDateUsesNowsLocation verifies the YYYY-MM-DD form
+// resolves to that date's midnight in now's location rather than always UTC.
+func TestParseSince_AbsoluteDateUsesNowsLocation(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	now := time.Date(2026, 3, 15, 10, 0, 0, 0, ny)
+
+	got, err := ParseSince(now, "2026-01-01")
+	require.NoError(t, err)
+	want := time.Date(2026, 1, 1, 0, 0, 0, 0, ny)
+	assert.True(t, want.Equal(got), "got %v, want %v", got, want)
+	assert.Equal(t, ny.String(), got.Location().String())
+}
+
+func TestParseSince_RejectsInvalidForms(t *testing.T) {
+	now := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{"empty string", ""},
+		{"unknown unit", "3x"},
+		{"unit before number", "m3"},
+		{"negative number", "-3d"},
+		{"zero is not positive", "0d"},
+		{"unit only", "d"},
+		{"double unit", "3dd"},
+		{"decimal number", "3.5d"},
+		{"trailing space", "3d "},
+		{"leading space", " 3d"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseSince(now, tt.in)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.in)
+		})
+	}
+}
+
+func TestBestEffortLocalTimezone(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name  string
+		envTZ string
+		loc   *time.Location
+		want  string
+	}{
+		{
+			name:  "valid env wins over local",
+			envTZ: "Europe/Berlin",
+			loc:   la,
+			want:  "Europe/Berlin",
+		},
+		{
+			name:  "invalid env falls back to local",
+			envTZ: "not/a-zone",
+			loc:   la,
+			want:  "America/Los_Angeles",
+		},
+		{
+			name:  "local sentinel is blank",
+			envTZ: "",
+			loc:   time.FixedZone("Local", 0),
+			want:  "",
+		},
+		{
+			name:  "invalid local name is blank",
+			envTZ: "",
+			loc:   time.FixedZone("DuckLocal", 0),
+			want:  "",
+		},
+		{
+			name:  "valid local IANA name passes through",
+			envTZ: "",
+			loc:   berlin,
+			want:  "Europe/Berlin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				bestEffortLocalTimezone(tt.envTZ, tt.loc))
+		})
+	}
+}
+
+func TestResolveLocalTimezone(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		envTZ      string
+		loc        *time.Location
+		systemName string
+		systemErr  error
+		want       string
+	}{
+		{
+			name:  "valid environment wins",
+			envTZ: "Europe/Berlin", loc: la,
+			systemName: "America/New_York", want: "Europe/Berlin",
+		},
+		{
+			name:  "accepted alias wins",
+			envTZ: "US/Eastern", loc: la,
+			systemName: "America/New_York", want: "US/Eastern",
+		},
+		{
+			name:  "invalid environment falls through",
+			envTZ: "not/a-zone", loc: berlin,
+			systemName: "America/New_York", want: "Europe/Berlin",
+		},
+		{
+			name:  "UTC is preserved",
+			envTZ: "UTC", loc: la,
+			systemName: "America/New_York", want: "UTC",
+		},
+		{
+			name: "valid local IANA name passes through",
+			loc:  berlin, systemName: "America/New_York", want: "Europe/Berlin",
+		},
+		{
+			name:       "Windows identity uses platform mapping",
+			loc:        time.FixedZone("Eastern Standard Time", -5*60*60),
+			systemName: "America/New_York", want: "America/New_York",
+		},
+		{
+			name:       "nil location uses platform mapping",
+			systemName: "America/New_York", want: "America/New_York",
+		},
+		{
+			name: "unknown platform identity is empty",
+			loc:  time.FixedZone("Local", 0), systemName: "Eastern Standard Time",
+		},
+		{
+			name: "platform error is empty",
+			loc:  time.FixedZone("Local", 0), systemErr: errors.New("unavailable"),
+		},
+		{
+			name: "invalid platform result is empty",
+			loc:  time.FixedZone("Local", 0), systemName: "not/a-zone",
+		},
+		{
+			name:       "offset identity is not guessed",
+			loc:        time.FixedZone("UTC-5", -5*60*60),
+			systemName: "Eastern Standard Time",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			got := resolveLocalTimezone(tt.envTZ, tt.loc, func() (string, error) {
+				calls++
+				return tt.systemName, tt.systemErr
+			})
+			assert.Equal(t, tt.want, got)
+			if tt.want != "" && (tt.envTZ != "" || tt.loc != nil &&
+				validatedTimezoneName(tt.loc.String()) != "") {
+				assert.Zero(t, calls, "platform resolver should not run")
 			}
 		})
 	}
+}
+
+func TestLocalTimezoneOrUTC(t *testing.T) {
+	assert.Equal(t, "America/New_York", localTimezoneOrUTC(
+		func() string { return "America/New_York" }))
+	assert.Equal(t, "UTC", localTimezoneOrUTC(func() string { return "" }))
+}
+
+func TestLocalLocation(t *testing.T) {
+	fallback := time.FixedZone("fallback", 0)
+	assert.Equal(t, "America/New_York", localLocation(
+		func() string { return "America/New_York" }, fallback).String())
+	assert.Same(t, fallback, localLocation(func() string { return "" }, fallback))
+	assert.Same(t, fallback, localLocation(
+		func() string { return "not/a-zone" }, fallback))
 }

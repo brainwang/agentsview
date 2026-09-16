@@ -1,6 +1,12 @@
 /** Matches Go Progress struct in internal/sync/progress.go */
 export interface SyncProgress {
   phase: string;
+  detail?: string;
+  hint?: string;
+  resync?: boolean;
+  stalled?: boolean;
+  started_at?: string;
+  updated_at?: string;
   current_project?: string;
   projects_total: number;
   projects_done: number;
@@ -23,4 +29,5 @@ export interface SyncStats {
 export interface SyncStatus {
   last_sync: string;
   stats: SyncStats | null;
+  progress?: SyncProgress | null;
 }

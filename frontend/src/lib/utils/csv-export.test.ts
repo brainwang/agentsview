@@ -1,8 +1,5 @@
-import { describe, it, expect } from "vitest";
-import {
-  generateAnalyticsCSV,
-  type AnalyticsData,
-} from "./csv-export.js";
+import { describe, it, expect } from "vite-plus/test";
+import { generateAnalyticsCSV, type AnalyticsData } from "./csv-export.js";
 
 function emptyData(): AnalyticsData {
   return {
@@ -46,9 +43,7 @@ describe("generateAnalyticsCSV", () => {
     expect(lines[2]).toBe("Sessions,10");
     expect(lines[3]).toBe("Messages,200");
     expect(lines).toContainEqual("Output Tokens,42000");
-    expect(lines).toContainEqual(
-      "Token Reporting Sessions,12",
-    );
+    expect(lines).toContainEqual("Token Reporting Sessions,12");
     expect(lines).toContainEqual("Concentration,45.6%");
   });
 
@@ -111,6 +106,7 @@ describe("generateAnalyticsCSV", () => {
         { category: "Write", count: 40, pct: 40 },
       ],
       by_agent: [],
+      by_tool: [],
       trend: [],
     };
 
@@ -156,10 +152,9 @@ describe("generateAnalyticsCSV", () => {
     };
     data.tools = {
       total_calls: 1,
-      by_category: [
-        { category: "Read", count: 1, pct: 100 },
-      ],
+      by_category: [{ category: "Read", count: 1, pct: 100 }],
       by_agent: [],
+      by_tool: [],
       trend: [],
     };
 
@@ -186,9 +181,7 @@ describe("generateAnalyticsCSV", () => {
     };
 
     const csv = generateAnalyticsCSV(data);
-    expect(csv).toContain(
-      '"project, ""special"""',
-    );
+    expect(csv).toContain('"project, ""special"""');
   });
 
   it("escapes formula injection characters", () => {

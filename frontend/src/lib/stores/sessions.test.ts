@@ -1,10 +1,4 @@
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-} from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import {
   createSessionsStore,
   buildSessionGroups,
@@ -13,32 +7,25 @@ import {
   filtersToParams,
   splitExcludeProjectParam,
 } from "./sessions.svelte.js";
+import { SessionsService, type DbSession } from "../api/generated/index";
+import { starred } from "./starred.svelte.js";
+import { yokedDates } from "./yokedDates.svelte.js";
 import type { Filters } from "./sessions.svelte.js";
 import type { Session } from "../api/types.js";
-import * as api from "../api/client.js";
-import type { ListSessionsParams } from "../api/client.js";
+import { ApiError, callGenerated } from "../api/runtime.js";
+import { rollingRange } from "../utils/dates.js";
 
-// Install a minimal localStorage mock for the test environment.
-const storageData = new Map<string, string>();
-Object.defineProperty(globalThis, "localStorage", {
-  value: {
-    getItem: (key: string) => storageData.get(key) ?? null,
-    setItem: (key: string, value: string) => { storageData.set(key, value); },
-    removeItem: (key: string) => { storageData.delete(key); },
-    clear: () => { storageData.clear(); },
-  },
-  configurable: true,
-  writable: true,
-});
-
-vi.mock("../api/client.js", () => ({
+const api = vi.hoisted(() => ({
   listSessions: vi.fn(),
+  getSidebarSessionIndex: vi.fn(),
   getSession: vi.fn(),
   getProjects: vi.fn(),
   getAgents: vi.fn(),
-  // invalidateFilterCaches() triggers sync.loadStats() which calls
-  // getStats(). Provide a default so the stale-state guards we
-  // exercise don't trip noisy "no export" stderr from the mock.
+  getMachines: vi.fn(),
+  deleteSession: vi.fn(),
+  batchDeleteSessions: vi.fn(),
+  restoreSession: vi.fn(),
+  renameSession: vi.fn(),
   getStats: vi.fn().mockResolvedValue({
     session_count: 0,
     message_count: 0,
@@ -46,19 +33,128 @@ vi.mock("../api/client.js", () => ({
     machine_count: 0,
     earliest_session: null,
   }),
-  // Live-refresh subscription opens an EventSource via watchEvents.
-  // Stub it so the mocked client doesn't blow up when the store
-  // calls events.subscribeDebounced() during load().
   watchEvents: vi.fn(() => ({ close: () => {} })),
 }));
 
-function mockListSessions(
-  overrides?: Partial<{ next_cursor: string }>,
-) {
-  vi.mocked(api.listSessions).mockResolvedValue({
+type SidebarIndexParams = Parameters<typeof api.getSidebarSessionIndex>[0];
+
+// Install a minimal localStorage mock for the test environment.
+const storageData = new Map<string, string>();
+Object.defineProperty(globalThis, "localStorage", {
+  value: {
+    getItem: (key: string) => storageData.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      storageData.set(key, value);
+    },
+    removeItem: (key: string) => {
+      storageData.delete(key);
+    },
+    clear: () => {
+      storageData.clear();
+    },
+  },
+  configurable: true,
+  writable: true,
+});
+
+vi.mock("../api/client.js", () => ({
+  watchEvents: api.watchEvents,
+}));
+
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
+  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: vi.fn(
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+  ),
+}));
+
+vi.mock("../api/generated/index", () => ({
+  SessionsService: {
+    getApiV1Sessions: vi.fn((params) => api.listSessions(params)),
+    getApiV1SessionsSidebarIndex: vi.fn((params) => api.getSidebarSessionIndex(params)),
+    getApiV1SessionsById: vi.fn(({ id }) => api.getSession(id)),
+    deleteApiV1SessionsById: vi.fn(({ id }) => api.deleteSession(id)),
+    postApiV1SessionsBatchDelete: vi.fn((body) => api.batchDeleteSessions(body.session_ids)),
+    postApiV1SessionsByIdRestore: vi.fn(({ id }) => api.restoreSession(id)),
+    patchApiV1SessionsByIdRename: vi.fn(({ id }, body) => api.renameSession(id, body.display_name)),
+    getApiV1SessionsByIdChildren: vi.fn().mockResolvedValue([]),
+  },
+  MetadataService: {
+    getApiV1Projects: vi.fn((params) => api.getProjects(params)),
+    getApiV1Agents: vi.fn((params) => api.getAgents(params)),
+    getApiV1Machines: vi.fn((params) => api.getMachines(params)),
+    getApiV1Stats: vi.fn((params) => api.getStats(params)),
+  },
+}));
+
+function mockSidebarPage(overrides?: Partial<{ next_cursor: string }>) {
+  vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
     sessions: [],
     total: 0,
     ...overrides,
+  });
+}
+
+function rejectGeneratedRequestOnAbort(
+  request: () => Promise<unknown>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const result = request();
+  if (!signal) return result;
+  return new Promise((resolve, reject) => {
+    signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+      once: true,
+    });
+    void result.then(resolve, reject);
+  });
+}
+
+type SkinnySessionRow = {
+  id: string;
+  parent_session_id?: string | null;
+  relationship_type?: string | null;
+  project: string;
+  machine: string;
+  agent: string;
+  agent_label?: string | null;
+  entrypoint?: string | null;
+  display_name?: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  created_at: string;
+  termination_status?: string | null;
+  message_count: number;
+  user_message_count: number;
+  is_automated: boolean;
+  is_teammate?: boolean;
+};
+
+function makeSkinnyRow(overrides: Partial<SkinnySessionRow> & { id: string }): SkinnySessionRow {
+  return {
+    project: "proj",
+    machine: "local",
+    agent: "claude",
+    agent_label: null,
+    entrypoint: null,
+    display_name: null,
+    started_at: null,
+    ended_at: null,
+    created_at: "2024-01-01T00:00:00Z",
+    termination_status: null,
+    message_count: 1,
+    user_message_count: 1,
+    is_automated: false,
+    is_teammate: false,
+    ...overrides,
+  };
+}
+
+function mockSidebarIndex(sessions: SkinnySessionRow[] = []) {
+  vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+    sessions,
+    total: sessions.length,
+    next_cursor: null,
   });
 }
 
@@ -68,11 +164,35 @@ function mockGetProjects() {
   });
 }
 
-function expectListSessionsCalledWith(
-  expected: Partial<ListSessionsParams>,
-) {
-  expect(api.listSessions).toHaveBeenLastCalledWith(
-    expect.objectContaining(expected),
+function expectSidebarIndexCalledWith(expected: Partial<SidebarIndexParams>) {
+  expect(api.getSidebarSessionIndex).toHaveBeenLastCalledWith(
+    expect.objectContaining(generatedParams(expected)),
+  );
+}
+
+function expectPaginatedSidebarIndexCalledWith(expected: Partial<SidebarIndexParams>) {
+  expect(api.getSidebarSessionIndex).toHaveBeenLastCalledWith(
+    expect.objectContaining(generatedParams(expected)),
+  );
+}
+
+function generatedParams(params: Partial<Record<string, unknown>>): Record<string, unknown> {
+  const names: Record<string, string> = {
+    activeSince: "active_since",
+    dateFrom: "date_from",
+    dateTo: "date_to",
+    excludeProject: "exclude_project",
+    healthGrade: "health_grade",
+    includeAutomated: "include_automated",
+    includeChildren: "include_children",
+    includeOneShot: "include_one_shot",
+    maxMessages: "max_messages",
+    minMessages: "min_messages",
+    minToolFailures: "min_tool_failures",
+    minUserMessages: "min_user_messages",
+  };
+  return Object.fromEntries(
+    Object.entries(params).map(([key, value]) => [names[key] ?? key, value]),
   );
 }
 
@@ -80,9 +200,20 @@ describe("SessionsStore", () => {
   let sessions: ReturnType<typeof createSessionsStore>;
 
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
+    const resolvedOptions = Intl.DateTimeFormat().resolvedOptions();
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      ...resolvedOptions,
+      timeZone: "America/New_York",
+    });
+    vi.mocked(callGenerated).mockImplementation((request: () => Promise<unknown>) => request());
     storageData.clear();
-    mockListSessions();
+    mockSidebarPage();
+    mockSidebarIndex();
+    starred.filterOnly = false;
+    starred.ids = new Set();
+    yokedDates.setEnabled(false);
     sessions = createSessionsStore();
   });
 
@@ -139,9 +270,7 @@ describe("SessionsStore", () => {
       sessions.filters.agent = "claude";
       await sessions.load();
 
-      const saved = JSON.parse(
-        localStorage.getItem("session-filters") ?? "{}",
-      );
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
       expect(saved.project).toBe("myproj");
       expect(saved.agent).toBe("claude");
     });
@@ -159,11 +288,1098 @@ describe("SessionsStore", () => {
       expect(store.filters.includeOneShot).toBe(true);
     });
 
+    it("holds saved filters through root loads and refreshes", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+
+      await store.load();
+      expect(store.filters.project).toBe("");
+      expect(localStorage.getItem("session-filters")).toBe(saved);
+
+      const detach = store.attachSidebar();
+      store.refreshSidebarIfAttached();
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      });
+      expect(localStorage.getItem("session-filters")).toBe(saved);
+      detach();
+    });
+
+    it("restores saved filters and resumes persistence", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+
+      store.restoreSavedFilters();
+      expect(store.filters.project).toBe("saved-project");
+      expect(store.filters.agent).toBe("codex");
+
+      store.filters.project = "updated-project";
+      await store.load();
+      const persisted = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(persisted).toMatchObject({
+        project: "updated-project",
+        agent: "codex",
+        version: 2,
+      });
+    });
+
+    it("releases the root hold when filters diverge", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+      store.filters.project = "new-project";
+
+      await store.load();
+
+      const persisted = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(persisted).toMatchObject({
+        project: "new-project",
+        agent: "",
+        version: 2,
+      });
+    });
+
+    it("keeps the root hold through session deselection", async () => {
+      const saved = JSON.stringify({
+        version: 2,
+        project: "saved-project",
+        agent: "codex",
+      });
+      localStorage.setItem("session-filters", saved);
+      const store = createSessionsStore();
+      store.resetFiltersForRoot();
+      store.selectSession("session-a");
+      store.deselectSession();
+
+      await store.load();
+
+      expect(localStorage.getItem("session-filters")).toBe(saved);
+    });
+
     it("should fall back to defaults on corrupted localStorage", () => {
       localStorage.setItem("session-filters", "not json");
       const store = createSessionsStore();
       expect(store.filters.project).toBe("");
       expect(store.filters.includeOneShot).toBe(true);
+    });
+
+    it("clears date bounds from legacy unversioned entries", () => {
+      // Entries written before provenance tracking may hold rolling bounds
+      // persisted as if explicit; only their date fields are dropped.
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({
+          project: "saved-proj",
+          dateFrom: "2025-07-07",
+          dateTo: "2026-07-06",
+          date: "2025-07-07",
+        }),
+      );
+      const store = createSessionsStore();
+      expect(store.filters.project).toBe("saved-proj");
+      expect(store.filters.dateFrom).toBe("");
+      expect(store.filters.dateTo).toBe("");
+      expect(store.filters.date).toBe("");
+      // Migration is written back so it runs only once.
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.version).toBe(2);
+      expect(saved.dateFrom).toBe("");
+    });
+
+    it("keeps date bounds from versioned entries", () => {
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({
+          version: 2,
+          dateFrom: "2026-01-01",
+          dateTo: "2026-01-31",
+        }),
+      );
+      const store = createSessionsStore();
+      expect(store.filters.dateFrom).toBe("2026-01-01");
+      expect(store.filters.dateTo).toBe("2026-01-31");
+    });
+
+    it("stamps the storage version when persisting", async () => {
+      sessions.filters.project = "myproj";
+      await sessions.load();
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.version).toBe(2);
+    });
+
+    it("persists rolling bounds as windowDays intent, not dates", async () => {
+      sessions.filters.project = "myproj";
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
+      await sessions.load();
+
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.dateFrom).toBe("");
+      expect(saved.dateTo).toBe("");
+      expect(saved.date).toBe("");
+      expect(saved.windowDays).toBe(365);
+      expect(saved.project).toBe("myproj");
+      // The current tab still queries with the materialized bounds.
+      expect(sessions.filters.dateFrom).toBe("2025-07-07");
+      expect(sessions.filters.dateTo).toBe("2026-07-06");
+    });
+
+    it("rematerializes a persisted rolling window on load", () => {
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({ version: 2, project: "p", windowDays: 30 }),
+      );
+      const store = createSessionsStore();
+      const range = rollingRange(30);
+      expect(store.filters.dateFrom).toBe(range.from);
+      expect(store.filters.dateTo).toBe(range.to);
+      expect(store.dateFiltersWindowDays).toBe(30);
+      expect(store.filters.project).toBe("p");
+    });
+
+    it("ignores an invalid persisted windowDays", () => {
+      localStorage.setItem("session-filters", JSON.stringify({ version: 2, windowDays: -5 }));
+      const store = createSessionsStore();
+      expect(store.filters.dateFrom).toBe("");
+      expect(store.dateFiltersWindowDays).toBe(null);
+    });
+
+    it("persists explicitly chosen fixed date bounds", async () => {
+      sessions.applyPanelDateFilters({ date_from: "2026-01-01", date_to: "2026-01-31" }, null);
+      await sessions.load();
+
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.dateFrom).toBe("2026-01-01");
+      expect(saved.dateTo).toBe("2026-01-31");
+      expect(saved.windowDays).toBeUndefined();
+    });
+
+    it("treats deep-linked window_days date bounds as rolling intent", async () => {
+      sessions.initFromParams({
+        window_days: "365",
+        date_from: "2025-07-07",
+        date_to: "2026-07-06",
+      });
+      await sessions.load();
+
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.dateFrom).toBe("");
+      expect(saved.dateTo).toBe("");
+      expect(saved.windowDays).toBe(365);
+      expect(sessions.filters.dateFrom).toBe("2025-07-07");
+    });
+
+    it("treats an invalid deep-linked window_days as explicit bounds", async () => {
+      sessions.initFromParams({
+        window_days: "abc",
+        date_from: "2026-01-01",
+        date_to: "2026-01-31",
+      });
+      expect(sessions.dateFiltersWindowDays).toBe(null);
+      await sessions.load();
+
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.dateFrom).toBe("2026-01-01");
+    });
+
+    it("resumes persisting dates when a rolling range is replaced by an explicit one", async () => {
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
+      await sessions.load();
+      sessions.applyPanelDateFilters({ date_from: "2026-01-01", date_to: "2026-01-31" }, null);
+      await sessions.load();
+
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.dateFrom).toBe("2026-01-01");
+      expect(saved.dateTo).toBe("2026-01-31");
+      expect(saved.windowDays).toBeUndefined();
+    });
+
+    it("persists a provenance flip even when the bounds are identical", async () => {
+      // Fixed range persisted, then a rolling preset materializes to the
+      // exact same bounds. Callers that diff serialized filters see no
+      // change and skip load(), so the store must persist on apply.
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, null);
+      await sessions.load();
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
+
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.dateFrom).toBe("");
+      expect(saved.dateTo).toBe("");
+      expect(saved.windowDays).toBe(365);
+    });
+
+    it("clears the rolling intent on wholesale filter resets", async () => {
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
+      sessions.clearSessionFilters();
+      expect(sessions.dateFiltersWindowDays).toBe(null);
+
+      sessions.applyPanelDateFilters({ date_from: "2025-07-07", date_to: "2026-07-06" }, 365);
+      sessions.setProjectFilter("myproj");
+      expect(sessions.dateFiltersWindowDays).toBe(null);
+    });
+
+    it("persists deep-linked explicit date bounds", async () => {
+      sessions.initFromParams({
+        date_from: "2026-01-01",
+        date_to: "2026-01-31",
+      });
+      await sessions.load();
+
+      const saved = JSON.parse(localStorage.getItem("session-filters") ?? "{}");
+      expect(saved.dateFrom).toBe("2026-01-01");
+      expect(saved.dateTo).toBe("2026-01-31");
+    });
+  });
+
+  describe("sidebar loading", () => {
+    it("does not load sessions when no sidebar consumer is mounted", async () => {
+      sessions.refreshSidebarIfAttached();
+
+      expect(api.listSessions).not.toHaveBeenCalled();
+      expect(api.getSidebarSessionIndex).not.toHaveBeenCalled();
+      expect(sessions.sessions).toHaveLength(0);
+    });
+
+    it("loads a bounded first page when the sidebar is mounted", async () => {
+      const rows = Array.from({ length: 500 }, (_, i) => makeSkinnyRow({ id: `s${i}` }));
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+        sessions: rows,
+        total: 86312,
+        next_cursor: "next",
+      });
+
+      const detach = sessions.attachSidebar();
+      await sessions.load();
+      detach();
+
+      expect(api.listSessions).not.toHaveBeenCalled();
+      expect(api.getSidebarSessionIndex).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          limit: 500,
+        }),
+      );
+      expect(sessions.sessions).toHaveLength(500);
+      expect(sessions.total).toBe(86312);
+      expect(sessions.nextCursor).toBe("next");
+    });
+
+    it("keeps sidebar rows skinny and carries teammate classification", async () => {
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+        sessions: [
+          makeSkinnyRow({
+            id: "team",
+            is_teammate: true,
+          }),
+        ],
+        total: 1,
+        next_cursor: null,
+      });
+
+      const detach = sessions.attachSidebar();
+      await sessions.load();
+      detach();
+
+      expect(api.listSessions).not.toHaveBeenCalled();
+      expect(sessions.sessions[0]).toMatchObject({
+        id: "team",
+        is_teammate: true,
+        is_index_only: true,
+      });
+      expect(sessions.sessions[0]!.first_message).toBeNull();
+    });
+
+    it("coalesces duplicate sidebar loads for the same filter signature", async () => {
+      let resolvePage!: (value: {
+        sessions: SkinnySessionRow[];
+        total: number;
+        next_cursor?: string | null;
+      }) => void;
+      vi.mocked(api.getSidebarSessionIndex).mockReturnValue(
+        new Promise((resolve) => {
+          resolvePage = resolve;
+        }),
+      );
+
+      const detach = sessions.attachSidebar();
+      const first = sessions.load();
+      const second = sessions.load();
+      await Promise.resolve();
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+      resolvePage({ sessions: [], total: 0, next_cursor: null });
+      await Promise.all([first, second]);
+      detach();
+    });
+
+    it("aborts an in-flight sidebar load when the filter signature changes", async () => {
+      const signals: AbortSignal[] = [];
+      vi.mocked(callGenerated).mockImplementation(
+        (request: () => Promise<unknown>, signal?: AbortSignal) => {
+          if (signal) signals.push(signal);
+          return request();
+        },
+      );
+
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockReturnValueOnce(new Promise(() => {}))
+        .mockResolvedValueOnce({
+          sessions: [],
+          total: 0,
+          next_cursor: null,
+        });
+
+      const detach = sessions.attachSidebar();
+      void sessions.load();
+      await Promise.resolve();
+      expect(signals[0]?.aborted).toBe(false);
+
+      sessions.filters.project = "changed";
+      await sessions.load();
+
+      expect(signals[0]?.aborted).toBe(true);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      detach();
+    });
+
+    it("serializes only the sidebar filter subset for the index request", async () => {
+      sessions.filters.project = "proj";
+      sessions.filters.machine = "host-a";
+      sessions.filters.agent = "codex";
+      sessions.filters.date = "2026-05-23";
+      sessions.filters.dateFrom = "2026-05-01";
+      sessions.filters.dateTo = "2026-05-31";
+      sessions.filters.recentlyActive = true;
+      sessions.filters.minMessages = 2;
+      sessions.filters.maxMessages = 20;
+      sessions.filters.minUserMessages = 1;
+      sessions.filters.includeOneShot = false;
+      sessions.filters.includeAutomated = true;
+      sessions.filters.hideUnknownProject = true;
+
+      const detach = sessions.attachSidebar();
+      await sessions.load();
+      detach();
+
+      const params = vi.mocked(api.getSidebarSessionIndex).mock.calls[0]![0];
+      expect(params).toMatchObject({
+        project: "proj",
+        exclude_project: "unknown",
+        machine: "host-a",
+        agent: "codex",
+        date: "2026-05-23",
+        date_from: "2026-05-01",
+        date_to: "2026-05-31",
+        min_messages: 2,
+        max_messages: 20,
+        min_user_messages: 1,
+        include_one_shot: undefined,
+        include_automated: true,
+        limit: 500,
+      });
+      expect(typeof params.active_since).toBe("string");
+      expect(params.cursor).toBeUndefined();
+      expect(params.health_grade).toBeUndefined();
+      expect(params.outcome).toBeUndefined();
+      expect(params.min_tool_failures).toBeUndefined();
+      expect(params.starred).toBeUndefined();
+    });
+
+    it("requests a server-side starred sidebar page when starred-only is active", async () => {
+      starred.filterOnly = true;
+
+      const detach = sessions.attachSidebar();
+      await sessions.load();
+      detach();
+
+      const params = vi.mocked(api.getSidebarSessionIndex).mock.calls[0]![0];
+      expect(params.starred).toBe(true);
+      expect(params.cursor).toBeUndefined();
+      expect(params.limit).toBe(500);
+    });
+
+    it("keeps display_name available without hydration", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "renamed",
+          display_name: "Renamed sidebar title",
+        }),
+      ]);
+
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.display_name).toBe("Renamed sidebar title");
+      expect(sessions.sessions[0]!.first_message).toBeNull();
+    });
+
+    it("marks skinny sidebar rows as index-only until hydrated", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "skinny" })]);
+
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.is_index_only).toBe(true);
+    });
+
+    it("preserves hydrated active rows when reloading the index", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "active", message_count: 1 })]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "active",
+          first_message: "hydrated active detail",
+          message_count: 1,
+        }),
+      );
+
+      await sessions.load();
+      sessions.selectSession("active");
+      await vi.waitFor(() => {
+        expect(sessions.activeSession?.first_message).toBe("hydrated active detail");
+      });
+
+      mockSidebarIndex([makeSkinnyRow({ id: "active", message_count: 9 })]);
+      await sessions.load();
+
+      expect(sessions.sessions).toHaveLength(1);
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+      expect(sessions.sessions[0]!.message_count).toBe(9);
+      expect(sessions.activeSession?.first_message).toBe("hydrated active detail");
+    });
+
+    it("keeps the active appended row when the reloaded index omits it", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "listed" })]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "offpage",
+          first_message: "hydrated offpage detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.navigateToSession("offpage");
+      expect(sessions.activeSession?.first_message).toBe("hydrated offpage detail");
+
+      await sessions.load();
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "offpage"]);
+      expect(sessions.activeSession?.first_message).toBe("hydrated offpage detail");
+    });
+
+    it("moves the appended active row into place when pagination reaches it", async () => {
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "listed" })],
+        total: 2,
+        next_cursor: "page-2",
+      });
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "offpage",
+          first_message: "hydrated offpage detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.navigateToSession("offpage");
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "offpage"]);
+
+      // A page that doesn't contain the appended row keeps it at the
+      // tail, preserving index order for keyboard navigation.
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "middle" })],
+        total: 4,
+        next_cursor: "page-3",
+      });
+      await sessions.loadMore();
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "middle", "offpage"]);
+
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "offpage" }), makeSkinnyRow({ id: "last" })],
+        total: 4,
+        next_cursor: null,
+      });
+      await sessions.loadMore();
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["listed", "middle", "offpage", "last"]);
+      expect(sessions.activeSession?.first_message).toBe("hydrated offpage detail");
+    });
+
+    it("refreshes hydrated agent identity fields from the sidebar index", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "active",
+          agent_label: "old-label",
+          entrypoint: "old-entrypoint",
+        }),
+      ]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "active",
+          agent_label: "old-label",
+          entrypoint: "old-entrypoint",
+          first_message: "hydrated active detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.hydrateVisibleSessions(["active"]);
+
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "active",
+          agent_label: "triage",
+          entrypoint: "sdk-cli",
+        }),
+      ]);
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+      expect(sessions.sessions[0]!.first_message).toBe("hydrated active detail");
+      expect(sessions.sessions[0]!.agent_label).toBe("triage");
+      expect(sessions.sessions[0]!.entrypoint).toBe("sdk-cli");
+    });
+
+    it("clears stale display names from hydrated rows when the index has none", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "renamed",
+          display_name: "Old custom name",
+        }),
+      ]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "renamed",
+          display_name: "Old custom name",
+          first_message: "hydrated detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.hydrateVisibleSessions(["renamed"]);
+      expect(sessions.sessions[0]!.display_name).toBe("Old custom name");
+
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "renamed",
+          display_name: null,
+        }),
+      ]);
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.display_name).toBeNull();
+      expect(sessions.sessions[0]!.first_message).toBe("hydrated detail");
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("merges hydrated full rows without changing index order", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "second" }), makeSkinnyRow({ id: "first" })]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "first", first_message: "full detail" }),
+      );
+
+      await sessions.load();
+      await (sessions as any).hydrateVisibleSessions(["first"]);
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["second", "first"]);
+      expect(sessions.sessions[1]!.first_message).toBe("full detail");
+      expect(sessions.sessions[1]!.is_index_only).toBe(false);
+    });
+
+    it("drops stale-version hydration results", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "stale" })]);
+      await sessions.load();
+      const staleVersion = (sessions as any).sidebarIndexVersion;
+
+      let resolveDetail: ((session: Session) => void) | null = null;
+      vi.mocked(api.getSession).mockReturnValueOnce(
+        new Promise<Session>((resolve) => {
+          resolveDetail = resolve;
+        }),
+      );
+      const hydratePromise = (sessions as any).hydrateVisibleSessions(["stale"], staleVersion);
+
+      mockSidebarIndex([makeSkinnyRow({ id: "fresh" })]);
+      await sessions.load();
+      resolveDetail!(
+        makeSession({
+          id: "stale",
+          first_message: "stale detail",
+        }),
+      );
+      await hydratePromise;
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["fresh"]);
+      expect(sessions.sessions[0]!.first_message).toBeNull();
+    });
+
+    it("prunes hydration caches from stale index versions", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "old" })]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "old", first_message: "old detail" }),
+      );
+      await sessions.load();
+      const oldVersion = (sessions as any).sidebarIndexVersion;
+      await (sessions as any).hydrateVisibleSessions(["old"]);
+
+      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion)).toBe(true);
+      expect((sessions as any).sidebarHydrationInflightByVersion.has(oldVersion)).toBe(true);
+      expect((sessions as any).sidebarHydrationEpochByVersion.has(oldVersion)).toBe(true);
+
+      mockSidebarIndex([makeSkinnyRow({ id: "new" })]);
+      await sessions.load();
+      const newVersion = (sessions as any).sidebarIndexVersion;
+
+      expect(oldVersion).not.toBe(newVersion);
+      expect((sessions as any).hydratedSessionsByVersion.has(oldVersion)).toBe(false);
+      expect((sessions as any).sidebarHydrationInflightByVersion.has(oldVersion)).toBe(false);
+      expect((sessions as any).sidebarHydrationEpochByVersion.has(oldVersion)).toBe(false);
+      expect([...(sessions as any).hydratedSessionsByVersion.keys()]).toEqual([newVersion]);
+      expect([...(sessions as any).sidebarHydrationEpochByVersion.keys()]).toEqual([newVersion]);
+    });
+
+    it("dedupes overlapping visible hydration for the same session", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "same" })]);
+      await sessions.load();
+
+      let resolveDetail!: (session: Session) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise<Session>((resolve) => {
+          resolveDetail = resolve;
+        }),
+      );
+
+      const first = (sessions as any).hydrateVisibleSessions(["same"]);
+      const second = (sessions as any).hydrateVisibleSessions(["same"]);
+      await Promise.resolve();
+
+      expect(api.getSession).toHaveBeenCalledTimes(1);
+
+      resolveDetail(makeSession({ id: "same", first_message: "detail" }));
+      await Promise.all([first, second]);
+
+      expect(sessions.sessions[0]!.first_message).toBe("detail");
+    });
+
+    it("bounds visible hydration concurrency", async () => {
+      const rows = Array.from({ length: 10 }, (_, i) => makeSkinnyRow({ id: `s${i}` }));
+      mockSidebarIndex(rows);
+      await sessions.load();
+
+      const resolvers: Array<() => void> = [];
+      let inFlight = 0;
+      let maxInFlight = 0;
+      vi.mocked(api.getSession).mockImplementation((id: string) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        return new Promise<Session>((resolve) => {
+          resolvers.push(() => {
+            inFlight--;
+            resolve(makeSession({ id }));
+          });
+        });
+      });
+
+      const hydrate = (sessions as any).hydrateVisibleSessions(rows.map((row) => row.id));
+
+      await vi.waitFor(() => {
+        expect(resolvers.length).toBeGreaterThan(0);
+      });
+      expect(maxInFlight).toBeLessThanOrEqual(6);
+
+      while (resolvers.length > 0) {
+        resolvers.shift()!();
+        await Promise.resolve();
+      }
+      await hydrate;
+      expect(api.getSession).toHaveBeenCalledTimes(10);
+    });
+
+    it("refreshing the active session preserves teammate metadata", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "team", is_teammate: true })]);
+      await sessions.load();
+      sessions.selectSession("team");
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "team", first_message: "full detail" }),
+      );
+
+      await sessions.refreshActiveSession();
+
+      expect(sessions.sessions[0]!.first_message).toBe("full detail");
+      expect(sessions.sessions[0]!.is_teammate).toBe(true);
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("selecting an index-only session hydrates it", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "select-me" })]);
+      await sessions.load();
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "select-me",
+          first_message: "hydrated on select",
+        }),
+      );
+
+      sessions.selectSession("select-me");
+
+      await vi.waitFor(() => {
+        expect(sessions.sessions[0]!.first_message).toBe("hydrated on select");
+      });
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("does not expose index-only rows through activeSession", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "active" })]);
+      await sessions.load();
+      let resolveDetail!: (session: Session) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise<Session>((resolve) => {
+          resolveDetail = resolve;
+        }),
+      );
+
+      sessions.selectSession("active");
+
+      expect(sessions.activeSession).toBeUndefined();
+
+      resolveDetail(
+        makeSession({
+          id: "active",
+          first_message: "ready for detail consumers",
+        }),
+      );
+      await vi.waitFor(() => {
+        expect(sessions.activeSession?.first_message).toBe("ready for detail consumers");
+      });
+    });
+
+    it("reloads the canonical group total after deleting a child", async () => {
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({ id: "root" }),
+            makeSkinnyRow({
+              id: "child",
+              parent_session_id: "root",
+            }),
+          ],
+          total: 1,
+          next_cursor: null,
+        })
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "root" })],
+          total: 1,
+          next_cursor: null,
+        });
+      vi.mocked((api as any).deleteSession).mockResolvedValue(undefined);
+      vi.mocked(api.getProjects).mockResolvedValue({ projects: [] });
+      vi.mocked(api.getAgents).mockResolvedValue({ agents: [] });
+      vi.mocked((api as any).getMachines).mockResolvedValue({ machines: [] });
+
+      await sessions.load();
+      await sessions.deleteSession("child");
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["root"]);
+      expect(sessions.total).toBe(1);
+      expect(api.getProjects).toHaveBeenCalled();
+      expect(api.getAgents).toHaveBeenCalled();
+      expect((api as any).getMachines).toHaveBeenCalled();
+    });
+
+    it("reloads the canonical group after deleting its root", async () => {
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({ id: "root" }),
+            makeSkinnyRow({
+              id: "child",
+              parent_session_id: "root",
+            }),
+          ],
+          total: 1,
+          next_cursor: null,
+        })
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({
+              id: "child",
+              parent_session_id: "root",
+            }),
+          ],
+          total: 1,
+          next_cursor: null,
+        });
+      vi.mocked((api as any).deleteSession).mockResolvedValue(undefined);
+
+      await sessions.load();
+      await sessions.deleteSession("root");
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["child"]);
+      expect(sessions.total).toBe(1);
+    });
+
+    it("batch delete creates one undo entry for the whole batch", async () => {
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({ id: "remove-a" }),
+            makeSkinnyRow({ id: "remove-b" }),
+            makeSkinnyRow({ id: "keep-me" }),
+          ],
+          total: 3,
+          next_cursor: null,
+        })
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "keep-me" })],
+          total: 1,
+          next_cursor: null,
+        });
+      vi.mocked(api.batchDeleteSessions).mockResolvedValue(undefined);
+      vi.mocked(api.getProjects).mockResolvedValue({ projects: [] });
+      vi.mocked(api.getAgents).mockResolvedValue({ agents: [] });
+      vi.mocked((api as any).getMachines).mockResolvedValue({ machines: [] });
+
+      await sessions.load();
+      await sessions.batchDeleteSessions(["remove-a", "remove-b"]);
+
+      expect(api.batchDeleteSessions).toHaveBeenCalledWith(["remove-a", "remove-b"]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["keep-me"]);
+      expect(sessions.total).toBe(1);
+      expect(sessions.recentlyDeleted).toHaveLength(1);
+      expect(sessions.recentlyDeleted[0]!.ids).toEqual(["remove-a", "remove-b"]);
+    });
+
+    it("reloads sidebar totals after deleting child rows", async () => {
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockResolvedValueOnce({
+          sessions: [
+            makeSkinnyRow({ id: "parent" }),
+            makeSkinnyRow({
+              id: "child",
+              parent_session_id: "parent",
+            }),
+          ],
+          total: 1,
+          next_cursor: null,
+        })
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "parent" })],
+          total: 1,
+          next_cursor: null,
+        });
+      vi.mocked(api.batchDeleteSessions).mockResolvedValue(undefined);
+      vi.mocked(api.getProjects).mockResolvedValue({ projects: [] });
+      vi.mocked(api.getAgents).mockResolvedValue({ agents: [] });
+      vi.mocked((api as any).getMachines).mockResolvedValue({ machines: [] });
+
+      await sessions.load();
+      await sessions.batchDeleteSessions(["child"]);
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["parent"]);
+      expect(sessions.total).toBe(1);
+      expect(sessions.recentlyDeleted[0]!.ids).toEqual(["child"]);
+    });
+
+    it("does not reuse a pre-delete in-flight sidebar load after batch delete", async () => {
+      let resolveStaleLoad!: (value: {
+        sessions: SkinnySessionRow[];
+        total: number;
+        next_cursor?: string | null;
+      }) => void;
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveStaleLoad = resolve;
+          }),
+        )
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "keep-me" })],
+          total: 1,
+          next_cursor: null,
+        });
+      vi.mocked(api.batchDeleteSessions).mockResolvedValue(undefined);
+      vi.mocked(api.getProjects).mockResolvedValue({ projects: [] });
+      vi.mocked(api.getAgents).mockResolvedValue({ agents: [] });
+      vi.mocked((api as any).getMachines).mockResolvedValue({ machines: [] });
+
+      const staleLoad = sessions.load();
+      await Promise.resolve();
+
+      const deletePromise = sessions.batchDeleteSessions(["remove-me"]);
+
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      });
+
+      resolveStaleLoad({
+        sessions: [makeSkinnyRow({ id: "remove-me" }), makeSkinnyRow({ id: "keep-me" })],
+        total: 2,
+        next_cursor: null,
+      });
+      await Promise.all([staleLoad, deletePromise]);
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["keep-me"]);
+      expect(sessions.total).toBe(1);
+    });
+
+    it("restore reloads the sidebar index", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "before" })]);
+      vi.mocked((api as any).restoreSession).mockResolvedValue(undefined);
+      await sessions.load();
+      mockSidebarIndex([makeSkinnyRow({ id: "after" })]);
+
+      await sessions.restoreSession("before");
+
+      expect((api as any).restoreSession).toHaveBeenCalledWith("before");
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["after"]);
+    });
+
+    it("removes only one id from a recently deleted batch", () => {
+      const timer = setTimeout(() => {}, 10_000);
+      sessions.recentlyDeleted = [{ key: 1, ids: ["restore-a", "restore-b"], timer }];
+
+      sessions.clearRecentlyDeleted("restore-a");
+
+      expect(sessions.recentlyDeleted).toHaveLength(1);
+      expect(sessions.recentlyDeleted[0]!.ids).toEqual(["restore-b"]);
+
+      sessions.clearRecentlyDeleted();
+    });
+
+    it("restores all sessions from one recently deleted batch", async () => {
+      const timer = setTimeout(() => {}, 10_000);
+      sessions.recentlyDeleted = [{ key: 1, ids: ["restore-a", "restore-b"], timer }];
+      vi.mocked((api as any).restoreSession).mockResolvedValue(undefined);
+      mockSidebarIndex([makeSkinnyRow({ id: "restore-a" }), makeSkinnyRow({ id: "restore-b" })]);
+
+      await sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!);
+
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(1, "restore-a");
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(2, "restore-b");
+      expect(sessions.recentlyDeleted).toEqual([]);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reuse a post-delete in-flight sidebar load after batch undo", async () => {
+      let resolveDeleteReload!: (value: {
+        sessions: SkinnySessionRow[];
+        total: number;
+        next_cursor?: string | null;
+      }) => void;
+      vi.mocked(api.getSidebarSessionIndex)
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveDeleteReload = resolve;
+          }),
+        )
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "restore-me" })],
+          total: 1,
+          next_cursor: null,
+        });
+      vi.mocked(api.batchDeleteSessions).mockResolvedValue(undefined);
+      vi.mocked((api as any).restoreSession).mockResolvedValue(undefined);
+      vi.mocked(api.getProjects).mockResolvedValue({ projects: [] });
+      vi.mocked(api.getAgents).mockResolvedValue({ agents: [] });
+      vi.mocked((api as any).getMachines).mockResolvedValue({ machines: [] });
+
+      const deletePromise = sessions.batchDeleteSessions(["restore-me"]);
+      await vi.waitFor(() => {
+        expect(sessions.recentlyDeleted).toHaveLength(1);
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      });
+
+      const restorePromise = sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!);
+
+      await vi.waitFor(() => {
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      });
+
+      resolveDeleteReload({
+        sessions: [],
+        total: 0,
+        next_cursor: null,
+      });
+      await Promise.all([deletePromise, restorePromise]);
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["restore-me"]);
+      expect(sessions.total).toBe(1);
+    });
+
+    it("keeps only failed ids when batch undo partially fails", async () => {
+      const timer = setTimeout(() => {}, 10_000);
+      sessions.recentlyDeleted = [
+        {
+          key: 1,
+          ids: ["restore-a", "restore-b", "restore-c"],
+          timer,
+        },
+      ];
+      vi.mocked((api as any).restoreSession)
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error("restore failed"))
+        .mockResolvedValueOnce(undefined);
+      mockSidebarIndex([makeSkinnyRow({ id: "restore-b" })]);
+
+      await expect(sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!)).rejects.toThrow(
+        "Failed to restore 1 session",
+      );
+
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(1, "restore-a");
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(2, "restore-b");
+      expect((api as any).restoreSession).toHaveBeenNthCalledWith(3, "restore-c");
+      expect(sessions.recentlyDeleted).toHaveLength(1);
+      expect(sessions.recentlyDeleted[0]!.ids).toEqual(["restore-b"]);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+      sessions.clearRecentlyDeleted();
+    });
+
+    it("keeps failed ids retryable if the original timer expires during batch undo", async () => {
+      vi.useFakeTimers();
+      try {
+        const timer = setTimeout(() => {
+          sessions.recentlyDeleted = sessions.recentlyDeleted.filter((d) => d.key !== 1);
+        }, 10_000);
+        sessions.recentlyDeleted = [{ key: 1, ids: ["restore-a"], timer }];
+        vi.mocked((api as any).restoreSession).mockImplementation(async () => {
+          vi.advanceTimersByTime(10_000);
+          throw new Error("restore failed");
+        });
+        mockSidebarIndex([makeSkinnyRow({ id: "restore-a" })]);
+
+        await expect(sessions.restoreRecentlyDeleted(sessions.recentlyDeleted[0]!)).rejects.toThrow(
+          "Failed to restore 1 session",
+        );
+
+        expect(sessions.recentlyDeleted).toHaveLength(1);
+        expect(sessions.recentlyDeleted[0]!.ids).toEqual(["restore-a"]);
+
+        vi.advanceTimersByTime(9_999);
+        expect(sessions.recentlyDeleted).toHaveLength(1);
+
+        vi.advanceTimersByTime(1);
+        expect(sessions.recentlyDeleted).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -314,12 +1530,20 @@ describe("SessionsStore", () => {
   });
 
   describe("load serialization", () => {
+    it("should pass the browser timezone", async () => {
+      await sessions.load();
+
+      expectSidebarIndexCalledWith({
+        timezone: "America/New_York",
+      });
+    });
+
     it("should omit min/max_messages when 0", async () => {
       sessions.filters.minMessages = 0;
       sessions.filters.maxMessages = 0;
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         min_messages: undefined,
         max_messages: undefined,
       });
@@ -329,28 +1553,28 @@ describe("SessionsStore", () => {
       sessions.filters.minMessages = 5;
       await sessions.load();
 
-      expectListSessionsCalledWith({ min_messages: 5 });
+      expectSidebarIndexCalledWith({ min_messages: 5 });
     });
 
     it("should include positive max_messages", async () => {
       sessions.filters.maxMessages = 100;
       await sessions.load();
 
-      expectListSessionsCalledWith({ max_messages: 100 });
+      expectSidebarIndexCalledWith({ max_messages: 100 });
     });
 
     it("should pass project filter when set", async () => {
       sessions.filters.project = "myproj";
       await sessions.load();
 
-      expectListSessionsCalledWith({ project: "myproj" });
+      expectSidebarIndexCalledWith({ project: "myproj" });
     });
 
     it("should omit project when empty", async () => {
       sessions.filters.project = "";
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         project: undefined,
       });
     });
@@ -359,21 +1583,21 @@ describe("SessionsStore", () => {
       sessions.filters.agent = "claude";
       await sessions.load();
 
-      expectListSessionsCalledWith({ agent: "claude" });
+      expectSidebarIndexCalledWith({ agent: "claude" });
     });
 
     it("should omit agent when empty", async () => {
       sessions.filters.agent = "";
       await sessions.load();
 
-      expectListSessionsCalledWith({ agent: undefined });
+      expectSidebarIndexCalledWith({ agent: undefined });
     });
 
     it("should pass date filter when set", async () => {
       sessions.filters.date = "2024-06-15";
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         date: "2024-06-15",
       });
     });
@@ -382,14 +1606,14 @@ describe("SessionsStore", () => {
       sessions.filters.date = "";
       await sessions.load();
 
-      expectListSessionsCalledWith({ date: undefined });
+      expectSidebarIndexCalledWith({ date: undefined });
     });
 
     it("should pass date_from filter when set", async () => {
       sessions.filters.dateFrom = "2024-06-01";
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         date_from: "2024-06-01",
       });
     });
@@ -398,7 +1622,7 @@ describe("SessionsStore", () => {
       sessions.filters.dateFrom = "";
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         date_from: undefined,
       });
     });
@@ -407,7 +1631,7 @@ describe("SessionsStore", () => {
       sessions.filters.dateTo = "2024-06-30";
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         date_to: "2024-06-30",
       });
     });
@@ -416,88 +1640,47 @@ describe("SessionsStore", () => {
       sessions.filters.dateTo = "";
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         date_to: undefined,
       });
     });
   });
 
   describe("loadMore serialization", () => {
-    it("should fetch all pages with consistent filters in load()", async () => {
-      vi.mocked(api.listSessions)
-        .mockResolvedValueOnce({
-          sessions: [
-            {
-              id: "s1",
-              project: "proj",
-              machine: "m",
-              agent: "a",
-              first_message: null,
-              started_at: null,
-              ended_at: null,
-              message_count: 1,
-              user_message_count: 1,
-              total_output_tokens: 0,
-              peak_context_tokens: 0,
-              has_total_output_tokens: false,
-              has_peak_context_tokens: false,
-              is_automated: false,
-              created_at: "2024-01-01T00:00:00Z",
-            },
-          ],
-          total: 2,
-          next_cursor: "cur1",
-        })
-        .mockResolvedValueOnce({
-          sessions: [
-            {
-              id: "s2",
-              project: "proj",
-              machine: "m",
-              agent: "a",
-              first_message: null,
-              started_at: null,
-              ended_at: null,
-              message_count: 1,
-              user_message_count: 1,
-              total_output_tokens: 0,
-              peak_context_tokens: 0,
-              has_total_output_tokens: false,
-              has_peak_context_tokens: false,
-              is_automated: false,
-              created_at: "2024-01-01T00:00:01Z",
-            },
-          ],
-          total: 2,
-        });
+    it("should pass the browser timezone in loadMore", async () => {
+      sessions.nextCursor = "cur-timezone";
+
+      mockSidebarPage();
+      await sessions.loadMore();
+
+      expectPaginatedSidebarIndexCalledWith({
+        timezone: "America/New_York",
+      });
+    });
+
+    it("should load the sidebar index once with consistent filters", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "s1" }), makeSkinnyRow({ id: "s2" })]);
 
       sessions.filters.minMessages = 10;
       sessions.filters.maxMessages = 50;
       await sessions.load();
 
-      expect(api.listSessions).toHaveBeenCalledTimes(2);
-      const calls = vi.mocked(api.listSessions).mock.calls;
-      const first = calls[0]?.[0];
-      const second = calls[1]?.[0];
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      const first = vi.mocked(api.getSidebarSessionIndex).mock.calls[0]?.[0];
 
       expect(first?.min_messages).toBe(10);
       expect(first?.max_messages).toBe(50);
       expect(first?.cursor).toBeUndefined();
-
-      expect(second?.min_messages).toBe(10);
-      expect(second?.max_messages).toBe(50);
-      expect(second?.cursor).toBe("cur1");
 
       expect(sessions.sessions).toHaveLength(2);
       expect(sessions.total).toBe(2);
       expect(sessions.nextCursor).toBeNull();
     });
 
-    it("swaps sessions atomically after all pages load", async () => {
+    it("preserves old sidebar rows while the index reload is in flight", async () => {
       // Pre-populate with a list representing a prior load,
-      // then trigger a multi-page reload. The visible count
-      // must not tick up as pages arrive — old data stays,
-      // then the new data replaces it in one step.
+      // then trigger a delayed index reload. The old rows stay
+      // visible until the new index request succeeds.
       sessions.sessions = [
         makeSession({ id: "old-a" }),
         makeSession({ id: "old-b" }),
@@ -505,51 +1688,34 @@ describe("SessionsStore", () => {
       ];
       sessions.total = 3;
 
-      let resolvePage2: ((v: {
-        sessions: Session[];
+      let resolveIndex: ((v: { sessions: SkinnySessionRow[]; total: number }) => void) | null =
+        null;
+      const indexPromise = new Promise<{
+        sessions: SkinnySessionRow[];
         total: number;
-        next_cursor?: string;
-      }) => void) | null = null;
-      const page2Promise = new Promise<{
-        sessions: Session[];
-        total: number;
-        next_cursor?: string;
       }>((resolve) => {
-        resolvePage2 = resolve;
+        resolveIndex = resolve;
       });
 
-      vi.mocked(api.listSessions)
-        .mockResolvedValueOnce({
-          sessions: [makeSession({ id: "new-1" })],
-          total: 2,
-          next_cursor: "c1",
-        })
-        .mockReturnValueOnce(page2Promise);
+      vi.mocked(api.getSidebarSessionIndex).mockReturnValueOnce(indexPromise);
 
       const loadPromise = sessions.load();
 
-      // Flush the first page fetch without resolving the second.
+      // Flush the load start without resolving the index request.
       await Promise.resolve();
       await Promise.resolve();
 
-      // Old sessions are still visible while pagination is in flight.
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "old-a",
-        "old-b",
-        "old-c",
-      ]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["old-a", "old-b", "old-c"]);
       expect(sessions.total).toBe(3);
+      expect(sessions.loading).toBe(true);
 
-      resolvePage2!({
-        sessions: [makeSession({ id: "new-2" })],
+      resolveIndex!({
+        sessions: [makeSkinnyRow({ id: "new-1" }), makeSkinnyRow({ id: "new-2" })],
         total: 2,
       });
       await loadPromise;
 
-      expect(sessions.sessions.map((s) => s.id)).toEqual([
-        "new-1",
-        "new-2",
-      ]);
+      expect(sessions.sessions.map((s) => s.id)).toEqual(["new-1", "new-2"]);
       expect(sessions.total).toBe(2);
       expect(sessions.nextCursor).toBeNull();
     });
@@ -557,10 +1723,10 @@ describe("SessionsStore", () => {
     it("should omit min/max when 0 in loadMore", async () => {
       sessions.nextCursor = "cur2";
 
-      mockListSessions();
+      mockSidebarPage();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedSidebarIndexCalledWith({
         min_messages: undefined,
         max_messages: undefined,
       });
@@ -570,30 +1736,30 @@ describe("SessionsStore", () => {
       sessions.nextCursor = "cur3";
       sessions.filters.agent = "";
 
-      mockListSessions();
+      mockSidebarPage();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({ agent: undefined });
+      expectPaginatedSidebarIndexCalledWith({ agent: undefined });
     });
 
     it("should omit date when empty in loadMore", async () => {
       sessions.nextCursor = "cur3";
       sessions.filters.date = "";
 
-      mockListSessions();
+      mockSidebarPage();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({ date: undefined });
+      expectPaginatedSidebarIndexCalledWith({ date: undefined });
     });
 
     it("should omit date_from when empty in loadMore", async () => {
       sessions.nextCursor = "cur3";
       sessions.filters.dateFrom = "";
 
-      mockListSessions();
+      mockSidebarPage();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedSidebarIndexCalledWith({
         date_from: undefined,
       });
     });
@@ -602,10 +1768,10 @@ describe("SessionsStore", () => {
       sessions.nextCursor = "cur3";
       sessions.filters.dateTo = "";
 
-      mockListSessions();
+      mockSidebarPage();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedSidebarIndexCalledWith({
         date_to: undefined,
       });
     });
@@ -617,10 +1783,10 @@ describe("SessionsStore", () => {
       sessions.filters.dateFrom = "2024-07-01";
       sessions.filters.dateTo = "2024-07-31";
 
-      mockListSessions();
+      mockSidebarPage();
       await sessions.loadMore();
 
-      expectListSessionsCalledWith({
+      expectPaginatedSidebarIndexCalledWith({
         agent: "codex",
         date: "2024-07-01",
         date_from: "2024-07-01",
@@ -643,7 +1809,7 @@ describe("SessionsStore", () => {
       // Wait for load() triggered by setProjectFilter to complete,
       // not just start — verifies loading clears after the fetch.
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
         expect(sessions.loading).toBe(false);
       });
 
@@ -656,7 +1822,7 @@ describe("SessionsStore", () => {
       expect(sessions.filters.maxMessages).toBe(0);
       expect(sessions.activeSessionId).toBeNull();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         project: "myproj",
         agent: "codex",
         date: undefined,
@@ -673,7 +1839,7 @@ describe("SessionsStore", () => {
       sessions.filters.hideUnknownProject = true;
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         exclude_project: "unknown",
       });
     });
@@ -682,7 +1848,7 @@ describe("SessionsStore", () => {
       sessions.filters.hideUnknownProject = false;
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         exclude_project: undefined,
       });
     });
@@ -691,12 +1857,12 @@ describe("SessionsStore", () => {
       sessions.filters.project = "unknown";
       sessions.setHideUnknownProjectFilter(true);
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.project).toBe("");
       expect(sessions.filters.hideUnknownProject).toBe(true);
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         project: undefined,
         exclude_project: "unknown",
       });
@@ -706,7 +1872,7 @@ describe("SessionsStore", () => {
       sessions.filters.project = "my_app";
       sessions.setHideUnknownProjectFilter(true);
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.project).toBe("my_app");
@@ -737,9 +1903,7 @@ describe("SessionsStore", () => {
     });
 
     it("should split hide-unknown from usage project exclusions", () => {
-      expect(
-        splitExcludeProjectParam("alpha,unknown,beta"),
-      ).toEqual({
+      expect(splitExcludeProjectParam("alpha,unknown,beta")).toEqual({
         hideUnknownProject: true,
         usageExcludedProjects: "alpha,beta",
       });
@@ -755,7 +1919,7 @@ describe("SessionsStore", () => {
       sessions.filters.project = "unknown";
       await sessions.load();
 
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         project: "unknown",
         exclude_project: undefined,
       });
@@ -765,7 +1929,7 @@ describe("SessionsStore", () => {
       sessions.filters.hideUnknownProject = true;
       sessions.clearSessionFilters();
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.hideUnknownProject).toBe(false);
@@ -805,7 +1969,7 @@ describe("SessionsStore", () => {
 
       sessions.clearSessionFilters();
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.hasActiveFilters).toBe(false);
@@ -816,11 +1980,86 @@ describe("SessionsStore", () => {
       sessions.filters.agent = "claude";
       sessions.clearSessionFilters();
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.project).toBe("myproj");
       expect(sessions.hasActiveFilters).toBe(false);
+    });
+
+    it("clears the date yoke before clearing the active session", () => {
+      sessions.activeSessionId = "session-1";
+      sessions.filters.dateFrom = "2025-05-01";
+      sessions.filters.dateTo = "2025-05-31";
+      yokedDates.setEnabled(true);
+      yokedDates.updateFromPanel({
+        from: "2025-05-01",
+        to: "2025-05-31",
+        mode: "rolling",
+        windowDays: 30,
+      });
+      expect(yokedDates.range).not.toBeNull();
+
+      const store = sessions as unknown as {
+        setActiveSession: (id: string | null) => void;
+      };
+      const setActiveSession = store.setActiveSession.bind(sessions);
+      const spy = vi.spyOn(store, "setActiveSession").mockImplementation((id) => {
+        expect(yokedDates.range).toBeNull();
+        setActiveSession(id);
+      });
+
+      sessions.clearSessionFilters();
+
+      expect(spy).toHaveBeenCalledWith(null);
+      expect(sessions.activeSessionId).toBeNull();
+      expect(yokedDates.range).toBeNull();
+    });
+
+    it("clears the date yoke before clearing the active session when requested by route intent", () => {
+      sessions.activeSessionId = "session-1";
+      sessions.filters.agent = "codex";
+      yokedDates.setEnabled(true);
+      yokedDates.updateFromPanel({
+        from: "2025-05-01",
+        to: "2025-05-31",
+        mode: "rolling",
+        windowDays: 30,
+      });
+      expect(yokedDates.range).not.toBeNull();
+
+      const store = sessions as unknown as {
+        setActiveSession: (id: string | null) => void;
+      };
+      const setActiveSession = store.setActiveSession.bind(sessions);
+      const spy = vi.spyOn(store, "setActiveSession").mockImplementation((id) => {
+        expect(yokedDates.range).toBeNull();
+        setActiveSession(id);
+      });
+
+      sessions.clearSessionFilters({ clearDateYoke: true });
+
+      expect(spy).toHaveBeenCalledWith(null);
+      expect(sessions.activeSessionId).toBeNull();
+      expect(yokedDates.range).toBeNull();
+    });
+
+    it("keeps the date yoke for non-date filter clears without route date intent", () => {
+      sessions.filters.agent = "codex";
+      yokedDates.setEnabled(true);
+      yokedDates.updateFromPanel({
+        from: "2025-05-01",
+        to: "2025-05-31",
+        mode: "fixed",
+      });
+
+      sessions.clearSessionFilters();
+
+      expect(yokedDates.range).toMatchObject({
+        from: "2025-05-01",
+        to: "2025-05-31",
+        mode: "fixed",
+      });
     });
   });
 
@@ -828,33 +2067,30 @@ describe("SessionsStore", () => {
     it("should toggle one machine on and serialize it", async () => {
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.machine).toBe("host-a");
       expect(sessions.selectedMachines).toEqual(["host-a"]);
       expect(sessions.isMachineSelected("host-a")).toBe(true);
-      expectListSessionsCalledWith({ machine: "host-a" });
+      expectSidebarIndexCalledWith({ machine: "host-a" });
     });
 
     it("should allow multiple selected machines", async () => {
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalledTimes(1);
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
       });
 
       sessions.toggleMachineFilter("host-b");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalledTimes(2);
+        expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
       });
 
       expect(sessions.filters.machine).toBe("host-a,host-b");
-      expect(sessions.selectedMachines).toEqual([
-        "host-a",
-        "host-b",
-      ]);
+      expect(sessions.selectedMachines).toEqual(["host-a", "host-b"]);
       expect(sessions.isMachineSelected("host-b")).toBe(true);
-      expectListSessionsCalledWith({
+      expectSidebarIndexCalledWith({
         machine: "host-a,host-b",
       });
     });
@@ -864,13 +2100,13 @@ describe("SessionsStore", () => {
 
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.machine).toBe("host-b");
       expect(sessions.selectedMachines).toEqual(["host-b"]);
       expect(sessions.isMachineSelected("host-a")).toBe(false);
-      expectListSessionsCalledWith({ machine: "host-b" });
+      expectSidebarIndexCalledWith({ machine: "host-b" });
     });
 
     it("should clear the filter when the last machine is removed", async () => {
@@ -878,12 +2114,12 @@ describe("SessionsStore", () => {
 
       sessions.toggleMachineFilter("host-a");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.machine).toBe("");
       expect(sessions.selectedMachines).toEqual([]);
-      expectListSessionsCalledWith({ machine: undefined });
+      expectSidebarIndexCalledWith({ machine: undefined });
     });
   });
 
@@ -893,13 +2129,13 @@ describe("SessionsStore", () => {
 
       sessions.toggleAgentFilter("opencode");
       await vi.waitFor(() => {
-        expect(api.listSessions).toHaveBeenCalled();
+        expect(api.getSidebarSessionIndex).toHaveBeenCalled();
       });
 
       expect(sessions.filters.agent).toBe("");
       expect(sessions.selectedAgents).toEqual([]);
       expect(sessions.isAgentSelected("opencode")).toBe(false);
-      expectListSessionsCalledWith({ agent: undefined });
+      expectSidebarIndexCalledWith({ agent: undefined });
     });
   });
 
@@ -1000,6 +2236,97 @@ describe("SessionsStore", () => {
       sessions.navigateSession(1, filter);
       expect(sessions.activeSessionId).toBe("s3");
     });
+
+    it("hydrates an index-only target after keyboard navigation", async () => {
+      sessions.sessions = [
+        makeSession({ id: "s1" }),
+        makeSession({
+          id: "skinny",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      sessions.activeSessionId = "s1";
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "skinny",
+          first_message: "hydrated from navigation",
+        }),
+      );
+
+      sessions.navigateSession(1);
+
+      expect(sessions.activeSessionId).toBe("skinny");
+      expect(sessions.activeSession).toBeUndefined();
+      await vi.waitFor(() => {
+        expect(sessions.activeSession?.first_message).toBe("hydrated from navigation");
+      });
+      expect(api.getSession).toHaveBeenCalledWith("skinny");
+      expect(sessions.sessions[1]!.is_index_only).toBe(false);
+    });
+  });
+
+  describe("renameSession", () => {
+    it("clears display_name in store when rename is cleared and response omits the field", async () => {
+      // Session starts with a custom user rename.
+      mockSidebarIndex([makeSkinnyRow({ id: "s1", display_name: "custom-name" })]);
+      await sessions.load();
+      expect(sessions.sessions[0]!.display_name).toBe("custom-name");
+
+      // Backend clears the name but finds no agent name to restore, so
+      // display_name is absent from the JSON response (omitempty on nil).
+      vi.mocked(api.renameSession).mockResolvedValue(makeSession({ id: "s1" }));
+
+      await sessions.renameSession("s1", null);
+
+      expect(sessions.sessions[0]!.display_name).toBeNull();
+    });
+
+    it("keeps agent name restored by backend when rename is cleared", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "s1", display_name: "custom-name" })]);
+      await sessions.load();
+
+      // Backend re-parsed the file and restored the agent name.
+      vi.mocked(api.renameSession).mockResolvedValue(
+        makeSession({ id: "s1", display_name: "agent-name" }),
+      );
+
+      await sessions.renameSession("s1", null);
+
+      expect(sessions.sessions[0]!.display_name).toBe("agent-name");
+    });
+  });
+
+  it("uses machine keys as labels when an older daemon omits machine_labels", async () => {
+    api.getMachines.mockResolvedValue({ machines: ["host-a.example"] });
+
+    await sessions.loadMachines();
+
+    expect(sessions.machines).toEqual(["host-a.example"]);
+    expect(sessions.machineLabel("host-a.example")).toBe("host-a.example");
+  });
+
+  it("upgrades saved and URL machine selections using recorded aliases only", async () => {
+    localStorage.setItem(
+      "session-filters",
+      JSON.stringify({ version: 2, machine: "old-owner,installation-a,source-a" }),
+    );
+    sessions = createSessionsStore();
+    api.getMachines.mockResolvedValue({
+      machines: ["installation-a", "source-a"],
+      machine_labels: { "installation-a": "Laptop" },
+      machine_aliases: { "old-owner": "installation-a" },
+    });
+
+    await sessions.loadMachines();
+
+    expect(sessions.selectedMachines).toEqual(["installation-a", "source-a"]);
+    expect(filtersToParams(sessions.filters).machine).toBe("installation-a,source-a");
+    expect(JSON.parse(localStorage.getItem("session-filters")!).machine).toBe(
+      "installation-a,source-a",
+    );
+    sessions.initFromParams({ machine: "old-owner,Laptop,constructor" });
+    expect(sessions.selectedMachines).toEqual(["installation-a", "Laptop", "constructor"]);
   });
 
   describe("loadProjects dedup", () => {
@@ -1033,21 +2360,15 @@ describe("SessionsStore", () => {
     });
 
     it("should resolve without throwing when API rejects", async () => {
-      vi.mocked(api.getProjects).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getProjects).mockRejectedValueOnce(new Error("network"));
 
-      await expect(
-        sessions.loadProjects(),
-      ).resolves.toBeUndefined();
+      await expect(sessions.loadProjects()).resolves.toBeUndefined();
       // Projects stay at default (empty).
       expect(sessions.projects).toHaveLength(0);
     });
 
     it("should allow retry after a failed load", async () => {
-      vi.mocked(api.getProjects).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getProjects).mockRejectedValueOnce(new Error("network"));
       await sessions.loadProjects();
 
       // Second attempt should succeed.
@@ -1063,9 +2384,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.listSessions).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(new Error("network"));
       await sessions.load();
 
       expect(sessions.loading).toBe(false);
@@ -1079,9 +2398,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.listSessions).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(new Error("network"));
       sessions.initFromParams({ project: "other" });
       await sessions.load();
 
@@ -1096,9 +2413,7 @@ describe("SessionsStore", () => {
       sessions.sessions = existing;
       sessions.total = 1;
 
-      vi.mocked(api.listSessions).mockRejectedValueOnce(
-        new Error("network"),
-      );
+      vi.mocked(api.getSidebarSessionIndex).mockRejectedValueOnce(new Error("network"));
       sessions.setAgentFilter("claude");
       await vi.waitFor(() => {
         expect(sessions.loading).toBe(false);
@@ -1110,22 +2425,14 @@ describe("SessionsStore", () => {
     });
 
     it("loadProjects resolves when API rejects", async () => {
-      vi.mocked(api.getProjects).mockRejectedValueOnce(
-        new Error("network"),
-      );
-      await expect(
-        sessions.loadProjects(),
-      ).resolves.toBeUndefined();
+      vi.mocked(api.getProjects).mockRejectedValueOnce(new Error("network"));
+      await expect(sessions.loadProjects()).resolves.toBeUndefined();
       expect(sessions.projects).toHaveLength(0);
     });
 
     it("loadAgents resolves when API rejects", async () => {
-      vi.mocked(api.getAgents).mockRejectedValueOnce(
-        new Error("network"),
-      );
-      await expect(
-        sessions.loadAgents(),
-      ).resolves.toBeUndefined();
+      vi.mocked(api.getAgents).mockRejectedValueOnce(new Error("network"));
+      await expect(sessions.loadAgents()).resolves.toBeUndefined();
       expect(sessions.agents).toHaveLength(0);
     });
   });
@@ -1146,7 +2453,9 @@ describe("SessionsStore", () => {
     it("discards stale projects response after invalidation", async () => {
       let resolveStale!: (v: { projects: { name: string; session_count: number }[] }) => void;
       const stalePromise = new Promise<{ projects: { name: string; session_count: number }[] }>(
-        (r) => { resolveStale = r; },
+        (r) => {
+          resolveStale = r;
+        },
       );
       vi.mocked(api.getProjects)
         .mockReturnValueOnce(stalePromise)
@@ -1176,9 +2485,9 @@ describe("SessionsStore", () => {
     it("discards stale agents response after invalidation", async () => {
       type AgentsRes = { agents: { name: string; session_count: number }[] };
       let resolveStale!: (v: AgentsRes) => void;
-      const stalePromise = new Promise<AgentsRes>(
-        (r) => { resolveStale = r; },
-      );
+      const stalePromise = new Promise<AgentsRes>((r) => {
+        resolveStale = r;
+      });
       vi.mocked(api.getAgents)
         .mockReturnValueOnce(stalePromise)
         .mockResolvedValueOnce({
@@ -1206,7 +2515,7 @@ describe("SessionsStore", () => {
         resolveGet = r;
       });
       vi.mocked(api.getSession).mockReturnValue(getPromise);
-      mockListSessions();
+      mockSidebarPage();
 
       const promise = sessions.navigateToSession("new-id");
 
@@ -1222,7 +2531,7 @@ describe("SessionsStore", () => {
     });
 
     it("skips fetch for already-loaded session", async () => {
-      mockListSessions();
+      mockSidebarPage();
       sessions.sessions = [makeSession({ id: "existing" })];
 
       await sessions.navigateToSession("existing");
@@ -1230,12 +2539,295 @@ describe("SessionsStore", () => {
       expect(sessions.activeSessionId).toBe("existing");
       expect(api.getSession).not.toHaveBeenCalled();
     });
+
+    it("flags not-found when the metadata fetch 404s", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+
+      await sessions.navigateToSession("missing");
+
+      expect(sessions.activeSessionId).toBe("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+    });
+
+    it("does not flag not-found for non-404 failures", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(500, "boom"));
+
+      await sessions.navigateToSession("missing");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("clears the not-found flag when the selection changes", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      sessions.sessions = [makeSession({ id: "other" })];
+      sessions.selectSession("other");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("retryActiveSession refetches and clears the flag on success", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValueOnce(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("late");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(makeSession({ id: "late" }));
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionId).toBe("late");
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.sessions.some((s) => s.id === "late")).toBe(true);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+    });
+
+    it("retryActiveSession keeps the flag while the session is still missing", async () => {
+      mockSidebarPage();
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionId).toBe("missing");
+      expect(sessions.activeSessionNotFound).toBe(true);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion);
+    });
+
+    it("retryActiveSession keeps the flag when the retry fails without a 404", async () => {
+      sessions.sessions = [makeSession({ id: "gone" })];
+      sessions.selectSession("gone");
+      sessions.activeSessionNotFound = true;
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(500, "boom"));
+
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(true);
+    });
+
+    it("retryActiveSession verifies a hydrated row and recovers", async () => {
+      sessions.sessions = [makeSession({ id: "gone", first_message: "cached" })];
+      sessions.selectSession("gone");
+      sessions.activeSessionNotFound = true;
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "gone", first_message: "restored" }),
+      );
+
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+      expect(sessions.sessions[0]!.first_message).toBe("restored");
+    });
+
+    it("retryActiveSession rehydrates an index-only row and recovers", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "late",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValueOnce(new ApiError(404, "session not found"));
+      await sessions.navigateToSession("late");
+      expect(sessions.activeSessionNotFound).toBe(true);
+
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({ id: "late", first_message: "synced" }),
+      );
+      await sessions.retryActiveSession();
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion + 1);
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("does not bump the load version on a first successful load", async () => {
+      mockSidebarPage();
+      const loadVersion = sessions.activeSessionLoadVersion;
+      vi.mocked(api.getSession).mockResolvedValue(makeSession({ id: "fresh" }));
+
+      await sessions.navigateToSession("fresh");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+      expect(sessions.activeSessionLoadVersion).toBe(loadVersion);
+    });
+
+    it("ignores a stale hydration 404 after the sidebar index moved on", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      let rejectGet!: (err: unknown) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise((_resolve, reject) => {
+          rejectGet = reject;
+        }),
+      );
+
+      const promise = sessions.navigateToSession("stale");
+      sessions.sidebarIndexVersion += 1;
+      rejectGet(new ApiError(404, "session not found"));
+      await promise;
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("flags not-found when index-only hydration 404s", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+
+      await sessions.navigateToSession("stale");
+
+      expect(sessions.activeSessionId).toBe("stale");
+      expect(sessions.activeSessionNotFound).toBe(true);
+      expect(sessions.sessions[0]!.is_index_only).toBe(true);
+    });
+
+    it("does not flag not-found when index-only hydration fails without a 404", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(500, "boom"));
+
+      await sessions.navigateToSession("stale");
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("does not flag not-found when hydration 404s for an inactive row", async () => {
+      sessions.sessions = [
+        makeSession({ id: "active" }),
+        makeSession({
+          id: "stale",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      sessions.selectSession("active");
+      vi.mocked(api.getSession).mockRejectedValue(new ApiError(404, "session not found"));
+
+      await sessions.hydrateVisibleSessions(["stale"]);
+
+      expect(sessions.activeSessionNotFound).toBe(false);
+    });
+
+    it("hydrates an already-loaded index-only session", async () => {
+      sessions.sessions = [
+        makeSession({
+          id: "existing",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "existing",
+          first_message: "hydrated navigation",
+        }),
+      );
+
+      await sessions.navigateToSession("existing");
+
+      expect(api.getSession).toHaveBeenCalledWith("existing");
+      expect(sessions.activeSessionId).toBe("existing");
+      expect(sessions.sessions[0]!.first_message).toBe("hydrated navigation");
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+    });
+
+    it("merges a navigation fetch if the index row arrives while fetching", async () => {
+      let resolveGet!: (s: Session) => void;
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise<Session>((resolve) => {
+          resolveGet = resolve;
+        }),
+      );
+
+      const promise = sessions.navigateToSession("racy");
+      sessions.sessions = [
+        makeSession({
+          id: "racy",
+          first_message: null,
+          is_index_only: true,
+        }),
+      ];
+      resolveGet(
+        makeSession({
+          id: "racy",
+          first_message: "fetched during navigation",
+        }),
+      );
+      await promise;
+
+      expect(sessions.sessions).toHaveLength(1);
+      expect(sessions.sessions[0]!.first_message).toBe("fetched during navigation");
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+      expect(sessions.activeSession?.first_message).toBe("fetched during navigation");
+    });
+  });
+
+  describe("route cancellation", () => {
+    it("aborts pagination and treats cancellation as normal completion", async () => {
+      const signals: AbortSignal[] = [];
+      vi.mocked(callGenerated).mockImplementation(
+        (request: () => Promise<unknown>, signal?: AbortSignal) => {
+          if (signal) signals.push(signal);
+          return rejectGeneratedRequestOnAbort(request, signal);
+        },
+      );
+      vi.mocked(api.getSidebarSessionIndex).mockReturnValue(new Promise(() => {}));
+      sessions.nextCursor = "next";
+
+      const load = sessions.loadMore();
+      await Promise.resolve();
+      sessions.cancelRouteReads();
+
+      expect(signals).toHaveLength(1);
+      expect(signals[0]?.aborted).toBe(true);
+      await expect(load).resolves.toBeUndefined();
+    });
+
+    it("keeps a replacement signal-detail request registered", async () => {
+      vi.mocked(callGenerated).mockImplementation(rejectGeneratedRequestOnAbort);
+      vi.mocked(api.getSession).mockReturnValue(new Promise(() => {}));
+
+      const obsolete = sessions.fetchSignalDetail("detail");
+      await Promise.resolve();
+      sessions.cancelRouteReads();
+      void sessions.fetchSignalDetail("detail");
+      await obsolete;
+
+      void sessions.fetchSignalDetail("detail");
+      await Promise.resolve();
+
+      expect(api.getSession).toHaveBeenCalledTimes(2);
+    });
   });
 });
 
-function makeSession(
-  overrides: Partial<Session> & { id: string },
-): Session {
+function makeSession(overrides: Partial<Session> & { id: string }): Session {
   return {
     project: "proj",
     machine: "local",
@@ -1254,6 +2846,95 @@ function makeSession(
 }
 
 describe("buildSessionGroups", () => {
+  it("sidebar index rows preserve status-tier order", () => {
+    const isoAgo = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const rows = [
+      makeSkinnyRow({
+        id: "unclean",
+        ended_at: isoAgo(2 * 60 * 60 * 1000),
+        termination_status: "tool_call_pending",
+      }),
+      makeSkinnyRow({
+        id: "quiet",
+        ended_at: isoAgo(30 * 60 * 1000),
+        termination_status: "clean",
+      }),
+      makeSkinnyRow({
+        id: "stale",
+        ended_at: isoAgo(30 * 60 * 1000),
+        termination_status: "truncated",
+      }),
+      makeSkinnyRow({
+        id: "idle",
+        ended_at: isoAgo(5 * 60 * 1000),
+      }),
+      makeSkinnyRow({
+        id: "waiting",
+        ended_at: isoAgo(5 * 60 * 1000),
+        termination_status: "awaiting_user",
+      }),
+      makeSkinnyRow({
+        id: "working",
+        ended_at: isoAgo(30 * 1000),
+      }),
+    ];
+
+    const groups = buildSessionGroups(rows as any);
+
+    expect(groups.map((g) => g.primarySessionId)).toEqual([
+      "working",
+      "waiting",
+      "idle",
+      "stale",
+      "quiet",
+      "unclean",
+    ]);
+  });
+
+  it("sidebar index freshness rollup uses every skinny group member", () => {
+    const rows = [
+      makeSkinnyRow({
+        id: "rolled-root",
+        ended_at: "2024-01-01T00:00:00Z",
+      }),
+      makeSkinnyRow({
+        id: "plain",
+        ended_at: "2024-01-02T00:00:00Z",
+      }),
+      makeSkinnyRow({
+        id: "rolled-child",
+        parent_session_id: "rolled-root",
+        relationship_type: "subagent",
+        ended_at: "2024-01-03T00:00:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(rows as any);
+
+    expect(groups.map((g) => g.key)).toEqual(["rolled-root", "plain"]);
+  });
+
+  it("sidebar index orphan teammate adoption uses is_teammate", () => {
+    const rows = [
+      makeSkinnyRow({
+        id: "main",
+        project: "proj",
+        started_at: "2024-01-01T00:00:00Z",
+      }),
+      makeSkinnyRow({
+        id: "teammate",
+        project: "proj",
+        is_teammate: true,
+        started_at: "2024-01-01T00:01:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(rows as any);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.sessions.map((s) => s.id)).toContain("teammate");
+  });
+
   it("groups two-session chain", () => {
     const sessions = [
       makeSession({
@@ -1624,57 +3305,213 @@ describe("SessionsStore live refresh", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     storageData.clear();
-    mockListSessions();
+    mockSidebarPage();
+    mockSidebarIndex();
     mockGetProjects();
   });
 
-  it("refetches when an events.subscribeDebounced callback fires", async () => {
+  it("messages events invalidate hydrated detail without reloading the index", async () => {
     const { events } = await import("./events.svelte.js");
-    // Capture the registered callback directly so the test bypasses
-    // the events singleton's debounce and any accumulated state.
     let registered: ((e: { scope: string }) => void) | null = null;
-    const spy = vi
-      .spyOn(events, "subscribeDebounced")
-      .mockImplementation((fn) => {
-        registered = fn as (e: { scope: string }) => void;
-        return () => {};
-      });
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
 
+    mockSidebarIndex([makeSkinnyRow({ id: "row" })]);
     const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
     await sessions.load();
-    expect(api.listSessions).toHaveBeenCalledTimes(1);
+    vi.mocked(api.getSession)
+      .mockResolvedValueOnce(
+        makeSession({
+          id: "row",
+          first_message: "first hydrate",
+        }),
+      )
+      .mockResolvedValueOnce(
+        makeSession({
+          id: "row",
+          first_message: "second hydrate",
+        }),
+      );
+    await sessions.hydrateVisibleSessions(["row"]);
+
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+    expect(api.getSession).toHaveBeenCalledTimes(1);
     expect(spy).toHaveBeenCalled();
     expect(registered).not.toBeNull();
 
     registered!({ scope: "messages" });
-    // Flush the load() promise chain without advancing timers
-    // (the safety-net setInterval is real here and would loop).
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(api.listSessions).toHaveBeenCalledTimes(2);
+    await sessions.hydrateVisibleSessions(["row"]);
 
-    sessions.dispose();
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+    expect(api.getSession).toHaveBeenCalledTimes(2);
+    expect(sessions.sessions[0]!.first_message).toBe("second hydrate");
+
+    detach();
+    spy.mockRestore();
+  });
+
+  it("messages events refresh active child sessions", async () => {
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
+
+    vi.mocked(SessionsService.getApiV1SessionsByIdChildren)
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          transcript_revision: "child-rev-1",
+        }),
+      ] as unknown as DbSession[])
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          transcript_revision: "child-rev-2",
+        }),
+      ] as unknown as DbSession[]);
+
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    sessions.activeSessionId = "root";
+    await sessions.loadChildSessions("root");
+    expect(sessions.childSessions.get("child")?.transcript_revision).toBe("child-rev-1");
+    expect(sessions.activeSessionUsageVersion).toBe(0);
+
+    registered!({ scope: "messages" });
+
+    await vi.waitFor(() => {
+      expect(sessions.childSessions.get("child")?.transcript_revision).toBe("child-rev-2");
+    });
+    expect(SessionsService.getApiV1SessionsByIdChildren).toHaveBeenCalledTimes(2);
+    expect(sessions.activeSessionUsageVersion).toBe(1);
+
+    detach();
+    spy.mockRestore();
+  });
+
+  it("sessions and sync events coalesce to one debounced index reload", async () => {
+    vi.useFakeTimers();
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
+
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    await sessions.load();
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    registered!({ scope: "sessions" });
+    registered!({ scope: "sync" });
+    await vi.advanceTimersByTimeAsync(299);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+
+    detach();
+    spy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("sessions events replace cached project filter options", async () => {
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
+
+    vi.mocked(api.getProjects)
+      .mockResolvedValueOnce({
+        projects: [{ name: "old-project", session_count: 1 }],
+      })
+      .mockResolvedValueOnce({
+        projects: [{ name: "new-project", session_count: 1 }],
+      });
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    await sessions.loadProjects();
+    expect(sessions.projects).toEqual([{ name: "old-project", session_count: 1 }]);
+
+    registered!({ scope: "sessions" });
+    await vi.waitFor(() => {
+      expect(sessions.projects).toEqual([{ name: "new-project", session_count: 1 }]);
+    });
+    expect(api.getProjects).toHaveBeenCalledTimes(2);
+
+    detach();
     spy.mockRestore();
   });
 
   it("refetches on the 5-minute safety-net interval", async () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
-    const spy = vi
-      .spyOn(events, "subscribeDebounced")
-      .mockReturnValue(() => {});
+    const spy = vi.spyOn(events, "subscribe").mockReturnValue(() => {});
 
     const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
     await sessions.load();
-    expect(api.listSessions).toHaveBeenCalledTimes(1);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
 
     // Advance exactly one interval — avoids the runAllTimers infinite
     // loop that recurring setInterval plus a promise-resolving
     // listSessions mock would produce.
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
-    expect(api.listSessions).toHaveBeenCalledTimes(2);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
 
-    sessions.dispose();
+    detach();
+    spy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("refreshes active child sessions on the 5-minute safety-net interval", async () => {
+    vi.useFakeTimers();
+    const { events } = await import("./events.svelte.js");
+    const spy = vi.spyOn(events, "subscribe").mockReturnValue(() => {});
+
+    vi.mocked(SessionsService.getApiV1SessionsByIdChildren)
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          total_output_tokens: 1,
+        }),
+      ] as unknown as DbSession[])
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          total_output_tokens: 9,
+        }),
+      ] as unknown as DbSession[]);
+
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    sessions.activeSessionId = "root";
+    await sessions.load();
+    await sessions.loadChildSessions("root");
+    expect(sessions.childSessions.get("child")?.total_output_tokens).toBe(1);
+    expect(sessions.activeSessionUsageVersion).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+
+    await vi.waitFor(() => {
+      expect(sessions.childSessions.get("child")?.total_output_tokens).toBe(9);
+    });
+    expect(SessionsService.getApiV1SessionsByIdChildren).toHaveBeenCalledTimes(2);
+    expect(sessions.activeSessionUsageVersion).toBe(1);
+
+    detach();
     spy.mockRestore();
     vi.useRealTimers();
   });
@@ -1683,13 +3520,12 @@ describe("SessionsStore live refresh", () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
     const unsub = vi.fn();
-    const spy = vi
-      .spyOn(events, "subscribeDebounced")
-      .mockReturnValue(unsub);
+    const spy = vi.spyOn(events, "subscribe").mockReturnValue(unsub);
 
     const sessions = createSessionsStore();
+    sessions.attachSidebar();
     await sessions.load();
-    expect(api.listSessions).toHaveBeenCalledTimes(1);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
 
     sessions.dispose();
     expect(unsub).toHaveBeenCalledTimes(1);
@@ -1697,7 +3533,7 @@ describe("SessionsStore live refresh", () => {
     // After dispose the interval is cleared, so advancing well past
     // 5 minutes triggers no further fetches.
     await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
-    expect(api.listSessions).toHaveBeenCalledTimes(1);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
 
     spy.mockRestore();
     vi.useRealTimers();

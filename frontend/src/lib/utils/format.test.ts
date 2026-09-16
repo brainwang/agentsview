@@ -1,10 +1,60 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { setLocale } from "../i18n/index.js";
+import { testMoney } from "../test/money.js";
 import {
+  formatRelativeTime,
   sanitizeSnippet,
   _resetNonceCounter,
+  formatCost,
   formatTokenCount,
   formatTokenUsage,
 } from "./format.js";
+
+describe("formatRelativeTime", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    setLocale("en");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    setLocale("en");
+  });
+
+  it.each([
+    ["2026-06-17T12:00:00Z", "just now"],
+    ["2026-06-17T11:58:00Z", "2m ago"],
+    ["2026-06-17T09:30:00Z", "2h ago"],
+    ["2026-06-15T12:00:00Z", "2d ago"],
+  ])("formats %s in English", (value, expected) => {
+    vi.setSystemTime(new Date("2026-06-17T12:00:20Z"));
+    expect(formatRelativeTime(value)).toBe(expected);
+  });
+
+  it("localizes relative time labels", () => {
+    setLocale("zh-CN");
+    vi.setSystemTime(new Date("2026-06-17T12:00:20Z"));
+
+    expect(formatRelativeTime("2026-06-17T12:00:00Z")).toBe("刚刚");
+    expect(formatRelativeTime("2026-06-17T11:58:00Z")).toBe("2 分钟前");
+    expect(formatRelativeTime("2026-06-15T12:00:00Z")).toBe("2 天前");
+  });
+});
+
+describe("formatCost", () => {
+  it.each([
+    [0, "$0.00"],
+    [0.004, "<$0.01"],
+    [0.01, "$0.01"],
+    [0.42, "$0.42"],
+    [12.345, "$12.35"],
+    [99.994, "$99.99"],
+    [100, "$100"],
+    [1234.5, "$1,235"],
+  ])("formats %d as %s", (value, expected) => {
+    expect(formatCost(testMoney(value))).toBe(expected);
+  });
+});
 
 describe("sanitizeSnippet", () => {
   beforeEach(() => {
@@ -12,24 +62,16 @@ describe("sanitizeSnippet", () => {
   });
 
   it.each([
-    [
-      "preserves <mark> tags",
-      "hello <mark>world</mark> end",
-      "hello <mark>world</mark> end",
-    ],
+    ["preserves <mark> tags", "hello <mark>world</mark> end", "hello <mark>world</mark> end"],
     [
       "escapes other HTML tags",
       '<script>alert("xss")</script>',
       '&lt;script&gt;alert("xss")&lt;/script&gt;',
     ],
-    [
-      "escapes img tags",
-      "<img src=x onerror=alert(1)>",
-      "&lt;img src=x onerror=alert(1)&gt;",
-    ],
+    ["escapes img tags", "<img src=x onerror=alert(1)>", "&lt;img src=x onerror=alert(1)&gt;"],
     [
       "handles mixed mark and other tags",
-      '<b>bold</b> <mark>highlighted</mark> <i>italic</i>',
+      "<b>bold</b> <mark>highlighted</mark> <i>italic</i>",
       "&lt;b&gt;bold&lt;/b&gt; <mark>highlighted</mark> &lt;i&gt;italic&lt;/i&gt;",
     ],
     [
@@ -42,21 +84,9 @@ describe("sanitizeSnippet", () => {
       "<mark>first</mark> gap <mark>second</mark>",
       "<mark>first</mark> gap <mark>second</mark>",
     ],
-    [
-      "returns empty string for empty input",
-      "",
-      "",
-    ],
-    [
-      "handles plain text without tags",
-      "no tags here",
-      "no tags here",
-    ],
-    [
-      "escapes angle brackets in content",
-      "x < y > z",
-      "x &lt; y &gt; z",
-    ],
+    ["returns empty string for empty input", "", ""],
+    ["handles plain text without tags", "no tags here", "no tags here"],
+    ["escapes angle brackets in content", "x < y > z", "x &lt; y &gt; z"],
     [
       "handles nested mark tags gracefully",
       "<mark>outer <mark>inner</mark></mark>",
@@ -133,17 +163,11 @@ describe("formatTokenUsage", () => {
   });
 
   it("formats both reported token metrics", () => {
-    expect(formatTokenUsage(2400, true, 180, true)).toBe(
-      "2.4k ctx / 180 out",
-    );
+    expect(formatTokenUsage(2400, true, 180, true)).toBe("2.4k ctx / 180 out");
   });
 
   it("renders an explicit placeholder for missing token metrics", () => {
-    expect(formatTokenUsage(0, false, 180, true)).toBe(
-      "— ctx / 180 out",
-    );
-    expect(formatTokenUsage(2400, true, 0, false)).toBe(
-      "2.4k ctx / — out",
-    );
+    expect(formatTokenUsage(0, false, 180, true)).toBe("— ctx / 180 out");
+    expect(formatTokenUsage(2400, true, 0, false)).toBe("2.4k ctx / — out");
   });
 });

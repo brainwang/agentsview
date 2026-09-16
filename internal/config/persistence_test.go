@@ -6,17 +6,120 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 func readConfigFile(t *testing.T, dir string) Config {
 	t.Helper()
 	var fileCfg Config
-	if _, err := toml.DecodeFile(
+	_, err := toml.DecodeFile(
 		filepath.Join(dir, configFileName), &fileCfg,
-	); err != nil {
-		t.Fatalf("parsing config file: %v", err)
-	}
+	)
+	require.NoError(t, err, "parsing config file")
 	return fileCfg
+}
+
+func TestSaveSettingsPersistsChartPalette(t *testing.T) {
+	dir := setupTestEnv(t)
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"chart_palette": ChartPaletteMatplotlib,
+	}))
+	assert.Equal(t, ChartPaletteMatplotlib, cfg.ChartPalette)
+	fileCfg := readConfigFile(t, dir)
+	assert.Equal(t, ChartPaletteMatplotlib, fileCfg.ChartPalette)
+}
+
+func TestSaveSettingsPersistsZoomLevelAndPreservesUnrelatedTables(t *testing.T) {
+	dir := setupTestEnv(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, configFileName), []byte(
+		"github_token = \"keep\"\n[proxy]\nmode = \"caddy\"\n"), 0o600))
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"zoom_level": ZoomLevel120,
+	}))
+	require.NotNil(t, cfg.ZoomLevel)
+	assert.Equal(t, ZoomLevel120, *cfg.ZoomLevel)
+
+	fileCfg := readConfigFile(t, dir)
+	require.NotNil(t, fileCfg.ZoomLevel)
+	assert.Equal(t, ZoomLevel120, *fileCfg.ZoomLevel)
+	assert.Equal(t, "keep", fileCfg.GithubToken)
+	assert.Equal(t, "caddy", fileCfg.Proxy.Mode)
+}
+
+func TestSaveSettingsRejectsInvalidZoomWithoutChangingSelectionOrDisk(t *testing.T) {
+	dir := setupTestEnv(t)
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"zoom_level": ZoomLevel120,
+	}))
+	before, err := os.ReadFile(filepath.Join(dir, configFileName))
+	require.NoError(t, err)
+
+	err = cfg.SaveSettings(map[string]any{
+		"zoom_level": ZoomLevel(101),
+	})
+	require.EqualError(t, err,
+		"zoom_level must be one of 67, 75, 80, 90, 100, 110, 120, 125, 130, 150, 175, 200 (got 101)")
+	require.NotNil(t, cfg.ZoomLevel)
+	assert.Equal(t, ZoomLevel120, *cfg.ZoomLevel)
+	after, err := os.ReadFile(filepath.Join(dir, configFileName))
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+
+	err = cfg.SaveSettings(map[string]any{"zoom_level": 120})
+	assert.EqualError(t, err, "zoom_level must use the typed configuration value")
+}
+
+func TestSaveSettingsRejectsInvalidChartPaletteWithoutChangingSelection(t *testing.T) {
+	dir := setupTestEnv(t)
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"chart_palette": ChartPaletteMatplotlib,
+	}))
+
+	err = cfg.SaveSettings(map[string]any{
+		"chart_palette": ChartPalette("neon"),
+	})
+	require.EqualError(t, err,
+		`chart_palette must be "agentsview" or "matplotlib" (got "neon")`)
+	assert.Equal(t, ChartPaletteMatplotlib, cfg.ChartPalette)
+	fileCfg := readConfigFile(t, dir)
+	assert.Equal(t, ChartPaletteMatplotlib, fileCfg.ChartPalette)
+}
+
+func TestSaveSettingsPersistsDisabledAgents(t *testing.T) {
+	dir := setupTestEnv(t)
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"disabled_agents": []parser.AgentType{
+			parser.AgentGemini,
+			parser.AgentClaude,
+			parser.AgentGemini,
+		},
+	}))
+
+	assert.Equal(t,
+		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+		cfg.DisabledAgents,
+	)
+	fileCfg := readConfigFile(t, dir)
+	assert.Equal(t, cfg.DisabledAgents, fileCfg.DisabledAgents)
 }
 
 func TestCursorSecret_GeneratedAndPersisted(t *testing.T) {
@@ -24,106 +127,59 @@ func TestCursorSecret_GeneratedAndPersisted(t *testing.T) {
 
 	// First load: should generate a secret
 	cfg1, err := LoadMinimal()
-	if err != nil {
-		t.Fatalf("first load failed: %v", err)
-	}
-	if cfg1.CursorSecret == "" {
-		t.Fatal("cursor secret was not generated")
-	}
-	if cfg1.DataDir != dir {
-		t.Fatalf(
-			"DataDir = %q, want %q", cfg1.DataDir, dir,
-		)
-	}
+	require.NoError(t, err, "first load failed")
+	require.NotEmpty(t, cfg1.CursorSecret, "cursor secret was not generated")
+	require.Equal(t, dir, cfg1.DataDir)
 
 	// Verify file existence and content
 	fileCfg := readConfigFile(t, dir)
 
-	if fileCfg.CursorSecret != cfg1.CursorSecret {
-		t.Errorf(
-			"file secret = %q, want %q",
-			fileCfg.CursorSecret, cfg1.CursorSecret,
-		)
-	}
+	assert.Equal(t, cfg1.CursorSecret, fileCfg.CursorSecret)
 
 	// Second load: should read the same secret
 	cfg2, err := LoadMinimal()
-	if err != nil {
-		t.Fatalf("second load failed: %v", err)
-	}
-	if cfg2.CursorSecret != cfg1.CursorSecret {
-		t.Errorf(
-			"second load got %q, want %q",
-			cfg2.CursorSecret, cfg1.CursorSecret,
-		)
-	}
+	require.NoError(t, err, "second load failed")
+	assert.Equal(t, cfg1.CursorSecret, cfg2.CursorSecret)
 }
 
 func TestCursorSecret_RegeneratedIfMissing(t *testing.T) {
 	dir := setupTestEnv(t)
 
 	initialContent := "cursor_secret = \"\"\n"
-	if err := os.WriteFile(filepath.Join(dir, configFileName), []byte(initialContent), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, configFileName), []byte(initialContent), 0o600))
 
 	cfg, err := LoadMinimal()
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
-	if cfg.CursorSecret == "" {
-		t.Fatal("cursor secret should have been regenerated")
-	}
+	require.NoError(t, err)
+	require.NotEmpty(t, cfg.CursorSecret, "cursor secret should have been regenerated")
 
 	// Verify it was updated in the file
 	fileCfg := readConfigFile(t, dir)
-	if fileCfg.CursorSecret == "" {
-		t.Error("cursor secret was not updated in the file")
-	}
+	assert.NotEmpty(t, fileCfg.CursorSecret, "cursor secret was not updated in the file")
 }
 
 func TestCursorSecret_LoadErrorOnInvalidConfig(t *testing.T) {
 	dir := setupTestEnv(t)
 
-	if err := os.WriteFile(filepath.Join(dir, configFileName), []byte("[invalid toml = ="), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, configFileName), []byte("[invalid toml = ="), 0o600))
 
 	_, err := LoadMinimal()
-	if err == nil {
-		t.Fatal("expected error loading invalid config")
-	}
+	require.Error(t, err, "expected error loading invalid config")
 }
 
 func TestCursorSecret_PreservesOtherFields(t *testing.T) {
 	dir := setupTestEnv(t)
 
-	if err := os.WriteFile(filepath.Join(dir, configFileName), []byte("github_token = \"my-token\"\n"), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, configFileName), []byte("github_token = \"my-token\"\n"), 0o600))
 
 	cfg, err := LoadMinimal()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	if cfg.CursorSecret == "" {
-		t.Error("cursor secret not generated")
-	}
-	if cfg.GithubToken != "my-token" {
-		t.Errorf(
-			"github_token = %q, want %q",
-			cfg.GithubToken, "my-token",
-		)
-	}
+	assert.NotEmpty(t, cfg.CursorSecret, "cursor secret not generated")
+	assert.Equal(t, "my-token", cfg.GithubToken)
 
 	// Verify file content has both
 	fileCfg := readConfigFile(t, dir)
 
-	if fileCfg.CursorSecret == "" {
-		t.Error("cursor_secret missing in file")
-	}
-	if fileCfg.GithubToken != "my-token" {
-		t.Error("github_token lost/changed in file")
-	}
+	assert.NotEmpty(t, fileCfg.CursorSecret, "cursor_secret missing in file")
+	assert.Equal(t, "my-token", fileCfg.GithubToken, "github_token lost/changed in file")
 }

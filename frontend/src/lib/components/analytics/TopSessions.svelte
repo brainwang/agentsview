@@ -7,11 +7,25 @@
   import { router } from "../../stores/router.svelte.js";
   import { formatTokenCount } from "../../utils/format.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
-  import StatusDot from "../common/StatusDot.svelte";
+  import { StatusDot } from "@kenn-io/kit-ui";
+  import { sessionStatusLabel } from "../../utils/sessionStatus.js";
+  import { m } from "../../i18n/index.js";
 
   function truncate(text: string, max: number): string {
     if (text.length <= max) return text;
     return text.slice(0, max - 1) + "\u2026";
+  }
+
+  function sessionLabel(session: {
+    id: string;
+    first_message: string | null;
+    display_name?: string | null;
+  }): string {
+    return (
+      session.display_name ||
+      normalizeMessagePreview(session.first_message) ||
+      session.id.slice(0, 12)
+    );
   }
 
   function formatDuration(mins: number): string {
@@ -22,18 +36,43 @@
     return m > 0 ? `${h}h ${m}m` : `${h}h`;
   }
 
+  function formatDurationWithTotal(
+    activeMin: number,
+    totalMin: number,
+  ): string {
+    return `${formatDuration(activeMin)} (${m.analytics_top_sessions_total_duration({
+      duration: formatDuration(totalMin),
+    })})`;
+  }
+
   function handleSessionClick(id: string) {
     let needInvalidate = false;
+    const params: Record<string, string> = {};
+    const clearParams: string[] = [];
     if (analytics.includeOneShot && !sessions.filters.includeOneShot) {
       sessions.filters.includeOneShot = true;
+      clearParams.push("include_one_shot");
       needInvalidate = true;
     }
-    if (analytics.includeAutomated && !sessions.filters.includeAutomated) {
+    if (
+      analytics.automatedScope !== "human" &&
+      !sessions.filters.includeAutomated
+    ) {
       sessions.filters.includeAutomated = true;
+      params.include_automated = "true";
+      clearParams.push("include_automated");
       needInvalidate = true;
     }
     if (needInvalidate) {
       sessions.invalidateFilterCaches();
+    }
+    if (clearParams.length > 0 || Object.keys(params).length > 0) {
+      router.navigateToSession(
+        id,
+        Object.keys(params).length > 0 ? params : undefined,
+        clearParams,
+      );
+      return;
     }
     router.navigateToSession(id);
   }
@@ -52,15 +91,17 @@
 
 <div class="top-sessions-container">
   <div class="top-header">
-    <h3 class="chart-title">Top Sessions</h3>
+    <h3 class="chart-title">{m.analytics_top_sessions_title()}</h3>
     <div class="header-controls">
       {#if uncleanCount > 0}
         <button
           class="status-count-pill"
           onclick={() => sessions.setTerminationFilter("unclean")}
-          title="Filter to unclean sessions"
+          title={m.analytics_top_sessions_filter_unclean()}
         >
-          {uncleanCount} unclean
+          {m.analytics_top_sessions_unclean_count({
+            countLabel: uncleanCount.toLocaleString(),
+          })}
         </button>
       {/if}
       <div class="metric-toggle">
@@ -69,14 +110,14 @@
           class:active={analytics.topMetric === "messages"}
           onclick={() => analytics.setTopMetric("messages")}
         >
-          By Messages
+          {m.analytics_top_sessions_by_messages()}
         </button>
         <button
           class="toggle-btn"
           class:active={analytics.topMetric === "duration"}
           onclick={() => analytics.setTopMetric("duration")}
         >
-          By Duration
+          {m.analytics_top_sessions_by_duration()}
         </button>
         {#if supportsOutputTokens}
           <button
@@ -84,7 +125,7 @@
             class:active={analytics.topMetric === "output_tokens"}
             onclick={() => analytics.setTopMetric("output_tokens")}
           >
-            By Output Tokens
+            {m.analytics_top_sessions_by_output_tokens()}
           </button>
         {/if}
       </div>
@@ -98,13 +139,14 @@
         class="retry-btn"
         onclick={() => analytics.fetchTopSessions()}
       >
-        Retry
+        {m.shared_retry()}
       </button>
     </div>
   {:else if analytics.topSessions && analytics.topSessions.sessions.length > 0}
     <div class="session-list">
       {#each analytics.topSessions.sessions as session, i}
-        {@const preview = normalizeMessagePreview(session.first_message)}
+        {@const label = sessionLabel(session)}
+        {@const status = getSessionStatus(session)}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
@@ -113,19 +155,25 @@
         >
           <span class="rank">{i + 1}</span>
           <span class="session-status">
-            <StatusDot session={session} size={7} />
+            <StatusDot {status} label={sessionStatusLabel(status)} size={7} />
           </span>
           <div class="session-info">
             <span class="session-label">
-              {preview
-                ? truncate(preview, 50)
-                : session.id.slice(0, 12)}
+              {truncate(label, 50)}
             </span>
             <span class="session-project">{session.project}</span>
           </div>
           <span class="session-metric">
             {#if analytics.topMetric === "duration"}
-              {formatDuration(session.duration_min)}
+              <span
+                class="session-metric-primary"
+                title={m.analytics_top_sessions_active_duration()}
+              >
+                {formatDurationWithTotal(
+                  session.active_duration_min,
+                  session.duration_min,
+                )}
+              </span>
             {:else if analytics.topMetric === "output_tokens"}
               {formatTokenCount(session.output_tokens)}
             {:else}
@@ -136,7 +184,7 @@
       {/each}
     </div>
   {:else}
-    <div class="empty">No sessions in range</div>
+    <div class="empty">{m.shared_no_sessions_in_range()}</div>
   {/if}
 </div>
 
@@ -293,8 +341,12 @@
     font-weight: 500;
     font-family: var(--font-mono);
     color: var(--accent-blue);
-    min-width: 36px;
+    min-width: 86px;
     text-align: right;
+  }
+
+  .session-metric-primary {
+    display: inline-block;
   }
 
   .empty {

@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { Message } from "../../api/types.js";
   import { formatTimestamp } from "../../utils/format.js";
+  import { RefreshCwIcon } from "../../icons.js";
+  import { m } from "../../i18n/index.js";
 
   interface Props {
     message: Message;
@@ -19,11 +21,13 @@
   let hasMore = $derived(content.length > 0 && content !== preview);
 </script>
 
-<div class="boundary" title="Context window compacted at this point">
+<div class="boundary" title={m.compact_boundary_title()}>
   <span class="boundary-line"></span>
   <span class="boundary-label">
-    <span class="boundary-icon" aria-hidden="true">↻</span>
-    Context compacted
+    <span class="boundary-icon">
+      <RefreshCwIcon size="12" strokeWidth="2.2" aria-hidden="true" />
+    </span>
+    {m.compact_boundary_label()}
     {#if message.timestamp}
       <span class="boundary-time">
         &middot; {formatTimestamp(message.timestamp)}
@@ -37,7 +41,7 @@
     <details class="boundary-details">
       <summary class="boundary-preview">
         <span>{preview}</span>
-        <span class="boundary-expand-hint">Show full summary</span>
+        <span class="boundary-expand-hint">{m.compact_boundary_show_full_summary()}</span>
       </summary>
       <pre class="boundary-full">{content}</pre>
     </details>
@@ -72,8 +76,8 @@
     white-space: nowrap;
   }
   .boundary-icon {
-    font-size: 13px;
-    line-height: 1;
+    display: inline-flex;
+    align-items: center;
   }
   .boundary-time {
     color: var(--text-muted);

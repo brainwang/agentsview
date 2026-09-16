@@ -29,6 +29,8 @@ func NormalizeToolCategory(rawName string) string {
 	case "shell_command", "exec_command",
 		"write_stdin", "shell":
 		return "Bash"
+	case "list_files":
+		return "Read"
 	case "apply_patch":
 		return "Edit"
 	case "spawn_agent":
@@ -46,9 +48,52 @@ func NormalizeToolCategory(rawName string) string {
 	case "search_files", "grep", "grep_search":
 		return "Grep"
 
+	// Kilo (legacy) / RooCode (Cline-family) camelCase tool names.
+	// Read-family verbs (appliedDiff → Edit) and list/search share
+	// an embedded "content" payload field; kilo_legacy.go and
+	// roocode.go strip that field before building InputJSON so the
+	// payload stays a clean argument object.
+	case "appliedDiff", "searchAndReplace",
+		"editedExistingFile", "deleteFile":
+		return "Edit"
+	case "insertContent":
+		return "Write"
+	case "readFile", "listFiles", "listCodeDefinitionNames",
+		"listFilesTopLevel", "listFilesRecursive":
+		return "Read"
+	case "searchFiles", "codebaseSearch":
+		return "Grep"
+	case "writeToFile", "createFile", "newFileCreated":
+		return "Write"
+	case "executeCommand":
+		return "Bash"
+	case "useMcpTool", "use_mcp_tool", "search":
+		return "Tool"
+	case "newTask":
+		return "Task"
+	case "fetchInstructions", "updateTodoList", "finishTask",
+		"switchMode":
+		return "Tool"
+
+	// Antigravity tools
+	case "view_file", "read_url_content":
+		return "Read"
+	case "replace_file_content", "multi_replace_file_content":
+		return "Edit"
+	case "write_to_file":
+		return "Write"
+	case "define_subagent", "invoke_subagent", "manage_subagents",
+		"send_message", "manage_task":
+		return "Task"
+	case "ask_permission", "ask_question", "schedule", "search_web",
+		"generate_image":
+		return "Tool"
+
 	// OpenCode tools (lowercase variants)
 	// Note: "grep" is handled above in the Gemini section.
 	case "read":
+		return "Read"
+	case "file_read", "file_read_diff":
 		return "Read"
 	case "edit":
 		return "Edit"
@@ -58,6 +103,12 @@ func NormalizeToolCategory(rawName string) string {
 		return "Bash"
 	case "glob":
 		return "Glob"
+	case "file_find":
+		return "Glob"
+	case "code_search":
+		return "Grep"
+	case "code_comment":
+		return "Tool"
 	case "task":
 		return "Task"
 
@@ -70,12 +121,16 @@ func NormalizeToolCategory(rawName string) string {
 		return "Tool"
 
 	// Cursor tools
+	case "ApplyPatch":
+		return "Edit"
 	case "Shell":
 		return "Bash"
 	case "StrReplace":
 		return "Edit"
 	case "LS":
 		return "Read"
+	case "Subagent":
+		return "Task"
 
 	// Amp tools (not already covered above)
 	// Note: "create_file" is also used by Pi.
@@ -172,9 +227,49 @@ func NormalizeToolCategory(rawName string) string {
 	case "zencoder-rag-mcp__web_search":
 		return "Read"
 
+	// Codebuff / Freebuff tools
+	// Note: "read_files" (Warp→Read), "list_directory" (Gemini→Read),
+	// "write_file" (Gemini→Write), "str_replace" (Pi→Edit),
+	// "skill" (Amp→Tool) are handled in earlier sections.
+	case "read_subtree", "file-picker":
+		return "Read"
+	case "suggest_followups", "write_todos", "read_url", "ask_user",
+		"render_ui", "gravity_index":
+		return "Tool"
+	case "run_terminal_command", "basher":
+		return "Bash"
+	case "code-searcher", "code-reviewer":
+		return "Tool"
+	case "spawn_agents":
+		return "Task"
+
 	// ChatGPT tools
 	case "code_interpreter":
 		return "Bash"
+
+	// Shelley (exe.dev) tools (excluding names already handled above:
+	// bash/shell→Bash, patch→Edit, browser/web_search/web_fetch→Tool,
+	// subagent→Task via the default).
+	case "keyword_search":
+		return "Grep"
+	case "read_context_file", "read_image":
+		return "Read"
+	case "change_dir", "output_iframe", "llm_one_shot",
+		"browser_emulate", "browser_network",
+		"browser_accessibility", "browser_profile":
+		return "Tool"
+
+	// Posit Assistant tools (excluding names already handled above:
+	// read→Read, edit→Edit, write→Write, bash→Bash, grep→Grep,
+	// skill→Tool, web_search→Tool)
+	case "ls", "getConsoleContent":
+		return "Read"
+	case "runCode", "executeCode":
+		return "Bash"
+	case "todoWrite", "webfetch", "EnterMode", "ExitMode":
+		return "Tool"
+	case "explore":
+		return "Task"
 
 	// Warp tools
 	case "read_files":
@@ -193,6 +288,12 @@ func NormalizeToolCategory(rawName string) string {
 		return "Read"
 	case "use_computer":
 		return "Tool"
+
+	// Poolside tools (only tools not already covered above)
+	case "todo_action", "switch_mode", "question", "exit":
+		return "Tool"
+	case "shell_kill", "shell_status", "shell_tail":
+		return "Bash"
 
 	default:
 		// MCP tools may carry a server prefix (e.g.

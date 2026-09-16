@@ -10,6 +10,13 @@ const SYSTEM_MSG_PREFIXES = [
   "Stop hook feedback:",
 ];
 
+const SYSTEM_REMINDER_OPEN_TAG = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE_TAG = "</system-reminder>";
+
+const LEGACY_GOAL_CONTEXT_PREFIX = "<goal_context>";
+const CODEX_INTERNAL_CONTEXT_TAG_PREFIX = "<codex_internal_context";
+const GOAL_CONTEXT_SOURCE_ATTR_RE = /(?:^|\s)source="goal"(?:\s|\/|$)/;
+
 // Subtypes the Claude parser promotes into visible system messages
 // that the SPA renders via SystemBoundaryCard. These must pass
 // through the MessageList filter even though is_system=true.
@@ -20,6 +27,18 @@ const VISIBLE_SYSTEM_SUBTYPES = new Set([
   "task_notification",
   "stop_hook",
 ]);
+
+/**
+ * Reports whether the transcript renders this message as a system boundary
+ * card instead of ordinary message content. The Claude parser keeps these
+ * rows on role "user" so analytics do not count them as assistant replies,
+ * so the role alone cannot tell them apart.
+ */
+export function isSystemBoundaryMessage(m: Message): m is Message & { source_subtype: string } {
+  if (m.is_compact_boundary) return false;
+  if (!m.is_system) return false;
+  return !!m.source_subtype && m.source_subtype !== "compact_boundary";
+}
 
 /**
  * Returns true if the message is system-injected and should be
@@ -38,16 +57,41 @@ export function isSystemMessage(m: Message): boolean {
   }
   if (m.is_system) return true;
   if (m.role !== "user") return false;
-  const trimmed = m.content.trim();
-  return SYSTEM_MSG_PREFIXES.some((p) => trimmed.startsWith(p));
+  const { remainder, stripped } = stripLeadingReminderBlocks(m.content);
+  if (stripped && remainder.length === 0) return true;
+  const trimmed = stripped ? remainder : m.content.trim();
+  return isGoalContextMessage(trimmed) || SYSTEM_MSG_PREFIXES.some((p) => trimmed.startsWith(p));
 }
 
-/**
- * Returns true when a message represents an explicit compact
- * boundary inserted by the agent runtime.
- */
-export function isCompactBoundary(m: Message): boolean {
-  return Boolean(m.is_compact_boundary);
+function stripLeadingReminderBlocks(content: string): {
+  remainder: string;
+  stripped: boolean;
+} {
+  const original = content.trimStart();
+  let rest = original;
+  let stripped = false;
+  while (rest.startsWith(SYSTEM_REMINDER_OPEN_TAG)) {
+    const closeIdx = rest.indexOf(SYSTEM_REMINDER_CLOSE_TAG);
+    if (closeIdx < 0) return { remainder: original, stripped: false };
+    rest = rest.slice(closeIdx + SYSTEM_REMINDER_CLOSE_TAG.length).trimStart();
+    stripped = true;
+  }
+  return { remainder: rest, stripped };
+}
+
+function isGoalContextMessage(trimmedContent: string): boolean {
+  if (trimmedContent.startsWith(LEGACY_GOAL_CONTEXT_PREFIX)) {
+    return true;
+  }
+  if (!trimmedContent.startsWith(CODEX_INTERNAL_CONTEXT_TAG_PREFIX)) {
+    return false;
+  }
+  const tagEnd = trimmedContent.indexOf(">");
+  if (tagEnd < 0) {
+    return false;
+  }
+  const openTag = trimmedContent.slice(0, tagEnd);
+  return GOAL_CONTEXT_SOURCE_ATTR_RE.test(openTag);
 }
 
 export interface MessagePreview {
@@ -70,27 +114,19 @@ export interface MessagePreview {
  * For message-body rendering use `renderMarkdown` instead — it
  * emits real code blocks via marked extensions.
  */
-export function previewMessage(
-  text: string | null | undefined,
-): MessagePreview {
+export function previewMessage(text: string | null | undefined): MessagePreview {
   if (!text) return { text: "", isShell: false };
   const isShell = /<bash-(?:input|stdout|stderr)>/.test(text);
   const out = text
-    .replace(
-      /<bash-input>([\s\S]*?)<\/bash-input>/g,
-      (_, cmd: string) => `!${cmd.trim()}`,
-    )
-    .replace(
-      /<bash-(?:stdout|stderr)>([\s\S]*?)<\/bash-(?:stdout|stderr)>/g,
-      (_, body: string) => body.trim(),
+    .replace(/<bash-input>([\s\S]*?)<\/bash-input>/g, (_, cmd: string) => `!${cmd.trim()}`)
+    .replace(/<bash-(?:stdout|stderr)>([\s\S]*?)<\/bash-(?:stdout|stderr)>/g, (_, body: string) =>
+      body.trim(),
     );
   return { text: out, isShell };
 }
 
 /** Plain-text variant of `previewMessage` for non-visual callers
  *  (rename input pre-fill, confirm-delete sentence, etc.). */
-export function normalizeMessagePreview(
-  text: string | null | undefined,
-): string {
+export function normalizeMessagePreview(text: string | null | undefined): string {
   return previewMessage(text).text;
 }

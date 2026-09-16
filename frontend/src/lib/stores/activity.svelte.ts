@@ -1,0 +1,564 @@
+import type { AgentInfo, ProjectInfo } from "../api/types.js";
+import type { Report } from "../api/types/activity.js";
+import { m } from "../i18n/index.js";
+import { MetadataService } from "../api/generated/index";
+import { callGenerated, isAbortError } from "../api/runtime.js";
+import {
+  fetchActivityReport,
+  fetchActivitySessions,
+  type ActivityReportProgress,
+  type ActivityReportQuery,
+  type ActivityBucketRange,
+  type ActivitySessionPageOptions,
+  type ActivitySessionSort,
+} from "../api/activity-report.js";
+import { sync } from "./sync.svelte.js";
+import { events } from "./events.svelte.js";
+import { router } from "./router.svelte.js";
+import { localDateStr, rollingRange } from "../utils/dates.js";
+import { LatestRead } from "../utils/latest-read.js";
+import type { DataChangedEvent } from "../api/client.js";
+
+export { localDateStr };
+
+type Preset = "day" | "week" | "month" | "custom";
+
+const PRESETS: ReadonlySet<string> = new Set<Preset>(["day", "week", "month", "custom"]);
+
+export type Automation = "all" | "interactive" | "automated";
+
+const AUTOMATIONS: ReadonlySet<string> = new Set<Automation>(["all", "interactive", "automated"]);
+
+function parseWindowDays(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isInteger(n) || n <= 0 || String(n) !== raw) {
+    return null;
+  }
+  return n;
+}
+
+/**
+ * Translate a date-only custom `to` value (YYYY-MM-DD, local zone) to the
+ * exclusive end of a half-open range: local 00:00 of the day AFTER `to`, as an
+ * RFC3339 instant. The caller passes only a non-empty value.
+ */
+function customToInstant(to: string): string {
+  const end = new Date(to + "T00:00:00");
+  end.setDate(end.getDate() + 1);
+  return end.toISOString();
+}
+
+export type ActivityQueryParams = ActivityReportQuery;
+
+class ActivityStore {
+  preset = $state<Preset>("day");
+  date: string = $state(localDateStr(new Date()));
+  from = $state("");
+  to = $state("");
+  rollingWindowDays: number | null = $state(null);
+  bucket = $state("");
+  project: string = $state("");
+  agent: string = $state("");
+  machine: string = $state("");
+  automation: Automation = $state("all");
+  report: Report | null = $state(null);
+  // Monotonic identity for successful full-report loads. report_id is
+  // deterministic for unchanged inputs, so it cannot signal that page-local
+  // drill-down state must be cleared after a manual refresh.
+  reportGeneration = $state(0);
+  loading = $state(false);
+  progress: ActivityReportProgress | null = $state(null);
+  error: string | null = $state(null);
+  sessionsLoading = $state(false);
+  sessionsError: string | null = $state(null);
+  sessionsSort: ActivitySessionSort = $state("agent_minutes");
+  sessionsDirection: "asc" | "desc" = $state("desc");
+  sessionsBucketRange: ActivityBucketRange | null = $state(null);
+  // Epoch ms of the last successful report fetch, powering the "Updated Xm ago"
+  // refresh label. null until the first load completes.
+  lastUpdatedAt: number | null = $state(null);
+  // Set when an SSE event arrives after the first load, signalling that newer
+  // data exists. Mirrors the analytics/usage stores: marking is cheap, and the
+  // actual refetch is left to the manual refresh button and the periodic
+  // scheduler so a session actively writing files does not thrash the report
+  // aggregation on every event.
+  hasNewData: boolean = $state(false);
+
+  // Filter-option lists for the activity controls. Loaded with full
+  // inclusion (one-shot + automated) so every project/agent/machine
+  // that can appear in the always-inclusive activity report is also
+  // selectable here — unlike the sidebar's lists, which honor the
+  // sidebar include toggles.
+  projects: ProjectInfo[] = $state([]);
+  agents: AgentInfo[] = $state([]);
+  machines: string[] = $state([]);
+
+  private loadVersion = 0;
+  private reportRead = new LatestRead();
+  private sessionsRead = new LatestRead();
+  private filterOptionsRead = new LatestRead();
+  #filterOptionsLoaded = false;
+  #filterOptionsPromise: Promise<boolean> | null = null;
+  #filterOptionsVersion = 0;
+  #attached = 0;
+
+  /** Browser-resolved IANA timezone; not a user control. */
+  get timezone(): string {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  }
+
+  /**
+   * Flag that newer data exists (an SSE event arrived) without refetching, so a
+   * session actively writing files does not thrash the report aggregation on
+   * every event. No-op before the first successful load, matching the
+   * analytics/usage stores. The report refreshes on the manual refresh button,
+   * the periodic scheduler, or a range/filter change.
+   */
+  markNewData(): void {
+    if (this.lastUpdatedAt === null) return;
+    this.hasNewData = true;
+  }
+
+  handleDataChangedEvent(event: DataChangedEvent): void {
+    this.markNewData();
+    if (event.scope !== "sessions" && event.scope !== "sync") return;
+    this.invalidateFilterOptions();
+    if (this.attached) void this.loadFilterOptions();
+  }
+
+  private materializeRollingWindow(): boolean {
+    if (this.preset !== "custom" || this.rollingWindowDays === null) {
+      return false;
+    }
+    const range = rollingRange(this.rollingWindowDays);
+    if (this.from === range.from && this.to === range.to) {
+      return false;
+    }
+    this.from = range.from;
+    this.to = range.to;
+    return true;
+  }
+
+  /** Build the complete Activity request scope for the report fetch. */
+  queryParams(): ActivityQueryParams {
+    const fromParam =
+      this.preset === "custom" && this.from
+        ? new Date(this.from + "T00:00:00").toISOString()
+        : undefined;
+    const toParam = this.preset === "custom" && this.to ? customToInstant(this.to) : undefined;
+    return {
+      preset: this.preset,
+      date: this.date,
+      from: fromParam,
+      to: toParam,
+      timezone: this.timezone,
+      bucket: (this.bucket || undefined) as "5m" | "15m" | "1h" | "1d" | "1w" | undefined,
+      project: this.project || undefined,
+      agent: this.agent || undefined,
+      machine: this.machine || undefined,
+      automation: this.automation,
+    };
+  }
+
+  async load({ background = false }: { background?: boolean } = {}): Promise<boolean> {
+    const v = ++this.loadVersion;
+    const signal = this.reportRead.begin();
+    if (this.materializeRollingWindow()) {
+      this.writeUrl();
+    }
+    // A custom range needs both bounds. With only one present (a cleared date
+    // input or a partial deep link) the backend rejects the request, so hold
+    // the current view until both are set instead of flashing an error.
+    if (this.preset === "custom" && (!this.from || !this.to)) {
+      this.reportRead.finish(signal);
+      this.loading = false;
+      return false;
+    }
+    this.loading = true;
+    this.progress = null;
+    this.error = null;
+    try {
+      const res = await fetchActivityReport(this.queryParams(), signal, (progress) => {
+        if (v === this.loadVersion && this.reportRead.isCurrent(signal)) {
+          this.progress = progress;
+        }
+      });
+      if (v !== this.loadVersion || !this.reportRead.isCurrent(signal)) return false;
+      this.sessionsRead.cancel();
+      this.sessionsLoading = false;
+      this.sessionsError = null;
+      this.sessionsSort = "agent_minutes";
+      this.sessionsDirection = "desc";
+      this.sessionsBucketRange = null;
+      this.report = res;
+      this.reportGeneration++;
+      this.lastUpdatedAt = Date.now();
+      this.hasNewData = false;
+      return true;
+    } catch (e) {
+      if (isAbortError(e) || v !== this.loadVersion || !this.reportRead.isCurrent(signal))
+        return false;
+      // A failed background refresh keeps the last good report on screen so a
+      // transient blip never blanks the report-first dashboard; the growing
+      // "Updated Xm ago" label signals the staleness. With no report yet (a
+      // first load still failing, or a refresh firing before one lands) there
+      // is nothing to preserve, so fall through and surface the error rather
+      // than leave a misleading empty state. First loads and range/filter
+      // changes are always foreground and clear on error.
+      if (background && this.report !== null) return false;
+      this.report = null;
+      this.error = e instanceof Error ? e.message : "Failed to load activity report";
+      return false;
+    } finally {
+      if (this.reportRead.finish(signal)) {
+        this.loading = false;
+        this.progress = null;
+      }
+    }
+  }
+
+  async loadSessionPage(options: ActivitySessionPageOptions = {}): Promise<boolean> {
+    const report = this.report;
+    if (!report?.report_id) return false;
+    const signal = this.sessionsRead.begin();
+    const sort = options.sort ?? this.sessionsSort;
+    const direction = options.direction ?? this.sessionsDirection;
+    const bucketRange =
+      options.bucketRange === undefined
+        ? (this.sessionsBucketRange ?? undefined)
+        : options.bucketRange;
+    this.sessionsLoading = true;
+    this.sessionsError = null;
+    try {
+      const page = await fetchActivitySessions(
+        report.report_id,
+        {
+          limit: options.limit ?? 200,
+          cursor: options.cursor,
+          sort,
+          direction,
+          bucketRange,
+        },
+        signal,
+      );
+      if (!this.sessionsRead.isCurrent(signal) || this.report?.report_id !== report.report_id) {
+        return false;
+      }
+      if (page.refresh_required && page.report) {
+        this.report = page.report;
+        this.reportGeneration++;
+        this.sessionsSort = "agent_minutes";
+        this.sessionsDirection = "desc";
+        this.sessionsBucketRange = null;
+        this.lastUpdatedAt = Date.now();
+        this.hasNewData = false;
+        return true;
+      }
+      this.sessionsSort = sort;
+      this.sessionsDirection = direction;
+      this.sessionsBucketRange = bucketRange ? { ...bucketRange } : null;
+      this.report = {
+        ...report,
+        report_id: page.report_id,
+        by_session: page.sessions,
+        sessions_next_cursor: page.next_cursor,
+        sessions_total: page.total,
+      };
+      return true;
+    } catch (e) {
+      if (isAbortError(e) || !this.sessionsRead.isCurrent(signal)) return false;
+      this.sessionsError = e instanceof Error ? e.message : m.activity_sessions_load_failed();
+      return false;
+    } finally {
+      if (this.sessionsRead.finish(signal)) this.sessionsLoading = false;
+    }
+  }
+
+  cancelInFlightReads(): void {
+    this.loadVersion++;
+    this.reportRead.cancel();
+    this.sessionsRead.cancel();
+    this.filterOptionsRead.cancel();
+    this.#filterOptionsPromise = null;
+    this.loading = false;
+    this.sessionsLoading = false;
+  }
+
+  /**
+   * Populate the activity filter dropdowns, including one-shot and automated
+   * sessions so the controls cover everything the always-inclusive activity
+   * report can surface. The result is cached after a fully successful load
+   * and refreshed when a sync/import completes (via invalidateFilterOptions),
+   * mirroring the sessions store. A concurrent call shares the in-flight
+   * request. A transient failure leaves the cache un-loaded so the next call
+   * retries; lists that did succeed keep their values in the meantime.
+   */
+  async loadFilterOptions(): Promise<boolean> {
+    if (this.#filterOptionsLoaded) return true;
+    if (this.#filterOptionsPromise) return this.#filterOptionsPromise;
+    const ver = this.#filterOptionsVersion;
+    const signal = this.filterOptionsRead.begin();
+    const opts = { include_one_shot: true, include_automated: true };
+    let request!: Promise<boolean>;
+    request = (async () => {
+      let ok = true;
+      try {
+        const res = await callGenerated(
+          (options) => MetadataService.getApiV1Projects(opts, options),
+          signal,
+        );
+        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
+          this.projects = res.projects;
+      } catch (e) {
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
+        ok = false; // keep the current list; retry on the next call
+      }
+      try {
+        const res = await callGenerated(
+          (options) => MetadataService.getApiV1Agents(opts, options),
+          signal,
+        );
+        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
+          this.agents = res.agents;
+      } catch (e) {
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
+        ok = false;
+      }
+      try {
+        const res = await callGenerated(
+          (options) => MetadataService.getApiV1Machines(opts, options),
+          signal,
+        );
+        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
+          this.machines = res.machines;
+      } catch (e) {
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
+        ok = false;
+      }
+      const current =
+        ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal);
+      if (current) {
+        // Cache only a fully successful load so a transient failure is
+        // retried rather than frozen as a permanent empty list.
+        this.#filterOptionsLoaded = ok;
+      }
+      return current && ok;
+    })().finally(() => {
+      if (this.#filterOptionsPromise === request) this.#filterOptionsPromise = null;
+      this.filterOptionsRead.finish(signal);
+    });
+    this.#filterOptionsPromise = request;
+    return request;
+  }
+
+  /**
+   * Drop the activity filter-option cache so the next loadFilterOptions()
+   * refetches. Invoked when a sync/import completes, since newly imported
+   * sessions can introduce projects/agents/machines the activity report shows.
+   */
+  invalidateFilterOptions() {
+    this.#filterOptionsVersion++;
+    this.#filterOptionsLoaded = false;
+    this.#filterOptionsPromise = null;
+  }
+
+  /** Whether an ActivityPage is currently mounted and showing the controls. */
+  get attached(): boolean {
+    return this.#attached > 0;
+  }
+
+  /**
+   * Register a mounted ActivityPage so a completed sync can refresh the filter
+   * options while they are on screen. Returns a detach callback for the
+   * component's onMount cleanup.
+   */
+  attach(): () => void {
+    this.#attached++;
+    // Make state URL-canonical on mount, then keep it in sync with browser
+    // back/forward. router's own popstate handler runs first (registered at
+    // module load) and has already refreshed router.params synchronously, so
+    // reading it here observes the navigated-to URL.
+    this.hydrateFromUrl(router.params);
+    const onPop = () => {
+      this.hydrateFromUrl(router.params);
+      void this.load();
+    };
+    window.addEventListener("popstate", onPop);
+    let detached = false;
+    return () => {
+      if (detached) return;
+      detached = true;
+      window.removeEventListener("popstate", onPop);
+      this.#attached = Math.max(0, this.#attached - 1);
+    };
+  }
+
+  /**
+   * Replace range/preset/filter state from URL query params. `preset` defaults
+   * to "day" (and falls back to "day" for any unknown value); `date` defaults
+   * to today's local YYYY-MM-DD; `automation` defaults to "all" (and falls back
+   * to "all" for any unknown value). The remaining filters default to empty.
+   * This is the single hydration path, run on mount and on popstate.
+   */
+  hydrateFromUrl(params: Record<string, string>) {
+    const windowDays = parseWindowDays(params.window_days);
+    if (windowDays !== null) {
+      const range = rollingRange(windowDays);
+      this.preset = "custom";
+      this.date = range.to;
+      this.from = range.from;
+      this.to = range.to;
+      this.rollingWindowDays = windowDays;
+    } else {
+      this.preset = PRESETS.has(params.preset ?? "") ? (params.preset as Preset) : "day";
+      this.date = params.date || localDateStr(new Date());
+      this.from = params.from ?? "";
+      this.to = params.to ?? "";
+      this.rollingWindowDays = null;
+    }
+    this.bucket = params.bucket ?? "";
+    this.project = params.project ?? "";
+    this.agent = params.agent ?? "";
+    this.machine = params.machine ?? "";
+    this.automation = AUTOMATIONS.has(params.automation ?? "")
+      ? (params.automation as Automation)
+      : "all";
+  }
+
+  /**
+   * Write the current range/preset/filter state to the URL through the router's
+   * single replaceState path. `preset` is always included; `date` is included
+   * for day/week/month when non-empty; `from`/`to` only for the custom preset;
+   * bucket/project/agent/machine only when non-empty; `automation` only when not
+   * the "all" default. Empty filters and preset-irrelevant fields are omitted so
+   * URLs stay minimal and deep-linkable.
+   */
+  writeUrl() {
+    const p: Record<string, string> = { preset: this.preset };
+    if (this.preset === "custom") {
+      if (this.from) p.from = this.from;
+      if (this.to) p.to = this.to;
+      if (this.rollingWindowDays !== null) {
+        p.window_days = String(this.rollingWindowDays);
+      }
+    } else {
+      if (this.date) p.date = this.date;
+    }
+    if (this.bucket) p.bucket = this.bucket;
+    if (this.project) p.project = this.project;
+    if (this.agent) p.agent = this.agent;
+    if (this.machine) p.machine = this.machine;
+    if (this.automation !== "all") p.automation = this.automation;
+    router.replaceParams(p);
+  }
+
+  setPreset(p: Preset) {
+    this.preset = p;
+    if (p !== "custom") {
+      this.rollingWindowDays = null;
+    }
+    if (p === "custom") {
+      // Seed a 1-day range from the current anchor so selecting Custom shows a
+      // valid range immediately instead of erroring on empty from/to bounds.
+      if (!this.from) this.from = this.date;
+      if (!this.to) this.to = this.date;
+    }
+    this.writeUrl();
+  }
+
+  setDate(date: string) {
+    this.date = date;
+    if (this.preset !== "custom") {
+      this.rollingWindowDays = null;
+    }
+    this.writeUrl();
+  }
+
+  setFrom(d: string) {
+    this.from = d;
+    this.rollingWindowDays = null;
+    this.writeUrl();
+  }
+
+  setTo(d: string) {
+    this.to = d;
+    this.rollingWindowDays = null;
+    this.writeUrl();
+  }
+
+  setCustomRange(from: string, to: string, rollingWindowDays: number | null = null) {
+    this.preset = "custom";
+    this.date = from;
+    this.from = from;
+    this.to = to;
+    this.rollingWindowDays = rollingWindowDays;
+    this.writeUrl();
+  }
+
+  /**
+   * Advance the anchor `date` by one preset unit: one day for `day`, seven days
+   * for `week`, one calendar month for `month` (clamped to a valid day). No-op
+   * for `custom`, which is driven by explicit from/to inputs instead.
+   */
+  step(direction: -1 | 1) {
+    if (this.preset === "custom") return;
+    const d = new Date(this.date + "T00:00:00");
+    if (this.preset === "week") {
+      d.setDate(d.getDate() + 7 * direction);
+    } else if (this.preset === "month") {
+      // Advance one calendar month, clamping the day to the target month's last
+      // day so e.g. Jan 31 -> Feb 28 instead of overflowing into March.
+      const target = new Date(d.getFullYear(), d.getMonth() + direction, 1);
+      const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+      target.setDate(Math.min(d.getDate(), lastDay));
+      d.setTime(target.getTime());
+    } else {
+      d.setDate(d.getDate() + direction);
+    }
+    this.date = localDateStr(d);
+    this.writeUrl();
+  }
+
+  setProject(project: string) {
+    this.project = project;
+    this.writeUrl();
+  }
+
+  setAgent(agent: string) {
+    this.agent = agent;
+    this.writeUrl();
+  }
+
+  setMachine(machine: string) {
+    this.machine = machine;
+    this.writeUrl();
+  }
+
+  setAutomation(automation: Automation) {
+    this.automation = automation;
+    this.writeUrl();
+  }
+}
+
+export const activity = new ActivityStore();
+
+// Keep the singleton's project metadata coherent even while ActivityPage is
+// unmounted. An attached page refetches immediately; otherwise the invalidated
+// cache is populated lazily on the next visit.
+events.subscribe((event) => activity.handleDataChangedEvent(event));
+
+// Refresh the activity filter options after any sync/import, mirroring the
+// sessions store, so newly imported projects/agents/machines appear in the
+// activity controls without a full page reload. Only refetch when an
+// ActivityPage is mounted; otherwise the invalidated cache is picked up lazily
+// by the next mount's loadFilterOptions(). The report itself is deliberately
+// not refetched here: that is driven by the manual refresh button and the
+// periodic scheduler in ActivityPage, so a session actively writing files does
+// not thrash the report aggregation on every sync. The eager option refetch
+// also recovers the controls when a sync lands mid-initial-load and the version
+// bump discards that in-flight response.
+sync.onSyncComplete(() => {
+  activity.invalidateFilterOptions();
+  if (activity.attached) void activity.loadFilterOptions();
+});

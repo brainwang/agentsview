@@ -24,7 +24,21 @@ class EventsStore {
   // tab becomes visible again (giving a user-initiated retry
   // window so false positives recover without a page reload).
   private permanentlyFailed = false;
+  private available = false;
   private visibilityHandlerInstalled = false;
+
+  /** Enable or disable the live event stream for the current backend mode. */
+  setAvailable(available: boolean) {
+    this.available = available;
+    if (!available) {
+      this.close();
+      return;
+    }
+    if (this.listeners.size > 0) {
+      this.ensureOpen();
+      this.ensureHealTimer();
+    }
+  }
 
   /** Subscribe to every event. Returns unsubscribe. */
   subscribe(fn: Listener): () => void {
@@ -44,10 +58,7 @@ class EventsStore {
   /** Subscribe with a trailing-edge debounce. The callback fires
    * once, `delayMs` after the last event in a burst, with the
    * most recent event's payload. Returns unsubscribe. */
-  subscribeDebounced(
-    fn: Listener,
-    delayMs = 300,
-  ): () => void {
+  subscribeDebounced(fn: Listener, delayMs = 300): () => void {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let latest: DataChangedEvent | null = null;
 
@@ -72,6 +83,7 @@ class EventsStore {
   }
 
   private ensureOpen() {
+    if (!this.available) return;
     // Don't retry once watchEvents has told us the endpoint is
     // permanently unavailable. The safety-net polls on each view
     // still keep data fresh in that mode.
@@ -157,10 +169,7 @@ class EventsStore {
   // subscribe so module import has no global side effect.
   private installVisibilityHandler() {
     if (this.visibilityHandlerInstalled) return;
-    if (
-      typeof document === "undefined" ||
-      typeof document.addEventListener !== "function"
-    ) {
+    if (typeof document === "undefined" || typeof document.addEventListener !== "function") {
       return;
     }
     this.visibilityHandlerInstalled = true;

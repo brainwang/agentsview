@@ -6,11 +6,15 @@ import (
 	"log"
 )
 
-const signalsBackfillMarker = "session_signals_v1"
+const signalsBackfillMarker = "session_quality_signals_v1"
 
 // SessionSignalUpdate holds computed signal values to persist
 // on the sessions table.
 type SessionSignalUpdate struct {
+	// FullState is optional state computed from the complete message snapshot
+	// being published. The same transaction binds it to the stored revision.
+	// Incremental and asynchronous writers use their own snapshot guards.
+	FullState              *SessionSignalState
 	ToolFailureSignalCount int
 	ToolRetryCount         int
 	EditChurnCount         int
@@ -27,6 +31,60 @@ type SessionSignalUpdate struct {
 	HealthGrade            *string
 	HasToolCalls           bool
 	HasContextData         bool
+	SecretLeakCount        int
+	SecretsRulesVersion    string
+	QualitySignals         QualitySignals
+}
+
+// usageOnlySignalUpdate is the canonical derived-signal state for an archive
+// that deliberately omits the transcript content those signals require. The
+// current version marks the empty result as intentional so startup backfill
+// does not revisit the row on every process launch.
+func usageOnlySignalUpdate() SessionSignalUpdate {
+	return SessionSignalUpdate{
+		QualitySignals: QualitySignals{
+			Version: CurrentQualitySignalVersion,
+		},
+	}
+}
+
+func settleUsageOnlySignalsTx(
+	tx transactionQueries, sessionID string,
+) error {
+	if err := updateSessionSignalsTx(
+		tx, sessionID, usageOnlySignalUpdate(),
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM session_signal_state WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("clearing usage-only signal state: %w", err)
+	}
+	return replaceSecretFindingsTx(tx, sessionID, nil, 0, "")
+}
+
+// SettleUsageOnlySignals atomically clears transcript-derived signal state and
+// records the current signal version. It also heals compact archives created
+// before usage-only writes persisted that terminal state.
+func (db *DB) SettleUsageOnlySignals(sessionID string) error {
+	if !db.usageOnlyStorage() {
+		return fmt.Errorf(
+			"settling usage-only signals for %s on a full-content database",
+			sessionID,
+		)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return fmt.Errorf("beginning usage-only signal tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := settleUsageOnlySignalsTx(tx, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateSessionSignals persists computed signal values on the
@@ -41,7 +99,33 @@ func (db *DB) UpdateSessionSignals(
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	_, err := db.getWriter().Exec(`
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return fmt.Errorf("beginning tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if db.usageOnlyStorage() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		err = updateSessionSignalsTx(tx, sessionID, u)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// updateSessionSignalsTx writes signal columns within an existing transaction.
+// Caller owns the lock and transaction lifecycle. It deliberately does NOT
+// write secret_leak_count/secrets_rules_version: those are owned solely by the
+// secret-finding replacement path (replaceSecretFindingsTx), so a signals-only
+// recompute cannot reset them while findings still exist. The two secret fields
+// on SessionSignalUpdate are carried here only so callers can forward them to
+// replaceSecretFindingsTx alongside the findings.
+func updateSessionSignalsTx(
+	tx transactionQueries, sessionID string, u SessionSignalUpdate,
+) error {
+	_, err := tx.Exec(`
 		UPDATE sessions SET
 			tool_failure_signal_count = ?,
 			tool_retry_count = ?,
@@ -59,6 +143,14 @@ func (db *DB) UpdateSessionSignals(
 			health_grade = ?,
 			has_tool_calls = ?,
 			has_context_data = ?,
+			quality_signal_version = ?,
+			short_prompt_count = ?,
+			unstructured_start = ?,
+			missing_success_criteria_count = ?,
+			missing_verification_count = ?,
+			duplicate_prompt_count = ?,
+			no_code_context_count = ?,
+			runaway_tool_loop_count = ?,
 			local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		WHERE id = ?`,
 		u.ToolFailureSignalCount,
@@ -77,6 +169,14 @@ func (db *DB) UpdateSessionSignals(
 		u.HealthGrade,
 		u.HasToolCalls,
 		u.HasContextData,
+		u.QualitySignals.Version,
+		u.QualitySignals.ShortPromptCount,
+		u.QualitySignals.UnstructuredStart,
+		u.QualitySignals.MissingSuccessCriteriaCount,
+		u.QualitySignals.MissingVerificationCount,
+		u.QualitySignals.DuplicatePromptCount,
+		u.QualitySignals.NoCodeContextCount,
+		u.QualitySignals.RunawayToolLoopCount,
 		sessionID,
 	)
 	if err != nil {
@@ -84,6 +184,25 @@ func (db *DB) UpdateSessionSignals(
 			"updating session signals for %s: %w",
 			sessionID, err,
 		)
+	}
+	if u.FullState != nil {
+		state := u.FullState
+		// Copy the revision inside SQLite, avoiding a post-commit read and
+		// a second transaction for the same session's derived state.
+		if _, err := tx.Exec(`
+			INSERT INTO session_signal_state
+				(session_id, state, transcript_revision, signal_version, updated_at)
+			SELECT id, ?, transcript_revision, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			FROM sessions WHERE id = ?
+			ON CONFLICT(session_id) DO UPDATE SET
+				state = excluded.state,
+				transcript_revision = excluded.transcript_revision,
+				signal_version = excluded.signal_version,
+				updated_at = excluded.updated_at`,
+			state.State, state.SignalVersion, sessionID,
+		); err != nil {
+			return fmt.Errorf("writing full signal state for %s: %w", sessionID, err)
+		}
 	}
 	return nil
 }
@@ -117,9 +236,11 @@ func (db *DB) PendingSignalSessions(
 	return ids, rows.Err()
 }
 
-// BackfillSignals runs a one-time computation of session
-// signals for all sessions. Guarded by a stats marker so it
-// only runs once. computeFn returns nil on success or an
+// BackfillSignals recomputes signals for every session whose stored
+// quality_signal_version is below the current one. A stats marker
+// records that a run completed cleanly; once set, later calls with
+// no stale sessions return without logging. computeFn returns nil
+// on success or an
 // error to signal that the per-session recompute could not
 // be completed (e.g. the DB connection went away during a
 // concurrent resync swap). The completion marker is only set
@@ -142,16 +263,32 @@ func (db *DB) BackfillSignals(
 			"probing signals backfill marker: %w", err,
 		)
 	}
-	if done > 0 {
-		db.mu.Unlock()
-		return nil
-	}
 	db.mu.Unlock()
 
-	log.Println("backfill: computing session signals...")
-
+	// Filter on the stored signal version even when the completion
+	// marker is unset: quality_signal_version defaults to 0, so
+	// sessions that never had signals computed always qualify, while
+	// sessions already at the current version -- synced inline during
+	// a resync, or copied as orphans from an already-backfilled
+	// archive -- are skipped. Post-resync databases lose the marker
+	// but keep current versions, so an unfiltered walk would recompute
+	// the entire archive for nothing.
+	//
+	// Accepted edge: a database written before findings persisted
+	// ahead of the version bump can hold rows whose version is
+	// current even though a findings write once failed mid-sequence.
+	// Those rows are not revisited here. They require a partial write
+	// failure that no later session write healed, the old code froze
+	// them identically whenever its completion marker was set, and a
+	// forced `secrets scan` (non-backfill) rewrites findings for
+	// every session. Healing them automatically would mean either
+	// permanent grandfathering state or a full-archive recompute at
+	// upgrade -- both worse than the edge.
 	rows, err := db.getReader().QueryContext(ctx,
-		`SELECT id FROM sessions WHERE message_count > 0`)
+		`SELECT id FROM sessions
+		 WHERE message_count > 0 AND quality_signal_version < ?`,
+		CurrentQualitySignalVersion,
+	)
 	if err != nil {
 		return fmt.Errorf(
 			"querying backfill candidates: %w", err,
@@ -172,6 +309,17 @@ func (db *DB) BackfillSignals(
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	if len(ids) == 0 {
+		if done == 0 {
+			return db.MarkSignalsBackfillDone()
+		}
+		return nil
+	}
+
+	log.Printf(
+		"backfill: recomputing %d stale session signals...",
+		len(ids),
+	)
 
 	var failed int
 	for i, id := range ids {

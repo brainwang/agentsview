@@ -1,7 +1,10 @@
-import * as api from "../api/client.js";
+import { SessionsService } from "../api/generated/index";
 import type { Message } from "../api/types.js";
+import { isAbortError } from "../api/runtime.js";
 import { clearContentCaches } from "../utils/content-parser.js";
-import { computeMainModel } from "../utils/model.js";
+import { computeMainModelInfo, type ModelEffort } from "../utils/model.js";
+import { buildReadProgressToken, readProgress } from "./read-progress.svelte.js";
+import { sessions } from "./sessions.svelte.js";
 
 const MESSAGE_PAGE_SIZE = 1000;
 const FULL_SESSION_MESSAGE_THRESHOLD = 3_000;
@@ -13,79 +16,113 @@ interface FetchPageOptions {
   signal: AbortSignal;
 }
 
-class MessagesStore {
+export class MessagesStore {
   messages: Message[] = $state([]);
   loading: boolean = $state(false);
   sessionId: string | null = $state(null);
   messageCount: number = $state(0);
+  activeSessionToken: string | null = $state(null);
+  activeSessionUnreadOrdinal: number | null = $state(null);
   hasOlder: boolean = $state(false);
   loadingOlder: boolean = $state(false);
-  private _stableMainModel: string = $state("");
-  mainModel: string = $derived(
-    this.loading
-      ? this._stableMainModel
-      : this.messages.length > 0
-        ? computeMainModel(this.messages)
-        : "",
+  historyComplete: boolean = $state(false);
+  private reloading: boolean = $state(false);
+  private _stableMainModelInfo: ModelEffort = $state({
+    model: "",
+    reasoningEffort: "",
+  });
+  mainModelInfo: ModelEffort = $derived(
+    this.loading ? this._stableMainModelInfo : computeMainModelInfo(this.messages),
   );
+  mainModel: string = $derived(this.mainModelInfo.model);
   private abortController: AbortController | null = null;
+  private cancelledSessionId: string | null = null;
+  // The session id alone cannot tell a stale load's late 404 apart
+  // from the current load for the same session, so failures check
+  // this before reporting a missing session.
+  private loadGeneration: number = 0;
   private reloadPromise: Promise<void> | null = null;
   private reloadSessionId: string | null = null;
   private pendingReload: boolean = false;
   private loadOlderPromise: Promise<void> | null = null;
+  private pendingSessionToken: string | null = null;
+  private hasPendingSessionToken: boolean = false;
+  private pendingSessionUnreadOrdinal: number | null = null;
+
+  resumeModelFor(sessionId: string): string {
+    return this.sessionId === sessionId &&
+      this.historyComplete &&
+      !this.loading &&
+      !this.loadingOlder &&
+      !this.reloading
+      ? this.mainModel
+      : "";
+  }
 
   async loadSession(id: string) {
+    const resumesCancelledLoad = this.sessionId === id && this.cancelledSessionId === id;
     if (
       this.sessionId === id &&
+      !resumesCancelledLoad &&
       (this.messages.length > 0 || this.loading)
     ) {
       return;
     }
-    this.clear();
-    this._stableMainModel = "";
+    const readMarker = readProgress.get(id);
+    if (!resumesCancelledLoad) {
+      this.clear();
+      this.activeSessionToken = null;
+      this.activeSessionUnreadOrdinal = null;
+    }
     this.sessionId = id;
+    this.cancelledSessionId = null;
     this.loading = true;
 
+    const generation = ++this.loadGeneration;
     const ac = new AbortController();
     this.abortController = ac;
 
     try {
       let countHint: number | null = null;
+      let pendingToken: string | null = null;
       try {
-        const sess = await api.getSession(id, {
-          signal: ac.signal,
-        });
+        const sess = await SessionsService.getApiV1SessionsById({ id }, { signal: ac.signal });
         countHint = sess.message_count ?? 0;
+        pendingToken = buildReadProgressToken(sess);
       } catch (err) {
         if (isAbortError(err)) return;
-        console.warn(
-          "Failed to fetch session metadata:",
-          err,
-        );
+        // This probe is the only detail fetch a plain click on an
+        // already-hydrated sidebar row makes, so it is what detects
+        // a session deleted behind a cached row.
+        if (this.loadGeneration === generation) {
+          sessions.markActiveSessionMissing(id, err);
+        }
+        console.warn("Failed to fetch session metadata:", err);
       }
 
-      if (
-        countHint !== null &&
-        countHint > FULL_SESSION_MESSAGE_THRESHOLD
-      ) {
+      if (countHint !== null && countHint > FULL_SESSION_MESSAGE_THRESHOLD) {
         await this.loadProgressively(id, ac.signal);
       } else {
-        await this.loadAllMessages(
-          id,
-          ac.signal,
-          countHint ?? undefined,
+        await this.loadAllMessages(id, ac.signal, countHint ?? undefined);
+      }
+      if (this.sessionId === id) {
+        this.publishOrDeferSessionToken(
+          pendingToken,
+          null,
+          readMarker !== null && readMarker.token !== pendingToken,
         );
       }
     } catch (err) {
       if (isAbortError(err)) return;
+      if (this.sessionId === id) this.historyComplete = false;
+      if (this.loadGeneration === generation) {
+        sessions.markActiveSessionMissing(id, err);
+      }
       console.warn("Failed to load session messages:", err);
     } finally {
       if (this.sessionId === id) {
         this.loading = false;
-        this._stableMainModel =
-          this.messages.length > 0
-            ? computeMainModel(this.messages)
-            : "";
+        this.updateStableMainModelInfo();
       }
     }
   }
@@ -93,25 +130,26 @@ class MessagesStore {
   reload(): Promise<void> {
     if (!this.sessionId) return Promise.resolve();
 
-    if (
-      this.reloadPromise &&
-      this.reloadSessionId === this.sessionId
-    ) {
+    if (this.reloadPromise && this.reloadSessionId === this.sessionId) {
       this.pendingReload = true;
       return this.reloadPromise;
     }
 
     const id = this.sessionId;
     this.reloadSessionId = id;
+    this.reloading = true;
 
     const promise = this.reloadNow(id).finally(async () => {
       if (this.reloadPromise === promise) {
         this.reloadPromise = null;
         this.reloadSessionId = null;
       }
-      if (this.pendingReload && this.sessionId === id) {
+      const shouldReload = this.pendingReload && this.sessionId === id;
+      if (shouldReload) {
         this.pendingReload = false;
         await this.reload();
+      } else if (this.sessionId === id) {
+        this.reloading = false;
       }
     });
     this.reloadPromise = promise;
@@ -119,15 +157,44 @@ class MessagesStore {
   }
 
   clear() {
-    this.abortController?.abort();
-    this.abortController = null;
+    this.cancelInFlight();
     this.messages = [];
     clearContentCaches();
     this.sessionId = null;
+    this.cancelledSessionId = null;
     this.loading = false;
-    this._stableMainModel = "";
+    this._stableMainModelInfo = { model: "", reasoningEffort: "" };
     this.messageCount = 0;
+    this.activeSessionToken = null;
+    this.activeSessionUnreadOrdinal = null;
     this.hasOlder = false;
+    this.loadingOlder = false;
+    this.historyComplete = false;
+    this.reloading = false;
+    this.reloadPromise = null;
+    this.reloadSessionId = null;
+    this.pendingReload = false;
+    this.loadOlderPromise = null;
+    this.pendingSessionToken = null;
+    this.hasPendingSessionToken = false;
+    this.pendingSessionUnreadOrdinal = null;
+  }
+
+  cancelInFlight(): void {
+    // A request that rejected just before the abort is not an
+    // AbortError, so retire the load's generation as well.
+    this.loadGeneration++;
+    const hasInFlightRead =
+      this.loading ||
+      this.loadingOlder ||
+      this.reloadPromise !== null ||
+      this.loadOlderPromise !== null;
+    if (hasInFlightRead && this.abortController && !this.abortController.signal.aborted) {
+      this.cancelledSessionId = this.sessionId;
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    this.loading = false;
     this.loadingOlder = false;
     this.reloadPromise = null;
     this.reloadSessionId = null;
@@ -135,17 +202,18 @@ class MessagesStore {
     this.loadOlderPromise = null;
   }
 
-  private async fetchPages(
-    id: string,
-    opts: FetchPageOptions,
-  ): Promise<Message[]> {
+  private async fetchPages(id: string, opts: FetchPageOptions): Promise<Message[]> {
     const loaded: Message[] = [];
     let from = opts.from;
 
     for (;;) {
-      const res = await api.getMessages(
-        id,
-        { from, limit: opts.limit, direction: opts.direction },
+      const res = await SessionsService.getApiV1SessionsByIdMessages(
+        { id },
+        {
+          from,
+          limit: opts.limit,
+          direction: opts.direction,
+        },
         { signal: opts.signal },
       );
       if (res.messages.length === 0) break;
@@ -156,15 +224,8 @@ class MessagesStore {
       const last = res.messages[res.messages.length - 1];
       if (!last) break;
 
-      const nextFrom =
-        opts.direction === "asc"
-          ? last.ordinal + 1
-          : last.ordinal - 1;
-      if (
-        opts.direction === "asc"
-          ? nextFrom <= from
-          : nextFrom >= from
-      ) {
+      const nextFrom = opts.direction === "asc" ? last.ordinal + 1 : last.ordinal - 1;
+      if (opts.direction === "asc" ? nextFrom <= from : nextFrom >= from) {
         break;
       }
       from = nextFrom;
@@ -173,32 +234,39 @@ class MessagesStore {
     return loaded;
   }
 
-  private async loadAllMessages(
-    id: string,
-    signal: AbortSignal,
-    messageCountHint?: number,
-  ) {
+  private async loadAllMessages(id: string, signal: AbortSignal, messageCountHint?: number) {
+    this.historyComplete = false;
     let from = 0;
     let loaded: Message[] = [];
+    let complete = false;
 
     for (;;) {
-      const res = await api.getMessages(
-        id,
-        { from, limit: MESSAGE_PAGE_SIZE, direction: "asc" },
+      const res = await SessionsService.getApiV1SessionsByIdMessages(
+        { id },
+        {
+          from,
+          limit: MESSAGE_PAGE_SIZE,
+          direction: "asc",
+        },
         { signal },
       );
-      if (res.messages.length === 0) break;
+      if (this.sessionId !== id) return;
+      if (res.messages.length === 0) {
+        complete = true;
+        break;
+      }
 
       loaded = [...loaded, ...res.messages];
       this.messages = loaded;
 
       const newest = loaded[loaded.length - 1];
-      this.messageCount =
-        messageCountHint ??
-        (newest ? newest.ordinal + 1 : loaded.length);
+      this.messageCount = messageCountHint ?? (newest ? newest.ordinal + 1 : loaded.length);
       this.hasOlder = false;
 
-      if (res.messages.length < MESSAGE_PAGE_SIZE) break;
+      if (res.messages.length < MESSAGE_PAGE_SIZE) {
+        complete = true;
+        break;
+      }
       const last = res.messages[res.messages.length - 1];
       if (!last) break;
       const nextFrom = last.ordinal + 1;
@@ -207,53 +275,52 @@ class MessagesStore {
     }
 
     const newest = this.messages[this.messages.length - 1];
-    this.messageCount =
-      messageCountHint ??
-      (newest ? newest.ordinal + 1 : this.messages.length);
+    if (this.sessionId !== id) return;
+    this.messageCount = messageCountHint ?? (newest ? newest.ordinal + 1 : this.messages.length);
     this.hasOlder = false;
+    this.historyComplete = complete;
   }
 
-  private async loadProgressively(
-    id: string,
-    signal: AbortSignal,
-  ) {
-    const firstRes = await api.getMessages(
-      id,
-      { limit: MESSAGE_PAGE_SIZE, direction: "desc" },
+  private async loadProgressively(id: string, signal: AbortSignal) {
+    const firstRes = await SessionsService.getApiV1SessionsByIdMessages(
+      { id },
+      {
+        limit: MESSAGE_PAGE_SIZE,
+        direction: "desc",
+      },
       { signal },
     );
+    if (this.sessionId !== id) return;
 
     this.messages = [...firstRes.messages].reverse();
+    this.historyComplete = false;
     const newest = this.messages[this.messages.length - 1];
     this.messageCount = newest ? newest.ordinal + 1 : 0;
     const oldest = this.messages[0]?.ordinal;
-    this.hasOlder =
-      oldest !== undefined ? oldest > 0 : false;
+    this.hasOlder = oldest !== undefined ? oldest > 0 : false;
+    this.historyComplete = !this.hasOlder;
   }
 
-  private async loadFrom(
-    id: string,
-    from: number,
-    signal: AbortSignal,
-  ) {
+  private async loadFrom(id: string, from: number, signal: AbortSignal) {
     const pages = await this.fetchPages(id, {
       from,
       limit: MESSAGE_PAGE_SIZE,
       direction: "asc",
       signal,
     });
+    if (this.sessionId !== id) return;
     if (pages.length > 0) {
-      this.messages.push(...pages);
+      const updates = new Map(pages.map((m) => [m.ordinal, m]));
+      const existingOrdinals = new Set(this.messages.map((m) => m.ordinal));
+      const appended = pages.filter((m) => !existingOrdinals.has(m.ordinal));
+      clearContentCaches();
+      this.messages = [...this.messages.map((m) => updates.get(m.ordinal) ?? m), ...appended];
+      this.updateStableMainModelInfo();
     }
   }
 
   async loadOlder() {
-    if (
-      !this.sessionId ||
-      this.loadOlderPromise ||
-      !this.hasOlder ||
-      this.messages.length === 0
-    ) {
+    if (!this.sessionId || this.loadOlderPromise || !this.hasOlder || this.messages.length === 0) {
       return this.loadOlderPromise ?? undefined;
     }
 
@@ -273,6 +340,8 @@ class MessagesStore {
     const oldest = this.messages[0]!.ordinal;
     if (oldest <= 0) {
       this.hasOlder = false;
+      this.historyComplete = true;
+      this.publishPendingSessionToken(id);
       return;
     }
 
@@ -281,8 +350,8 @@ class MessagesStore {
 
     this.loadingOlder = true;
     try {
-      const res = await api.getMessages(
-        id,
+      const res = await SessionsService.getApiV1SessionsByIdMessages(
+        { id },
         {
           from: oldest - 1,
           limit: MESSAGE_PAGE_SIZE,
@@ -293,13 +362,18 @@ class MessagesStore {
       if (this.sessionId !== id) return;
       if (res.messages.length === 0) {
         this.hasOlder = false;
+        this.historyComplete = true;
+        this.publishPendingSessionToken(id);
         return;
       }
       const chunk = [...res.messages].reverse();
       this.messages.unshift(...chunk);
       this.hasOlder = chunk[0]!.ordinal > 0;
+      this.historyComplete = !this.hasOlder;
+      this.publishPendingSessionToken(id);
     } catch (err) {
       if (isAbortError(err)) return;
+      if (this.sessionId === id) this.historyComplete = false;
       console.warn("Failed to load older messages:", err);
     } finally {
       if (this.sessionId === id) {
@@ -323,10 +397,7 @@ class MessagesStore {
       if (this.messages[0]!.ordinal <= targetOrdinal) return;
     }
 
-    const p = this.doEnsureOrdinal(
-      id,
-      targetOrdinal,
-    ).finally(() => {
+    const p = this.doEnsureOrdinal(id, targetOrdinal).finally(() => {
       if (this.loadOlderPromise === p) {
         this.loadOlderPromise = null;
       }
@@ -335,10 +406,77 @@ class MessagesStore {
     return p;
   }
 
-  private async doEnsureOrdinal(
-    id: string,
-    targetOrdinal: number,
-  ) {
+  /** Complete either a missing prefix or a failed forward load for session find. */
+  async ensureHistoryLoaded(): Promise<void> {
+    const id = this.sessionId;
+    const signal = this.abortController?.signal;
+    const current = () =>
+      this.sessionId === id && this.abortController?.signal === signal && !signal?.aborted;
+    if (!id || !signal || !current() || this.loading) return;
+    if (this.hasOlder) {
+      await this.ensureOrdinalLoaded(0);
+      if (!current() || this.hasOlder) return;
+    }
+    if (this.historyComplete) return;
+    if (this.loadOlderPromise) {
+      await this.loadOlderPromise;
+      if (!current() || this.historyComplete) return;
+    }
+    const pending = this.loadRemainingMessages(id, signal).finally(() => {
+      if (this.loadOlderPromise === pending) this.loadOlderPromise = null;
+    });
+    this.loadOlderPromise = pending;
+    await pending;
+  }
+
+  /** Resume the missing tail without removing already loaded rows or their cursor. */
+  private async loadRemainingMessages(id: string, signal: AbortSignal): Promise<void> {
+    const current = () =>
+      this.sessionId === id && this.abortController?.signal === signal && !signal.aborted;
+    this.loadingOlder = true;
+    try {
+      let from = (this.messages.at(-1)?.ordinal ?? -1) + 1;
+      for (;;) {
+        const res = await SessionsService.getApiV1SessionsByIdMessages(
+          { id },
+          { from, limit: MESSAGE_PAGE_SIZE, direction: "asc" },
+          { signal },
+        );
+        if (!current()) return;
+        if (res.messages.length === 0) {
+          this.historyComplete = !this.hasOlder;
+          break;
+        }
+        const nextFrom = res.messages.at(-1)!.ordinal + 1;
+        if (nextFrom <= from) throw new Error("Session history pagination made no progress");
+        // Concurrent SSE refreshes may already have appended some of this page.
+        // Preserve their objects and never introduce duplicate ordinals.
+        const existing = new Set(this.messages.map((message) => message.ordinal));
+        const added = res.messages.filter((message) => {
+          if (existing.has(message.ordinal)) return false;
+          existing.add(message.ordinal);
+          return true;
+        });
+        clearContentCaches();
+        this.messages = [...this.messages, ...added].sort((a, b) => a.ordinal - b.ordinal);
+        this.messageCount = Math.max(this.messageCount, this.messages.at(-1)!.ordinal + 1);
+        if (res.messages.length < MESSAGE_PAGE_SIZE) {
+          this.historyComplete = !this.hasOlder;
+          break;
+        }
+        from = nextFrom;
+      }
+      this.publishPendingSessionToken(id);
+    } catch (error) {
+      if (isAbortError(error) || !current()) return;
+      this.historyComplete = false;
+      console.warn("Failed to complete session history:", error);
+    } finally {
+      if (current()) this.loadingOlder = false;
+    }
+  }
+
+  private async doEnsureOrdinal(id: string, targetOrdinal: number) {
     const signal = this.abortController?.signal;
     if (!signal || signal.aborted) return;
 
@@ -349,8 +487,8 @@ class MessagesStore {
       const chunks: Message[][] = [];
 
       while (from >= 0) {
-        const res = await api.getMessages(
-          id,
+        const res = await SessionsService.getApiV1SessionsByIdMessages(
+          { id },
           {
             from,
             limit: MESSAGE_PAGE_SIZE,
@@ -361,6 +499,7 @@ class MessagesStore {
         if (this.sessionId !== id) return;
         if (res.messages.length === 0) {
           this.hasOlder = false;
+          this.historyComplete = true;
           break;
         }
 
@@ -383,14 +522,13 @@ class MessagesStore {
       }
 
       const oldestNow = this.messages[0]?.ordinal;
-      this.hasOlder =
-        oldestNow !== undefined && oldestNow > 0;
+      this.hasOlder = oldestNow !== undefined && oldestNow > 0;
+      this.historyComplete = !this.hasOlder;
+      this.publishPendingSessionToken(id);
     } catch (err) {
       if (isAbortError(err)) return;
-      console.warn(
-        "Failed to load older messages for ordinal:",
-        err,
-      );
+      if (this.sessionId === id) this.historyComplete = false;
+      console.warn("Failed to load older messages for ordinal:", err);
     } finally {
       if (this.sessionId === id) {
         this.loadingOlder = false;
@@ -402,74 +540,182 @@ class MessagesStore {
     const signal = this.abortController?.signal;
     if (!signal || signal.aborted) return;
 
+    const previousToken = this.activeSessionToken;
+    const previousMessages = this.messages;
+
     try {
-      const sess = await api.getSession(id, { signal });
+      const sess = await SessionsService.getApiV1SessionsById({ id }, { signal });
       if (this.sessionId !== id) return;
 
+      const pendingToken = buildReadProgressToken(sess);
       const newCount = sess.message_count ?? 0;
       const oldCount = this.messageCount;
-      if (newCount === oldCount) return;
-
-      if (newCount > oldCount && this.messages.length > 0) {
-        const lastOrdinal =
-          this.messages[this.messages.length - 1]!.ordinal;
-        await this.loadFrom(id, lastOrdinal + 1, signal);
+      if (newCount === oldCount) {
+        const refreshed = await this.refreshLoadedWindow(id, signal);
+        const newest = this.messages[this.messages.length - 1];
+        this.historyComplete =
+          refreshed && this.messages[0]?.ordinal === 0 && newest?.ordinal === oldCount - 1;
+      } else if (newCount > oldCount && this.messages.length > 0) {
+        const oldestOrdinal = this.messages[0]!.ordinal;
+        await this.loadFrom(id, oldestOrdinal, signal);
         if (this.sessionId !== id) return;
 
-        const newest =
-          this.messages[this.messages.length - 1];
-        if (newest && newest.ordinal !== newCount - 1) {
+        const newest = this.messages[this.messages.length - 1];
+        if (!newest || newest.ordinal !== newCount - 1) {
           await this.fullReload(id, signal, newCount);
-          return;
+        } else {
+          this.messageCount = newCount;
+          this.historyComplete = this.messages[0]?.ordinal === 0 && newest.ordinal === newCount - 1;
         }
-
-        this.messageCount = newCount;
-        return;
+      } else {
+        await this.fullReload(id, signal, newCount);
       }
 
-      await this.fullReload(id, signal, newCount);
+      if (this.sessionId === id) {
+        const unreadOrdinal =
+          pendingToken !== previousToken
+            ? earliestChangedOrdinal(previousMessages, this.messages)
+            : null;
+        this.publishOrDeferSessionToken(pendingToken, unreadOrdinal);
+      }
     } catch (err) {
       if (isAbortError(err)) return;
+      if (this.sessionId === id) this.historyComplete = false;
       console.warn("Reload failed:", err);
     }
   }
 
-  private async fullReload(
-    id: string,
-    signal: AbortSignal,
-    messageCountHint?: number,
+  private publishOrDeferSessionToken(
+    token: string | null,
+    unreadOrdinal: number | null,
+    deferForOlder: boolean = true,
   ) {
+    if (this.hasOlder && deferForOlder) {
+      this.pendingSessionToken = token;
+      this.hasPendingSessionToken = true;
+      this.pendingSessionUnreadOrdinal = 0;
+      return;
+    }
+    this.pendingSessionToken = null;
+    this.hasPendingSessionToken = false;
+    this.pendingSessionUnreadOrdinal = null;
+    this.activeSessionToken = token;
+    this.activeSessionUnreadOrdinal = unreadOrdinal;
+  }
+
+  private publishPendingSessionToken(id: string) {
+    if (this.sessionId !== id || this.hasOlder || !this.hasPendingSessionToken) {
+      return;
+    }
+    this.activeSessionToken = this.pendingSessionToken;
+    this.activeSessionUnreadOrdinal = this.pendingSessionUnreadOrdinal;
+    this.pendingSessionToken = null;
+    this.hasPendingSessionToken = false;
+    this.pendingSessionUnreadOrdinal = null;
+  }
+
+  private async refreshLoadedWindow(id: string, signal: AbortSignal): Promise<boolean> {
+    const oldest = this.messages[0];
+    const newest = this.messages[this.messages.length - 1];
+    if (!oldest || !newest) return false;
+
+    const refreshed = await this.fetchPages(id, {
+      from: oldest.ordinal,
+      limit: MESSAGE_PAGE_SIZE,
+      direction: "asc",
+      signal,
+    });
+    if (this.sessionId !== id || refreshed.length === 0) {
+      return false;
+    }
+
+    const updates = new Map(
+      refreshed
+        .filter((m) => m.ordinal >= oldest.ordinal && m.ordinal <= newest.ordinal)
+        .map((m) => [m.ordinal, m]),
+    );
+    clearContentCaches();
+    this.messages = this.messages.map((m) => updates.get(m.ordinal) ?? m);
+    this.updateStableMainModelInfo();
+    return true;
+  }
+
+  private async fullReload(id: string, signal: AbortSignal, messageCountHint?: number) {
     clearContentCaches();
     this.loading = true;
     try {
-      if (
-        messageCountHint !== undefined &&
-        messageCountHint > FULL_SESSION_MESSAGE_THRESHOLD
-      ) {
+      if (messageCountHint !== undefined && messageCountHint > FULL_SESSION_MESSAGE_THRESHOLD) {
         await this.loadProgressively(id, signal);
       } else {
-        await this.loadAllMessages(
-          id,
-          signal,
-          messageCountHint,
-        );
+        await this.loadAllMessages(id, signal, messageCountHint);
       }
     } finally {
       if (this.sessionId === id) {
         this.loading = false;
-        this._stableMainModel =
-          this.messages.length > 0
-            ? computeMainModel(this.messages)
-            : "";
+        this.updateStableMainModelInfo();
       }
     }
   }
+
+  private updateStableMainModelInfo() {
+    this._stableMainModelInfo = computeMainModelInfo(this.messages);
+  }
 }
 
-function isAbortError(err: unknown): boolean {
-  return (
-    err instanceof DOMException && err.name === "AbortError"
-  );
+function earliestChangedOrdinal(previous: Message[], current: Message[]): number | null {
+  const previousByOrdinal = new Map(previous.map((message) => [message.ordinal, message]));
+  const currentByOrdinal = new Map(current.map((message) => [message.ordinal, message]));
+  const ordinals = new Set([...previousByOrdinal.keys(), ...currentByOrdinal.keys()]);
+  let earliest: number | null = null;
+  for (const ordinal of ordinals) {
+    const before = previousByOrdinal.get(ordinal);
+    const after = currentByOrdinal.get(ordinal);
+    if (before !== undefined && after !== undefined && transcriptMessageEqual(before, after)) {
+      continue;
+    }
+    earliest = earliest === null ? ordinal : Math.min(earliest, ordinal);
+  }
+  return earliest;
+}
+
+function transcriptMessageEqual(before: Message, after: Message): boolean {
+  const visibleContent = (message: Message) => ({
+    role: message.role,
+    content: message.content,
+    thinkingText: message.thinking_text,
+    timestamp: message.timestamp,
+    hasThinking: message.has_thinking,
+    hasToolUse: message.has_tool_use,
+    isSystem: message.is_system,
+    model: message.model,
+    reasoningEffort: message.reasoning_effort ?? "",
+    contextTokens: message.context_tokens,
+    outputTokens: message.output_tokens,
+    hasContextTokens: message.has_context_tokens ?? false,
+    hasOutputTokens: message.has_output_tokens ?? false,
+    sourceSubtype: message.source_subtype ?? "",
+    isCompactBoundary: message.is_compact_boundary ?? false,
+    toolCalls: (message.tool_calls ?? []).map((call) => ({
+      toolName: call.tool_name,
+      category: call.category ?? "",
+      toolUseId: call.tool_use_id ?? "",
+      inputJson: call.input_json ?? "",
+      skillName: call.skill_name ?? "",
+      resultContent: call.result_content ?? "",
+      subagentSessionId: call.subagent_session_id ?? "",
+      resultEvents: (call.result_events ?? []).map((event) => ({
+        toolUseId: event.tool_use_id ?? "",
+        agentId: event.agent_id ?? "",
+        subagentSessionId: event.subagent_session_id ?? "",
+        source: event.source,
+        status: event.status,
+        content: event.content,
+        timestamp: event.timestamp ?? "",
+        eventIndex: event.event_index,
+      })),
+    })),
+  });
+  return JSON.stringify(visibleContent(before)) === JSON.stringify(visibleContent(after));
 }
 
 export const messages = new MessagesStore();

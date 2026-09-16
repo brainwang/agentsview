@@ -2,8 +2,10 @@ package parser
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,32 +39,43 @@ func (m jsonMillis) Time() time.Time {
 type vscodeCopilotRequest struct {
 	RequestID string               `json:"requestId"`
 	Message   vscodeCopilotMessage `json:"message"`
-	Response  []json.RawMessage    `json:"response"`
+	Response  []jsontext.Value     `json:"response"`
 	Agent     *vscodeCopilotAgent  `json:"agent,omitempty"`
 	ModelID   string               `json:"modelId"`
 	Timestamp jsonMillis           `json:"timestamp"`
 	Result    *vscodeCopilotResult `json:"result,omitempty"`
-	FollowUps []json.RawMessage    `json:"followups,omitempty"`
+	FollowUps []jsontext.Value     `json:"followups,omitempty"`
 }
 
 // vscodeCopilotMessage is the user prompt.
 type vscodeCopilotMessage struct {
-	Text  string          `json:"text"`
-	Parts json.RawMessage `json:"parts,omitempty"`
+	Text  string         `json:"text"`
+	Parts jsontext.Value `json:"parts,omitempty"`
 }
 
 // vscodeCopilotAgent identifies the agent that handled the request.
 type vscodeCopilotAgent struct {
-	ID          string          `json:"id"`
-	Name        string          `json:"name"`
-	FullName    string          `json:"fullName"`
-	ExtensionID json.RawMessage `json:"extensionId,omitempty"`
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	FullName    string         `json:"fullName"`
+	ExtensionID jsontext.Value `json:"extensionId,omitempty"`
 }
 
 // vscodeCopilotResult holds timing and metadata.
 type vscodeCopilotResult struct {
 	Timings  *vscodeCopilotTimings `json:"timings,omitempty"`
-	Metadata json.RawMessage       `json:"metadata,omitempty"`
+	Metadata jsontext.Value        `json:"metadata,omitempty"`
+}
+
+// vscodeCopilotMetadata holds the per-request token accounting
+// found in result.metadata. VSCode Copilot records the full
+// prompt size (promptTokens, cumulative context for that turn)
+// and the generated output (outputTokens), plus the resolved
+// model id already in pricing-catalog form (e.g. "claude-opus-4-8").
+type vscodeCopilotMetadata struct {
+	PromptTokens  int    `json:"promptTokens"`
+	OutputTokens  int    `json:"outputTokens"`
+	ResolvedModel string `json:"resolvedModel"`
 }
 
 type vscodeCopilotTimings struct {
@@ -73,29 +86,36 @@ type vscodeCopilotTimings struct {
 // vscodeCopilotResponseItem is a single element of the
 // response array, with flexible typing.
 type vscodeCopilotResponseItem struct {
-	Kind              string          `json:"kind,omitempty"`
-	Value             string          `json:"value,omitempty"`
-	ToolID            string          `json:"toolId,omitempty"`
-	ToolCallID        string          `json:"toolCallId,omitempty"`
-	IsConfirmed       bool            `json:"isConfirmed,omitempty"`
-	IsComplete        bool            `json:"isComplete,omitempty"`
-	InvocationMessage json.RawMessage `json:"invocationMessage,omitempty"`
-	PastTenseMessage  json.RawMessage `json:"pastTenseMessage,omitempty"`
-	ToolName          string          `json:"toolName,omitempty"`
-	InlineReference   json.RawMessage `json:"inlineReference,omitempty"`
-	ToolSpecificData  json.RawMessage `json:"toolSpecificData,omitempty"`
+	Kind              string         `json:"kind,omitempty"`
+	Value             string         `json:"value,omitempty"`
+	ToolID            string         `json:"toolId,omitempty"`
+	ToolCallID        string         `json:"toolCallId,omitempty"`
+	InvocationMessage jsontext.Value `json:"invocationMessage,omitempty"`
+	PastTenseMessage  jsontext.Value `json:"pastTenseMessage,omitempty"`
+	ToolName          string         `json:"toolName,omitempty"`
+	InlineReference   jsontext.Value `json:"inlineReference,omitempty"`
+	ToolSpecificData  jsontext.Value `json:"toolSpecificData,omitempty"`
 }
 
 // vscodeCopilotToolData holds terminal-specific tool data.
 type vscodeCopilotToolData struct {
-	Kind     string `json:"kind"`
-	Language string `json:"language,omitempty"`
-	Command  string `json:"command,omitempty"`
+	Kind        string `json:"kind"`
+	Language    string `json:"language,omitempty"`
+	Command     string `json:"command,omitempty"`
+	CommandLine struct {
+		Original string `json:"original"`
+	} `json:"commandLine,omitempty"`
 }
 
 // vscodeCopilotInvocationMsg holds a structured invocation message.
 type vscodeCopilotInvocationMsg struct {
 	Value string `json:"value"`
+}
+
+type vscodeCopilotInlineReference struct {
+	FSPath   string `json:"fsPath"`
+	Path     string `json:"path"`
+	External string `json:"external"`
 }
 
 // vscodeCopilotWorkspace holds the workspace.json manifest.
@@ -104,10 +124,10 @@ type vscodeCopilotWorkspace struct {
 	Workspace string `json:"workspace"`
 }
 
-// ParseVSCodeCopilotSession parses a VSCode Copilot chat
-// session file (.json or .jsonl). Returns (nil, nil, nil)
-// if the file is empty or contains no meaningful content.
-func ParseVSCodeCopilotSession(
+// parseSession parses a VSCode Copilot chat session file (.json or .jsonl).
+// Returns (nil, nil, nil) if the file is empty or contains no meaningful
+// content.
+func (p *vscodeCopilotProvider) parseSession(
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
@@ -175,6 +195,12 @@ func parseVSCodeCopilotData(
 	var firstMessage string
 	ordinal := 0
 
+	var usageEvents []ParsedUsageEvent
+	totalOutput := 0
+	peakContext := 0
+	sawTokens := false
+	startedAt := session.CreationDate.Time()
+
 	for _, req := range session.Requests {
 		// User message
 		text := strings.TrimSpace(req.Message.Text)
@@ -192,6 +218,18 @@ func parseVSCodeCopilotData(
 				ContentLength: len(text),
 			})
 			ordinal++
+		}
+
+		// Token accounting: VSCode records prompt/output tokens and
+		// the resolved model in result.metadata. Emit one usage event
+		// per turn so the cost gets catalog-priced downstream.
+		if ev, ok := vscodeCopilotUsageEvent(req, startedAt); ok {
+			usageEvents = append(usageEvents, ev)
+			totalOutput += ev.OutputTokens
+			// promptTokens is the full context billed for the turn,
+			// so the largest one is the session's peak context.
+			peakContext = max(peakContext, ev.InputTokens)
+			sawTokens = true
 		}
 
 		// Assistant response: parse response items
@@ -251,7 +289,6 @@ func parseVSCodeCopilotData(
 		}
 	}
 
-	startedAt := session.CreationDate.Time()
 	endedAt := session.LastMessageDate.Time()
 	if endedAt.IsZero() && len(session.Requests) > 0 {
 		last := session.Requests[len(session.Requests)-1]
@@ -267,15 +304,61 @@ func parseVSCodeCopilotData(
 		EndedAt:          endedAt,
 		MessageCount:     len(messages),
 		UserMessageCount: userCount,
+		UsageEvents:      usageEvents,
+	}
+
+	if sawTokens {
+		sess.TotalOutputTokens = totalOutput
+		sess.HasTotalOutputTokens = true
+		sess.PeakContextTokens = peakContext
+		sess.HasPeakContextTokens = true
 	}
 
 	return sess, messages, nil
 }
 
+// vscodeCopilotUsageEvent builds a per-turn usage event from a
+// request's result.metadata token accounting. Returns ok=false
+// when the request carries no usable token data. The prompt size
+// (promptTokens) is the full context billed for that turn; without
+// a cache breakdown it is treated as input tokens, so the derived
+// cost is an upper-bound estimate that ignores prompt-cache discounts.
+func vscodeCopilotUsageEvent(
+	req vscodeCopilotRequest, sessionStart time.Time,
+) (ParsedUsageEvent, bool) {
+	if req.Result == nil || len(req.Result.Metadata) == 0 {
+		return ParsedUsageEvent{}, false
+	}
+	var md vscodeCopilotMetadata
+	if err := json.Unmarshal(req.Result.Metadata, &md); err != nil {
+		return ParsedUsageEvent{}, false
+	}
+	if md.PromptTokens <= 0 && md.OutputTokens <= 0 {
+		return ParsedUsageEvent{}, false
+	}
+
+	// resolvedModel is already in pricing-catalog form
+	// (e.g. "claude-opus-4-8"). Fall back to the prefixed modelId
+	// (e.g. "copilot/claude-opus-4.8") and normalize it.
+	model := md.ResolvedModel
+	if model == "" {
+		model = strings.TrimPrefix(req.ModelID, "copilot/")
+	}
+	model = normalizeCopilotModel(model)
+
+	return ParsedUsageEvent{
+		Source:       "vscode-copilot",
+		Model:        model,
+		InputTokens:  md.PromptTokens,
+		OutputTokens: md.OutputTokens,
+		OccurredAt:   timeString(req.Timestamp.Time(), sessionStart),
+	}, true
+}
+
 // parseVSCodeCopilotResponse extracts text and tool calls
 // from the response items array.
 func parseVSCodeCopilotResponse(
-	raw []json.RawMessage,
+	raw []jsontext.Value,
 ) (string, []ParsedToolCall) {
 	var textParts []string
 	var toolCalls []ParsedToolCall
@@ -305,8 +388,13 @@ func parseVSCodeCopilotResponse(
 			}
 		case "prepareToolInvocation":
 			// Skip, the actual invocation comes later.
-		case "inlineReference", "undoStop",
-			"codeblockUri", "textEditGroup":
+		case "inlineReference":
+			if ref := extractVSCodeInlineReference(
+				item.InlineReference,
+			); ref != "" {
+				textParts = append(textParts, ref)
+			}
+		case "undoStop", "codeblockUri", "textEditGroup":
 			// Skip non-text items.
 		case "":
 			// Items without a kind are markdown text
@@ -323,6 +411,25 @@ func parseVSCodeCopilotResponse(
 
 	text := strings.TrimSpace(strings.Join(textParts, ""))
 	return text, toolCalls
+}
+
+func extractVSCodeInlineReference(raw jsontext.Value) string {
+	var ref vscodeCopilotInlineReference
+	if err := json.Unmarshal(raw, &ref); err != nil {
+		return ""
+	}
+
+	path := ref.FSPath
+	if path == "" {
+		path = ref.Path
+	}
+	if path == "" {
+		path = strings.TrimPrefix(ref.External, "file://")
+	}
+	if path == "" {
+		return ""
+	}
+	return "`" + path + "`"
 }
 
 // normalizeVSCodeToolName maps VSCode Copilot tool IDs to
@@ -413,18 +520,21 @@ func normalizeVSCodeToolName(toolID string) string {
 	}
 }
 
+// formatVSCodeCopilotToolCalls renders each call and records the exact text
+// on the call so storage policies that drop tool inputs can replace it.
 func formatVSCodeCopilotToolCalls(
 	calls []ParsedToolCall,
 ) string {
 	var parts []string
-	for _, tc := range calls {
+	for i, tc := range calls {
 		header := formatToolHeader(tc.Category, tc.ToolName)
 		body := extractVSCopilotToolBody(tc)
+		rendering := header
 		if body != "" {
-			parts = append(parts, header+"\n"+body)
-		} else {
-			parts = append(parts, header)
+			rendering = header + "\n" + body
 		}
+		calls[i].Rendering = rendering
+		parts = append(parts, rendering)
 	}
 	return strings.Join(parts, "\n\n")
 }
@@ -453,7 +563,7 @@ func extractVSCopilotToolBody(tc ParsedToolCall) string {
 // extractVSCopilotInputJSON builds an InputJSON string from
 // the invocationMessage and toolSpecificData fields.
 func extractVSCopilotInputJSON(
-	invocationMsg, pastTenseMsg, toolData json.RawMessage,
+	invocationMsg, pastTenseMsg, toolData jsontext.Value,
 ) string {
 	result := make(map[string]any)
 
@@ -470,8 +580,12 @@ func extractVSCopilotInputJSON(
 	if len(toolData) > 0 {
 		var td vscodeCopilotToolData
 		if err := json.Unmarshal(toolData, &td); err == nil {
-			if td.Command != "" {
-				result["command"] = td.Command
+			command := td.Command
+			if command == "" {
+				command = td.CommandLine.Original
+			}
+			if command != "" {
+				result["command"] = command
 			}
 		}
 	}
@@ -479,7 +593,7 @@ func extractVSCopilotInputJSON(
 	if len(result) == 0 {
 		return ""
 	}
-	data, err := json.Marshal(result)
+	data, err := json.Marshal(result, json.Deterministic(true))
 	if err != nil {
 		return ""
 	}
@@ -489,7 +603,7 @@ func extractVSCopilotInputJSON(
 // extractInvocationText extracts a human-readable string
 // from an invocationMessage field which can be a plain
 // string or a {"value": "..."} object.
-func extractInvocationText(raw json.RawMessage) string {
+func extractInvocationText(raw jsontext.Value) string {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -505,6 +619,11 @@ func extractInvocationText(raw json.RawMessage) string {
 	}
 	return ""
 }
+
+// readVSCodeWorkspaceManifest indirects ReadVSCodeWorkspaceManifest so the
+// VSCode-Copilot and Positron discovery paths can resolve the manifest once
+// per workspace dir and tests can observe how often it runs.
+var readVSCodeWorkspaceManifest = ReadVSCodeWorkspaceManifest
 
 // ReadVSCodeWorkspaceManifest reads the workspace.json file
 // in a workspaceStorage hash directory and extracts the
@@ -555,11 +674,13 @@ func extractProjectFromURI(uri string) string {
 // jsonlOp represents a single operation in a VSCode JSONL
 // session operation log.
 type jsonlOp struct {
-	Kind int               `json:"kind"`
-	K    []json.RawMessage `json:"k,omitempty"`
-	V    json.RawMessage   `json:"v,omitempty"`
-	I    *int              `json:"i,omitempty"`
+	Kind int              `json:"kind"`
+	K    []jsontext.Value `json:"k,omitempty"`
+	V    jsontext.Value   `json:"v,omitempty"`
+	I    *int             `json:"i,omitempty"`
 }
+
+const vscodeCopilotHardRecordLimit = 128 << 20
 
 // reconstructJSONL reads a VSCode JSONL operation log and
 // replays mutations to reconstruct the full session JSON.
@@ -570,25 +691,34 @@ type jsonlOp struct {
 //   - kind=2 (Push): append/splice items into array at path k
 //   - kind=3 (Delete): remove property at path k
 func reconstructJSONL(path string) ([]byte, error) {
+	return reconstructJSONLWithLimit(path, vscodeCopilotHardRecordLimit)
+}
+
+func reconstructJSONLWithLimit(path string, hardRecordLimit int) ([]byte, error) {
+	if hardRecordLimit <= 0 {
+		return nil, fmt.Errorf("VS Code Copilot hard replay limit must be positive")
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	reader := bufio.NewReaderSize(f, 64*1024)
 
 	var state any
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	for {
+		record, err := readVSCodeCopilotRecord(reader, hardRecordLimit)
+		if err == io.EOF {
+			break
 		}
-
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
 		var op jsonlOp
-		if err := json.Unmarshal(line, &op); err != nil {
+		if err := json.Unmarshal(record, &op); err != nil {
 			continue
 		}
 
@@ -599,15 +729,29 @@ func reconstructJSONL(path string) ([]byte, error) {
 					"jsonl initial: %w", err,
 				)
 			}
+			projectVSCodeCopilotResultOutput(state)
 
 		case 1: // Set
 			if state == nil || len(op.K) == 0 {
 				continue
 			}
 			keys := decodeJSONLKeys(op.K)
+			destination := classifyVSCodeCopilotDestination(keys)
+			switch destination {
+			case vscodeCopilotDestinationExactOutput, vscodeCopilotDestinationBelowOutput:
+				if destination == vscodeCopilotDestinationExactOutput {
+					jsonlSet(state, keys, []any{})
+				}
+				continue
+			}
 			var val any
 			if err := json.Unmarshal(op.V, &val); err != nil {
 				continue
+			}
+			if destination == vscodeCopilotDestinationExactResultDetails {
+				projectVSCodeCopilotResultDetails(val)
+			} else {
+				projectVSCodeCopilotResultOutput(val)
 			}
 			jsonlSet(state, keys, val)
 
@@ -616,9 +760,19 @@ func reconstructJSONL(path string) ([]byte, error) {
 				continue
 			}
 			keys := decodeJSONLKeys(op.K)
+			if destination := classifyVSCodeCopilotDestination(keys); destination == vscodeCopilotDestinationExactOutput || destination == vscodeCopilotDestinationBelowOutput {
+				continue
+			}
 			var items []any
 			if err := json.Unmarshal(op.V, &items); err != nil {
 				continue
+			}
+			if classifyVSCodeCopilotDestination(keys) == vscodeCopilotDestinationExactResultDetails {
+				for _, item := range items {
+					projectVSCodeCopilotResultDetails(item)
+				}
+			} else {
+				projectVSCodeCopilotResultOutput(items)
 			}
 			jsonlPush(state, keys, items, op.I)
 
@@ -631,20 +785,109 @@ func reconstructJSONL(path string) ([]byte, error) {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan %s: %w", path, err)
-	}
-
 	if state == nil {
 		return nil, nil
 	}
 
-	return json.Marshal(state)
+	return json.Marshal(state, json.Deterministic(true))
+}
+
+func readVSCodeCopilotRecord(
+	source *bufio.Reader,
+	limit int,
+) ([]byte, error) {
+	var record []byte
+	for {
+		chunk, prefix, err := source.ReadLine()
+		if err != nil {
+			return nil, err
+		}
+		if len(record)+len(chunk) > limit {
+			return nil, fmt.Errorf(
+				"VS Code Copilot JSONL record exceeds %d-byte safety ceiling",
+				limit,
+			)
+		}
+		record = append(record, chunk...)
+		if !prefix {
+			return record, nil
+		}
+	}
+}
+
+type vscodeCopilotDestination int
+
+const (
+	vscodeCopilotDestinationOutside vscodeCopilotDestination = iota
+	vscodeCopilotDestinationExactResultDetails
+	vscodeCopilotDestinationExactOutput
+	vscodeCopilotDestinationBelowOutput
+)
+
+func classifyVSCodeCopilotDestination(keys []string) vscodeCopilotDestination {
+	for i := range len(keys) {
+		if keys[i] != "resultDetails" {
+			continue
+		}
+		valid := true
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] == "output" {
+				if j == len(keys)-1 {
+					return vscodeCopilotDestinationExactOutput
+				}
+				return vscodeCopilotDestinationBelowOutput
+			}
+			if _, err := strconv.Atoi(keys[j]); err != nil {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return vscodeCopilotDestinationExactResultDetails
+		}
+	}
+	return vscodeCopilotDestinationOutside
+}
+
+func projectVSCodeCopilotResultOutput(value any) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			if key == "resultDetails" {
+				projectVSCodeCopilotResultDetails(child)
+				continue
+			}
+			projectVSCodeCopilotResultOutput(child)
+		}
+	case []any:
+		for _, child := range v {
+			projectVSCodeCopilotResultOutput(child)
+		}
+	}
+}
+
+func projectVSCodeCopilotResultDetails(value any) {
+	switch details := value.(type) {
+	case map[string]any:
+		if details == nil {
+			return
+		}
+		details["output"] = []any{}
+		for key, child := range details {
+			if key != "output" {
+				projectVSCodeCopilotResultOutput(child)
+			}
+		}
+	case []any:
+		for _, child := range details {
+			projectVSCodeCopilotResultDetails(child)
+		}
+	}
 }
 
 // decodeJSONLKeys converts raw JSON key elements to strings.
 // Keys can be strings (object keys) or numbers (array indices).
-func decodeJSONLKeys(raw []json.RawMessage) []string {
+func decodeJSONLKeys(raw []jsontext.Value) []string {
 	keys := make([]string, len(raw))
 	for i, r := range raw {
 		var s string
@@ -737,12 +980,13 @@ func jsonlPush(
 		}
 		if spliceIdx != nil {
 			idx := max(0, min(*spliceIdx, len(arr)))
+			end := min(idx+len(items), len(arr))
 			newArr := make(
-				[]any, 0, len(arr)+len(items),
+				[]any, 0, len(arr)-(end-idx)+len(items),
 			)
 			newArr = append(newArr, arr[:idx]...)
 			newArr = append(newArr, items...)
-			newArr = append(newArr, arr[idx:]...)
+			newArr = append(newArr, arr[end:]...)
 			p[lastKey] = newArr
 		} else {
 			p[lastKey] = append(arr, items...)
@@ -758,12 +1002,13 @@ func jsonlPush(
 		}
 		if spliceIdx != nil {
 			si := max(0, min(*spliceIdx, len(arr)))
+			end := min(si+len(items), len(arr))
 			newArr := make(
-				[]any, 0, len(arr)+len(items),
+				[]any, 0, len(arr)-(end-si)+len(items),
 			)
 			newArr = append(newArr, arr[:si]...)
 			newArr = append(newArr, items...)
-			newArr = append(newArr, arr[si:]...)
+			newArr = append(newArr, arr[end:]...)
 			p[idx] = newArr
 		} else {
 			p[idx] = append(arr, items...)

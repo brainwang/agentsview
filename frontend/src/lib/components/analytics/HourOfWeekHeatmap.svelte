@@ -1,13 +1,22 @@
 <script lang="ts">
+  import { Chart, Layer, Rect, Text } from "layerchart";
   import { analytics } from "../../stores/analytics.svelte.js";
+  import { getLocale, m } from "../../i18n/index.js";
 
-  const CELL_SIZE = 17;
   const CELL_GAP = 2;
-  const CELL_STEP = CELL_SIZE + CELL_GAP;
+  const CELL_HEIGHT = 17;
+  const ROW_STEP = CELL_HEIGHT + CELL_GAP;
   const ROW_LABEL_WIDTH = 29;
   const COL_LABEL_HEIGHT = 18;
-  const DAY_LABELS = [
-    "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+  const FALLBACK_WIDTH = 480;
+  const DAYS = [
+    { label: "Sun", dayIdx: 6 },
+    { label: "Mon", dayIdx: 0 },
+    { label: "Tue", dayIdx: 1 },
+    { label: "Wed", dayIdx: 2 },
+    { label: "Thu", dayIdx: 3 },
+    { label: "Fri", dayIdx: 4 },
+    { label: "Sat", dayIdx: 5 },
   ];
 
   const LEVEL_COLORS_LIGHT = [
@@ -71,27 +80,36 @@
         level: number;
       }[];
     }[] = [];
-    for (let d = 0; d < 7; d++) {
+    for (const day of DAYS) {
       const hours: {
         hour: number;
         value: number;
         level: number;
       }[] = [];
       for (let h = 0; h < 24; h++) {
-        const value = lookup.get(`${d}:${h}`) ?? 0;
+        const value = lookup.get(`${day.dayIdx}:${h}`) ?? 0;
         hours.push({
           hour: h,
           value,
           level: assignLevel(value, max),
         });
       }
-      rows.push({ day: DAY_LABELS[d]!, dayIdx: d, hours });
+      rows.push({
+        day: day.label,
+        dayIdx: day.dayIdx,
+        hours,
+      });
     }
     return rows;
   });
 
-  const svgWidth = ROW_LABEL_WIDTH + 24 * CELL_STEP + 4;
-  const svgHeight = COL_LABEL_HEIGHT + 7 * CELL_STEP + 4;
+  let availableWidth = $state(0);
+  const chartWidth = $derived(availableWidth || FALLBACK_WIDTH);
+  const cellStep = $derived(
+    Math.max((chartWidth - ROW_LABEL_WIDTH - 4) / 24, 1),
+  );
+  const cellWidth = $derived(Math.max(cellStep - CELL_GAP, 1));
+  const svgHeight = COL_LABEL_HEIGHT + 7 * ROW_STEP + 4;
 
   function handleCellHover(
     e: MouseEvent,
@@ -106,7 +124,12 @@
     tooltip = {
       x: rect.left + rect.width / 2,
       y: rect.top - 4,
-      text: `${day} ${h}:00 - ${value.toLocaleString()} messages`,
+      text: m.analytics_hour_of_week_tooltip({
+        day,
+        hour: h,
+        count: value,
+        countLabel: value.toLocaleString(getLocale()),
+      }),
     };
   }
 
@@ -147,84 +170,80 @@
         class="retry-btn"
         onclick={() => analytics.fetchHourOfWeek()}
       >
-        Retry
+        {m.shared_retry()}
       </button>
     </div>
   {:else if grid}
-    <div class="how-scroll">
-      <svg
-        width={svgWidth}
+    <div class="how-chart" bind:clientWidth={availableWidth}>
+      <Chart
+        width={chartWidth}
         height={svgHeight}
-        class="how-svg"
+        padding={0}
       >
-        {#each [0, 3, 6, 9, 12, 15, 18, 21] as h}
-          <text
-            x={h * CELL_STEP + ROW_LABEL_WIDTH + CELL_SIZE / 2}
-            y={COL_LABEL_HEIGHT - 4}
-            class="hour-label"
-            class:active-label={analytics.selectedHour === h}
-            text-anchor="middle"
-            role="button"
-            tabindex="0"
-            onclick={() => handleHourClick(h)}
-            onkeydown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                handleHourClick(h);
-              }
-            }}
-          >
-            {h}
-          </text>
-        {/each}
-
-        {#each grid as row, rowIdx}
-          <text
-            x={ROW_LABEL_WIDTH - 4}
-            y={rowIdx * CELL_STEP + COL_LABEL_HEIGHT + CELL_SIZE - 2}
-            class="day-label"
-            class:active-label={analytics.selectedDow === row.dayIdx}
-            text-anchor="end"
-            role="button"
-            tabindex="0"
-            onclick={() => handleDayClick(row.dayIdx)}
-            onkeydown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                handleDayClick(row.dayIdx);
-              }
-            }}
-          >
-            {row.day}
-          </text>
-
-          {#each row.hours as cell}
-            <rect
-              x={cell.hour * CELL_STEP + ROW_LABEL_WIDTH}
-              y={rowIdx * CELL_STEP + COL_LABEL_HEIGHT}
-              width={CELL_SIZE}
-              height={CELL_SIZE}
-              rx="2"
-              fill={levelColor(cell.level)}
-              class="how-cell"
-              class:dimmed={isDimmed(row.dayIdx, cell.hour)}
+        <Layer class="how-svg">
+          {#each [0, 3, 6, 9, 12, 15, 18, 21] as hour}
+            <Text
+              value={hour}
+              x={hour * cellStep + ROW_LABEL_WIDTH + cellWidth / 2}
+              y={COL_LABEL_HEIGHT - 4}
+              class={`hour-label${analytics.selectedHour === hour ? " active-label" : ""}`}
+              textAnchor="middle"
               role="button"
-              tabindex="0"
-              onmouseenter={(e) =>
-                handleCellHover(e, row.day, cell.hour, cell.value)}
-              onmouseleave={handleCellLeave}
-              onclick={() =>
-                handleCellClick(row.dayIdx, cell.hour)}
-              onkeydown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  handleCellClick(row.dayIdx, cell.hour);
+              tabindex={0}
+              onclick={() => handleHourClick(hour)}
+              onkeydown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  handleHourClick(hour);
                 }
               }}
             />
           {/each}
-        {/each}
-      </svg>
+
+          {#each grid as row, rowIdx}
+            <Text
+              value={row.day}
+              x={ROW_LABEL_WIDTH - 4}
+              y={rowIdx * ROW_STEP + COL_LABEL_HEIGHT + CELL_HEIGHT - 2}
+              class={`day-label${analytics.selectedDow === row.dayIdx ? " active-label" : ""}`}
+              textAnchor="end"
+              role="button"
+              tabindex={0}
+              onclick={() => handleDayClick(row.dayIdx)}
+              onkeydown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  handleDayClick(row.dayIdx);
+                }
+              }}
+            />
+
+            {#each row.hours as cell}
+              <Rect
+                x={cell.hour * cellStep + ROW_LABEL_WIDTH}
+                y={rowIdx * ROW_STEP + COL_LABEL_HEIGHT}
+                width={cellWidth}
+                height={CELL_HEIGHT}
+                rx={2}
+                fill={levelColor(cell.level)}
+                class={`how-cell${isDimmed(row.dayIdx, cell.hour) ? " dimmed" : ""}`}
+                role="button"
+                tabindex={0}
+                onmouseenter={(event) =>
+                  handleCellHover(event, row.day, cell.hour, cell.value)}
+                onmouseleave={handleCellLeave}
+                onclick={() => handleCellClick(row.dayIdx, cell.hour)}
+                onkeydown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    handleCellClick(row.dayIdx, cell.hour);
+                  }
+                }}
+              />
+            {/each}
+          {/each}
+        </Layer>
+      </Chart>
     </div>
 
     {#if tooltip}
@@ -232,11 +251,11 @@
         class="tooltip"
         style="left: {tooltip.x}px; top: {tooltip.y}px;"
       >
-        {tooltip.text}
+        <span>{tooltip.text}</span>
       </div>
     {/if}
   {:else}
-    <div class="empty">No data for this period</div>
+    <div class="empty">{m.shared_no_data_for_period()}</div>
   {/if}
 </div>
 
@@ -246,45 +265,45 @@
     flex: 1;
   }
 
-  .how-scroll {
-    overflow-x: auto;
-    padding-bottom: 4px;
+  .how-chart {
+    width: 100%;
+    min-width: 0;
   }
 
-  .how-svg {
+  .how-container :global(.how-svg) {
     display: block;
   }
 
-  .hour-label,
-  .day-label {
+  .how-container :global(.hour-label),
+  .how-container :global(.day-label) {
     font-size: 9px;
     fill: var(--text-muted);
     font-family: var(--font-sans);
     cursor: pointer;
   }
 
-  .hour-label:hover,
-  .day-label:hover {
+  .how-container :global(.hour-label:hover),
+  .how-container :global(.day-label:hover) {
     fill: var(--text-primary);
   }
 
-  .active-label {
+  .how-container :global(.active-label) {
     fill: var(--accent-blue);
     font-weight: 600;
   }
 
-  .how-cell {
+  .how-container :global(.how-cell) {
     cursor: pointer;
     transition: opacity 0.15s;
   }
 
-  .how-cell:hover {
+  .how-container :global(.how-cell:hover) {
     opacity: 0.8;
     stroke: var(--text-muted);
     stroke-width: 1;
   }
 
-  .how-cell.dimmed {
+  .how-container :global(.how-cell.dimmed) {
     opacity: 0.2;
   }
 
@@ -298,7 +317,7 @@
     border-radius: var(--radius-sm);
     white-space: nowrap;
     pointer-events: none;
-    z-index: 100;
+    z-index: var(--z-tooltip);
   }
 
   .empty {

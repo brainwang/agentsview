@@ -6,29 +6,40 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/tidwall/gjson"
-	"github.com/wesm/agentsview/internal/db/git"
+	"go.kenn.io/agentsview/internal/db/git"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 // StatsFilter mirrors the service-layer StatsFilter but lives in db
 // because db functions take typed filters without cross-package deps.
 type StatsFilter struct {
-	Since                 string
-	Until                 string
-	Agent                 string
-	IncludeProjects       []string
-	ExcludeProjects       []string
-	Timezone              string
-	IncludeGitOutcomes    bool
-	IncludeGitHubOutcomes bool
-	GHToken               string
+	Since                  string
+	Until                  string
+	Agent                  string
+	ApplyDefaultVisibility bool
+	IncludeOneShot         bool
+	IncludeAutomated       bool
+	IncludeProjects        []string
+	ExcludeProjects        []string
+	Timezone               string
+	IncludeGitOutcomes     bool
+	IncludeGitHubOutcomes  bool
+	GHToken                string
 }
+
+// StatsInputError marks invalid user-supplied stats filters so HTTP
+// transports can return 400 instead of treating validation failures as server
+// faults.
+type StatsInputError struct{ Msg string }
+
+func (e *StatsInputError) Error() string { return e.Msg }
 
 // GetSessionStats computes the v1 session-stats JSON response.
 // Sections are populated in order so each step can reuse the per-session
@@ -38,20 +49,30 @@ func (db *DB) GetSessionStats(
 ) (*SessionStats, error) {
 	tz, err := resolveTimezone(f.Timezone)
 	if err != nil {
-		return nil, fmt.Errorf("resolving timezone: %w", err)
+		return nil, &StatsInputError{Msg: "invalid timezone: " + f.Timezone}
 	}
 	from, to, days, err := windowBounds(f, time.Now())
 	if err != nil {
-		return nil, fmt.Errorf("resolving window: %w", err)
+		return nil, &StatsInputError{Msg: err.Error()}
 	}
 
-	rows, err := db.loadSessionsInWindow(ctx, f, from, to)
+	// Root-only rows drive every consumer (distributions, velocity,
+	// timing, the human/automation split, archetypes, outcomes), so
+	// short signal-less subagents do not skew shape or per-session
+	// metrics. A second, subagent-inclusive load supplies the additive
+	// token/session totals, where subagent spend is real and belongs in
+	// the headline numbers.
+	rows, err := db.loadSessionsInWindow(ctx, f, from, to, false)
+	if err != nil {
+		return nil, err
+	}
+	rowsWithSubagents, err := db.loadSessionsInWindow(ctx, f, from, to, true)
 	if err != nil {
 		return nil, err
 	}
 
 	stats := &SessionStats{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Window: StatsWindow{
 			Since: from.UTC().Format(time.RFC3339),
 			Until: to.UTC().Format(time.RFC3339),
@@ -67,11 +88,26 @@ func (db *DB) GetSessionStats(
 	}
 
 	computeTotalsAndArchetypes(stats, rows)
+	// Override the additive totals to count subagents. Archetypes and
+	// the human/automation split computed above stay root-only: a
+	// subagent is not a human or automation session and carries no
+	// shape signal. SessionsAll counts every row in the inclusive set;
+	// the message totals sum across it. SessionsHuman/SessionsAutomation
+	// are intentionally left as computeTotalsAndArchetypes set them.
+	applySubagentInclusiveTotals(stats, rowsWithSubagents)
 	computeDistributions(stats, rows)
 
+	// Root-only IDs drive the distribution surfaces (velocity, temporal).
+	// The inclusive IDs drive the additive all-session aggregates
+	// (tool_mix, model_mix.by_tokens) so they count subagent spend and
+	// reconcile with the subagent-inclusive Totals.
 	sessionIDs := make([]string, 0, len(rows))
 	for _, r := range rows {
 		sessionIDs = append(sessionIDs, r.id)
+	}
+	sessionIDsAll := make([]string, 0, len(rowsWithSubagents))
+	for _, r := range rowsWithSubagents {
+		sessionIDsAll = append(sessionIDsAll, r.id)
 	}
 	accum, err := populateVelocityAccumulator(ctx, db, sessionIDs, tz)
 	if err != nil {
@@ -80,14 +116,14 @@ func (db *DB) GetSessionStats(
 	computeVelocity(stats, accum)
 
 	if err := db.computeToolAndModelMix(
-		ctx, stats, sessionIDs,
+		ctx, stats, sessionIDsAll,
 	); err != nil {
 		return nil, fmt.Errorf(
 			"computing tool/model mix: %w", err,
 		)
 	}
 
-	computeAgentPortfolio(stats, rows)
+	computeAgentPortfolio(stats, rowsWithSubagents, rows)
 
 	if err := db.computeCacheEconomics(ctx, stats, rows); err != nil {
 		return nil, fmt.Errorf(
@@ -264,7 +300,7 @@ func windowBounds(
 ) (from, to time.Time, days int, err error) {
 	to = now
 	if f.Until != "" {
-		to, err = parseWindowPoint(f.Until, now)
+		to, err = ParseWindowPoint(f.Until, now)
 		if err != nil {
 			return time.Time{}, time.Time{}, 0,
 				fmt.Errorf("parsing until %q: %w", f.Until, err)
@@ -277,7 +313,7 @@ func windowBounds(
 		if d, ok := parseDurationShort(f.Since); ok {
 			from = to.Add(-d)
 		} else {
-			from, err = parseWindowPoint(f.Since, now)
+			from, err = ParseWindowPoint(f.Since, now)
 			if err != nil {
 				return time.Time{}, time.Time{}, 0,
 					fmt.Errorf(
@@ -304,10 +340,13 @@ func windowBounds(
 	return from, to, days, nil
 }
 
-// parseWindowPoint accepts either a duration-relative-to-now form
-// ("28d", "12h") or an absolute YYYY-MM-DD date (interpreted as
-// the start of that UTC day). Used by Since and Until.
-func parseWindowPoint(s string, now time.Time) (time.Time, error) {
+// ParseWindowPoint resolves a single window bound — a compact
+// duration-relative-to-now form ("28d", "12h") or an absolute YYYY-MM-DD
+// date (the start of that UTC day) — to an instant. A duration anchors at
+// now; passing a resolved bound as now lets a caller anchor a duration
+// against it (as usage daily anchors --since to --until). Shared by stats'
+// windowBounds and the usage CLI.
+func ParseWindowPoint(s string, now time.Time) (time.Time, error) {
 	if d, ok := parseDurationShort(s); ok {
 		return now.Add(-d), nil
 	}
@@ -384,14 +423,23 @@ type sessionStatsRow struct {
 // by started_at within [from, to).
 func (db *DB) loadSessionsInWindow(
 	ctx context.Context, f StatsFilter, from, to time.Time,
+	includeSubagents bool,
 ) ([]sessionStatsRow, error) {
 	// Use the same COALESCE(NULLIF(started_at, ''), created_at)
 	// expression as the rest of the analytics code so sessions whose
 	// started_at is missing (parser couldn't infer a start time) are
 	// still attributed to the window via their created_at fallback.
+	//
+	// includeSubagents selects which row set this is: the root-only set
+	// (default, drives distributions/shape/velocity and the human vs
+	// automation split) or the subagent-inclusive set (drives the
+	// additive token/session totals). Fork rows stay excluded in both
+	// because their tokens overlap their root session. The predicate is
+	// the same one the analytics builders use, via the shared helper, so
+	// the two paths can't drift.
 	preds := []string{
 		"message_count > 0",
-		"relationship_type NOT IN ('subagent', 'fork')",
+		RelationshipExclusionSQL(includeSubagents, false, ""),
 		"deleted_at IS NULL",
 		"COALESCE(NULLIF(started_at, ''), created_at) >= ?",
 		"COALESCE(NULLIF(started_at, ''), created_at) < ?",
@@ -400,13 +448,26 @@ func (db *DB) loadSessionsInWindow(
 		from.UTC().Format(time.RFC3339Nano),
 		to.UTC().Format(time.RFC3339Nano),
 	}
+	if f.ApplyDefaultVisibility {
+		visibilityBuilder := NewQueryBuilder(SQLiteQueryDialect(), len(args))
+		preds, _ = appendSessionVisibilityPredicates(
+			preds,
+			SessionFilter{
+				ExcludeOneShot:   !f.IncludeOneShot,
+				ExcludeAutomated: !f.IncludeAutomated,
+			},
+			visibilityBuilder,
+			func(col string) string { return "s." + col },
+		)
+		args = append(args, visibilityBuilder.Args()...)
+	}
 
 	if f.Agent != "" {
-		agents := strings.Split(f.Agent, ",")
+		agents := csvFilterValues(f.Agent)
 		if len(agents) == 1 {
 			preds = append(preds, "agent = ?")
 			args = append(args, agents[0])
-		} else {
+		} else if len(agents) > 1 {
 			ph := make([]string, len(agents))
 			for i, a := range agents {
 				ph[i] = "?"
@@ -589,6 +650,33 @@ func computeTotalsAndArchetypes(
 	})
 }
 
+// applySubagentInclusiveTotals overrides the additive token/session
+// totals with sums over the subagent-inclusive row set. It is called
+// after computeTotalsAndArchetypes (which ran on the root-only rows) so
+// the archetypes and the human/automation split stay root-only while
+// the headline totals count subagent spend. Only the strictly additive
+// fields are overridden; SessionsHuman and SessionsAutomation are not,
+// since a subagent is neither.
+func applySubagentInclusiveTotals(
+	s *SessionStats, rows []sessionStatsRow,
+) {
+	var sessions, messages, userMessages int
+	for _, r := range rows {
+		sessions++
+		messages += r.messageCount
+		userMessages += r.userMessageCount
+	}
+	s.Totals.SessionsAll = sessions
+	s.Totals.MessagesTotal = messages
+	s.Totals.UserMessagesTotal = userMessages
+	// SessionsHuman and SessionsAutomation were set from the root-only
+	// rows and exclude subagents. The remainder is the subagent count,
+	// which keeps the partition sessions_all == human + automation +
+	// subagent intact.
+	s.Totals.SessionsSubagent =
+		sessions - s.Totals.SessionsHuman - s.Totals.SessionsAutomation
+}
+
 // pickMaxLabel returns the key with the strictly highest count.
 // Ties are broken by iterating priority in order — the earlier
 // priority entry wins. Returns "" when counts is empty or every
@@ -674,9 +762,13 @@ func (a *scopedAccumulator) finalize() ScopedDistribution {
 //     the human mean and buckets because the v1 human bucket shape
 //     starts at 2. ScopeAll keeps the [0,2) bucket for short sessions.
 //
-// PeakContextTokens is Claude-only: rows from other agents and rows
-// without hasPeakContext data are excluded from every bucket; the
-// Claude-specific null rows are tallied separately in NullCount.
+// PeakContextTokens includes every row with hasPeakContext data,
+// regardless of agent: the metric used to be Claude-only, but the
+// hermes/kimi/forge/zed parsers populate it now (#646). Rows without
+// the data are tallied in NullCount — but only for agents that report
+// the metric at least once in the window, so agents that never track
+// peak context stay outside the metric entirely instead of inflating
+// the null tally.
 func computeDistributions(s *SessionStats, rows []sessionStatsRow) {
 	durAll := newAccumulator(durationMinutesEdges)
 	durHuman := newAccumulator(durationMinutesEdges)
@@ -687,6 +779,15 @@ func computeDistributions(s *SessionStats, rows []sessionStatsRow) {
 	tptAll := newAccumulator(toolsPerTurnEdges)
 	tptHuman := newAccumulator(toolsPerTurnEdges)
 	var pcNull int
+
+	// Agents with at least one peak-context-bearing row in the window;
+	// only their data-less rows count toward NullCount.
+	peakAgents := map[string]bool{}
+	for _, r := range rows {
+		if r.hasPeakContext {
+			peakAgents[r.agent] = true
+		}
+	}
 
 	for _, r := range rows {
 		human := !r.isAutomated
@@ -709,16 +810,14 @@ func computeDistributions(s *SessionStats, rows []sessionStatsRow) {
 		if human && r.userMessageCount >= 2 {
 			umHuman.add(umv)
 		}
-		if r.agent == "claude" {
-			if r.hasPeakContext {
-				pv := float64(r.peakContextTokens)
-				pcAll.add(pv)
-				if human {
-					pcHuman.add(pv)
-				}
-			} else {
-				pcNull++
+		if r.hasPeakContext {
+			pv := float64(r.peakContextTokens)
+			pcAll.add(pv)
+			if human {
+				pcHuman.add(pv)
 			}
+		} else if peakAgents[r.agent] {
+			pcNull++
 		}
 		if r.assistantTurns > 0 {
 			tpt := float64(r.totalToolCalls) / float64(r.assistantTurns)
@@ -741,7 +840,7 @@ func computeDistributions(s *SessionStats, rows []sessionStatsRow) {
 		ScopeAll:   pcAll.finalize(),
 		ScopeHuman: pcHuman.finalize(),
 		NullCount:  pcNull,
-		ClaudeOnly: true,
+		ClaudeOnly: false,
 	}
 	s.Distributions.ToolsPerTurn = ScopedDistributionPair{
 		ScopeAll:   tptAll.finalize(),
@@ -783,14 +882,21 @@ func safeMean(sum float64, n int) float64 {
 // flag is set. Without that guard, agents whose token coverage is
 // missing (default 0) would be indistinguishable from agents that
 // truly produced no output tokens.
-func computeAgentPortfolio(s *SessionStats, rows []sessionStatsRow) {
+//
+// The all-session maps (by_sessions/by_messages/by_tokens) are built
+// from rowsAll so they count subagent spend and reconcile with the
+// subagent-inclusive Totals. The _human maps are built from rowsRoot:
+// a subagent is not a human session, and (since subagents are also not
+// is_automated) folding them via the !isAutomated gate would wrongly
+// inflate the human variants. rowsRoot already excludes subagents, so
+// the human accumulation uses it directly.
+func computeAgentPortfolio(
+	s *SessionStats, rowsAll, rowsRoot []sessionStatsRow,
+) {
 	bySessions := map[string]int{}
 	byMessages := map[string]int{}
 	byTokens := map[string]int64{}
-	bySessionsHuman := map[string]int{}
-	byMessagesHuman := map[string]int{}
-	byTokensHuman := map[string]int64{}
-	for _, r := range rows {
+	for _, r := range rowsAll {
 		if r.agent == "" {
 			continue
 		}
@@ -799,12 +905,18 @@ func computeAgentPortfolio(s *SessionStats, rows []sessionStatsRow) {
 		if r.hasTotalOutputTokens {
 			byTokens[r.agent] += r.totalOutputTokens
 		}
-		if !r.isAutomated {
-			bySessionsHuman[r.agent]++
-			byMessagesHuman[r.agent] += r.messageCount
-			if r.hasTotalOutputTokens {
-				byTokensHuman[r.agent] += r.totalOutputTokens
-			}
+	}
+	bySessionsHuman := map[string]int{}
+	byMessagesHuman := map[string]int{}
+	byTokensHuman := map[string]int64{}
+	for _, r := range rowsRoot {
+		if r.agent == "" || r.isAutomated {
+			continue
+		}
+		bySessionsHuman[r.agent]++
+		byMessagesHuman[r.agent] += r.messageCount
+		if r.hasTotalOutputTokens {
+			byTokensHuman[r.agent] += r.totalOutputTokens
 		}
 	}
 	s.AgentPortfolio.BySessions = bySessions
@@ -843,8 +955,8 @@ type sessionCacheTotals struct {
 	inputTok     int64
 	cacheCreateT int64
 	cacheReadT   int64
-	dollarsSpent float64
-	dollarsNoCac float64 // cost if the workload had never cached
+	dollarsSpent money.Money
+	dollarsNoCac money.Money // cost if the workload had never cached
 }
 
 // computeCacheEconomics populates stats.CacheEconomics for Claude
@@ -862,7 +974,7 @@ type sessionCacheTotals struct {
 // the same way keeps merge semantics stable.
 //
 // dollars_spent prices every eligible Claude message using the
-// model_pricing table. dollars_saved_vs_uncached reprices cache_read
+// effective pricing catalog. dollars_saved_vs_uncached reprices cache_read
 // tokens at the input rate and zeroes cache_creation (the
 // counterfactual where the workload never cached), then subtracts
 // dollars_spent. A missing pricing row zeroes out that model's
@@ -880,12 +992,13 @@ func (db *DB) computeCacheEconomics(
 	if err != nil {
 		return fmt.Errorf("loading pricing: %w", err)
 	}
+	rateResolver := export.NewPricingResolver(pricing)
 
 	perSession := make(map[string]*sessionCacheTotals, len(claudeIDs))
 	if err := queryChunked(claudeIDs,
 		func(chunk []string) error {
 			return db.accumulateCacheTotals(
-				ctx, chunk, pricing, perSession,
+				ctx, chunk, rateResolver, perSession,
 			)
 		}); err != nil {
 		return err
@@ -900,8 +1013,8 @@ func (db *DB) computeCacheEconomics(
 	var (
 		cacheReadSum   int64
 		denominatorSum int64
-		dollarsSpent   float64
-		dollarsNoCache float64
+		dollarsSpent   money.Money
+		dollarsNoCache money.Money
 	)
 	// Iterate in session-id order so floating-point sums stay
 	// deterministic across runs; Go's map iteration order is
@@ -918,8 +1031,14 @@ func (db *DB) computeCacheEconomics(
 		}
 		denom := totals.inputTok + totals.cacheReadT +
 			totals.cacheCreateT
-		dollarsSpent += totals.dollarsSpent
-		dollarsNoCache += totals.dollarsNoCac
+		dollarsSpent, err = money.Add(dollarsSpent, totals.dollarsSpent)
+		if err != nil {
+			return fmt.Errorf("summing cache spending: %w", err)
+		}
+		dollarsNoCache, err = money.Add(dollarsNoCache, totals.dollarsNoCac)
+		if err != nil {
+			return fmt.Errorf("summing uncached spending: %w", err)
+		}
 		if denom <= 0 {
 			continue
 		}
@@ -940,7 +1059,10 @@ func (db *DB) computeCacheEconomics(
 	// frontend/src/lib/utils/usageSavings.ts) surface that "costlier
 	// than uncached" state directly, so do not clamp it away here —
 	// hiding it would mask real cache-efficiency regressions.
-	ce.DollarsSavedVsUncached = dollarsNoCache - dollarsSpent
+	ce.DollarsSavedVsUncached, err = money.Sub(dollarsNoCache, dollarsSpent)
+	if err != nil {
+		return fmt.Errorf("computing cache savings: %w", err)
+	}
 
 	stats.CacheEconomics = ce
 	return nil
@@ -965,7 +1087,7 @@ func collectClaudeSessionIDs(rows []sessionStatsRow) []string {
 // dollar numbers consistent with GetDailyUsage.
 func (db *DB) accumulateCacheTotals(
 	ctx context.Context, sessionIDs []string,
-	pricing map[string]modelRates,
+	pricing *export.PricingResolver,
 	perSession map[string]*sessionCacheTotals,
 ) error {
 	ph, args := inPlaceholders(sessionIDs)
@@ -975,7 +1097,7 @@ func (db *DB) accumulateCacheTotals(
 	// The cross-session fold in computeCacheEconomics already sorts
 	// session IDs; the per-message order completes the determinism
 	// chain so golden tests stay byte-stable.
-	q := `SELECT session_id, model, token_usage
+	q := `SELECT session_id, model, token_usage, COALESCE(timestamp, '')
 		FROM messages
 		WHERE session_id IN ` + ph + `
 			AND token_usage != ''
@@ -988,15 +1110,17 @@ func (db *DB) accumulateCacheTotals(
 	}
 	defer sqlRows.Close()
 	for sqlRows.Next() {
-		var sessionID, model, tokenJSON string
+		var sessionID, model, tokenJSON, timestamp string
 		if err := sqlRows.Scan(
-			&sessionID, &model, &tokenJSON,
+			&sessionID, &model, &tokenJSON, &timestamp,
 		); err != nil {
 			return fmt.Errorf("scanning cache tokens: %w", err)
 		}
-		addMessageToCacheTotals(
-			perSession, sessionID, model, tokenJSON, pricing,
-		)
+		if err := addMessageToCacheTotals(
+			perSession, sessionID, model, tokenJSON, timestamp, pricing,
+		); err != nil {
+			return err
+		}
 	}
 	return sqlRows.Err()
 }
@@ -1006,39 +1130,51 @@ func (db *DB) accumulateCacheTotals(
 // accumulateCacheTotals so the row loop stays a thin scan+dispatch.
 func addMessageToCacheTotals(
 	perSession map[string]*sessionCacheTotals,
-	sessionID, model, tokenJSON string,
-	pricing map[string]modelRates,
-) {
-	usage := gjson.Parse(tokenJSON)
-	inputTok := usage.Get("input_tokens").Int()
-	outputTok := usage.Get("output_tokens").Int()
-	cacheCrTok := usage.Get("cache_creation_input_tokens").Int()
-	cacheRdTok := usage.Get("cache_read_input_tokens").Int()
+	sessionID, model, tokenJSON, timestamp string,
+	pricing *export.PricingResolver,
+) error {
+	inputTok, outputTok, cacheCrTok, cacheRdTok :=
+		clampedUsageTokenCounters(tokenJSON)
+	cacheCr1hTok := clampedCacheCreation1hTokens(tokenJSON)
 
 	totals, ok := perSession[sessionID]
 	if !ok {
 		totals = &sessionCacheTotals{}
 		perSession[sessionID] = totals
 	}
-	totals.inputTok += inputTok
-	totals.cacheCreateT += cacheCrTok
-	totals.cacheReadT += cacheRdTok
+	totals.inputTok += int64(inputTok)
+	totals.cacheCreateT += int64(cacheCrTok)
+	totals.cacheReadT += int64(cacheRdTok)
 
-	rates := pricing[model]
-	totals.dollarsSpent += (float64(inputTok)*rates.input +
-		float64(outputTok)*rates.output +
-		float64(cacheCrTok)*rates.cacheCreation +
-		float64(cacheRdTok)*rates.cacheRead) / 1_000_000
+	_, lookup := pricing.ResolveAt(
+		model, usageLookupModel(model, timestamp), usagePricingTimestamp(timestamp),
+	)
+	rates := lookup.Rates
+	spent, err := rates.CostForTokens(
+		inputTok, outputTok, 0, cacheCrTok, cacheCr1hTok, cacheRdTok)
+	if err != nil {
+		return fmt.Errorf("pricing cache usage for model %q: %w", model, err)
+	}
+	totals.dollarsSpent, err = money.Add(totals.dollarsSpent, spent)
+	if err != nil {
+		return fmt.Errorf("summing cache usage for model %q: %w", model, err)
+	}
 	// Uncached counterfactual: cache_creation tokens would still
 	// have been sent as ordinary input (so they are billed at the
 	// input rate, not dropped), and cache_read tokens are re-billed
 	// at the input rate too. This matches the rest of the codebase
 	// (see internal/db/usage.go and the savings calculation in
 	// frontend/src/lib/utils/usageSavings.ts).
-	totals.dollarsNoCac += (float64(inputTok)*rates.input +
-		float64(outputTok)*rates.output +
-		float64(cacheCrTok)*rates.input +
-		float64(cacheRdTok)*rates.input) / 1_000_000
+	uncached, err := rates.CostForTokens(
+		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0, 0)
+	if err != nil {
+		return fmt.Errorf("pricing uncached usage for model %q: %w", model, err)
+	}
+	totals.dollarsNoCac, err = money.Add(totals.dollarsNoCac, uncached)
+	if err != nil {
+		return fmt.Errorf("summing uncached usage for model %q: %w", model, err)
+	}
+	return nil
 }
 
 // computeTemporal fills stats.Temporal.HourlyUTC and ReporterTimezone.
@@ -1058,9 +1194,10 @@ func addMessageToCacheTotals(
 // the JSON output emits "hourly_utc": [] rather than null.
 //
 // ReporterTimezone reflects f.Timezone when set (honouring the CLI
-// --timezone flag), the TZ env var when present, or time.Local's name
-// otherwise. This is a best-effort IANA name; tooling that needs a
-// strict tzdata lookup should pass --timezone explicitly.
+// --timezone flag), otherwise the best-effort local IANA name resolved
+// from TZ, the local location, or the OS-aware platform adapter. When
+// no loadable name can be resolved safely, the field stays empty so
+// downstream fallback logic can take over.
 func (db *DB) computeTemporal(
 	ctx context.Context, stats *SessionStats, f StatsFilter,
 	from, to time.Time, sessionIDs []string,
@@ -1132,6 +1269,7 @@ func (db *DB) accumulateHourlyUTC(
 		FROM messages m
 		WHERE m.session_id IN ` + ph + `
 			AND m.role = 'user'
+			AND COALESCE(m.source_subtype, '') <> 'tool_result'
 			AND m.timestamp IS NOT NULL
 			AND m.timestamp != ''
 			AND m.timestamp >= ?
@@ -1174,20 +1312,15 @@ func (db *DB) accumulateHourlyUTC(
 // SessionStats.Temporal.ReporterTimezone. Precedence:
 //
 //  1. f.Timezone when non-empty — echoes the --timezone flag.
-//  2. TZ environment variable — what most Unix tools respect.
-//  3. time.Local.String() — may be "Local" on systems without /etc/localtime.
-//
-// This function is intentionally simple: it does not attempt tzdata
-// lookups or validate the result. Consumers that need a strict zone
-// pass --timezone explicitly and get the validated name back.
+//  2. Valid IANA names from TZ or the current local location, followed
+//     by the OS-aware platform adapter for identities such as Windows
+//     registry names.
+//  3. Empty string when no loadable name can be resolved safely.
 func reporterTimezone(f StatsFilter) string {
 	if f.Timezone != "" {
 		return f.Timezone
 	}
-	if tz := os.Getenv("TZ"); tz != "" {
-		return tz
-	}
-	return time.Local.String()
+	return timeutil.BestEffortLocalTimezone()
 }
 
 // computeOutcomes populates stats.Outcomes from the Claude-agent subset
@@ -1392,17 +1525,28 @@ func (db *DB) computeOutcomeStats(
 			cwds = append(cwds, r.cwd)
 		}
 	}
-	repos := git.DiscoverRepos(cwds)
+	repos := git.DiscoverRepos(ctx, cwds)
 	if len(repos) == 0 {
 		return nil
 	}
 	since := from.UTC().Format(time.RFC3339)
 	until := to.UTC().Format(time.RFC3339)
-	cache := git.NewCache(db.getWriter())
+	var cache *git.Cache
+	// Snapshot the writer pool once: CloseWriter can nil it concurrently for a
+	// worker maintenance pass, so a check-then-load would hand git.NewCache a nil
+	// *sql.DB and panic on first use. Compaction reopens the pool before its
+	// rollback window closes, so writerClosed remains the authority even when the
+	// snapshot is non-nil. Fall back to the read-only cache while either barrier
+	// is active so analytics never persists git stats that a rollback can discard.
+	if writer := db.rawWriter(); !db.ReadOnly() && !db.WriterClosed() && writer != nil {
+		cache = git.NewCache(writer)
+	} else {
+		cache = git.NewReadOnlyCache(db.rawReader())
+	}
 	out := &StatsOutcomeStats{}
 	contributed := false
 	for _, repo := range repos {
-		email := git.AuthorEmail(repo)
+		email := git.AuthorEmail(ctx, repo)
 		if email == "" {
 			continue
 		}

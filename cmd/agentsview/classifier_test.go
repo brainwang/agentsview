@@ -7,65 +7,102 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 )
 
-// classifierTestEnv prepares a temp data dir and writes a
-// minimal config.toml with the given user prefixes.
-func classifierTestEnv(t *testing.T, prefixes []string) string {
-	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("AGENTSVIEW_DATA_DIR", dir)
+// unreachablePGURL points at a deliberately-closed port (1) so
+// postgres.Open returns quickly without blocking the test.
+const unreachablePGURL = "postgres://nobody:nobody@127.0.0.1:1/" +
+	"nonexistent?sslmode=disable&connect_timeout=2"
 
-	tomlBuf := &bytes.Buffer{}
-	tomlBuf.WriteString("[automated]\nprefixes = [")
-	for i, p := range prefixes {
-		if i > 0 {
-			tomlBuf.WriteString(", ")
-		}
-		tomlBuf.WriteString("\"" + p + "\"")
-	}
-	tomlBuf.WriteString("]\n")
-	if err := os.WriteFile(
-		filepath.Join(dir, "config.toml"),
-		tomlBuf.Bytes(), 0o600,
-	); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	t.Cleanup(func() { db.SetUserAutomationPrefixes(nil) })
-	return dir
+// classifierFixture owns the per-test data dir and the config
+// wired to it. Construct it with newClassifierFixture.
+type classifierFixture struct {
+	Dir string
+	Cfg config.Config
 }
 
-// seedHash opens the DB at cfg.DBPath, runs the backfill so
-// a hash gets stored, then closes.
-func seedHash(t *testing.T, cfg config.Config) {
+// newClassifierFixture prepares a temp data dir with a minimal
+// config.toml carrying the given user prefixes, loads a minimal
+// config pointed at that dir, applies any option mutators, and
+// installs the classifier patterns into the db singleton.
+func newClassifierFixture(
+	t *testing.T, prefixes []string, opts ...func(*config.Config),
+) classifierFixture {
+	t.Helper()
+	dir := testDataDir(t)
+	writeAutomatedPrefixesConfig(t, dir, prefixes)
+
+	cfg, err := config.LoadMinimal()
+	require.NoError(t, err, "load")
+	cfg.DBPath = filepath.Join(dir, "sessions.db")
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	applyClassifierConfig(cfg)
+
+	t.Cleanup(func() {
+		db.SetUserAutomationPrefixes(nil)
+		db.SetUserAutomationSubstrings(nil)
+		db.SetUserAutomationExactMatches(nil)
+	})
+	return classifierFixture{Dir: dir, Cfg: cfg}
+}
+
+// withUnreachablePG configures a PG URL that cannot be reached so
+// tests can exercise the PG cleanup path without a live database.
+func withUnreachablePG(cfg *config.Config) {
+	cfg.PG.URL = unreachablePGURL
+	cfg.PG.AllowInsecure = true
+}
+
+// withoutPG clears any configured PG URL.
+func withoutPG(cfg *config.Config) {
+	cfg.PG.URL = ""
+}
+
+// writeAutomatedPrefixesConfig writes a config.toml under dir with
+// the given automated prefixes, quoting each via strconv.Quote so
+// prefixes containing quotes or backslashes stay valid TOML.
+func writeAutomatedPrefixesConfig(t *testing.T, dir string, prefixes []string) {
+	t.Helper()
+	quoted := make([]string, len(prefixes))
+	for i, p := range prefixes {
+		quoted[i] = strconv.Quote(p)
+	}
+	toml := "[automated]\nprefixes = [" + strings.Join(quoted, ", ") + "]\n"
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "config.toml"),
+		[]byte(toml), 0o600,
+	), "write config")
+}
+
+// seedClassifierHash opens the DB at cfg.DBPath, which runs the
+// backfill so a classifier hash gets stored, then closes.
+func seedClassifierHash(t *testing.T, cfg config.Config) {
 	t.Helper()
 	d, err := db.Open(cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer d.Close()
-	// Opening already runs backfill; the hash is now stored.
-	_ = d
+	require.NoError(t, err, "open db")
+	require.NoError(t, d.Close(), "close db")
 }
 
-// readStoredHash returns the stored classifier hash from the
-// stats table via a raw SQLite connection. Bypasses db.Open
-// because db.Open runs the backfill, which would re-write
-// the hash that this helper exists to observe (e.g. after
-// runClassifierRebuild deletes it).
-func readStoredHash(t *testing.T, dbPath string) string {
+// classifierHashInSQLite returns the stored classifier hash from
+// the stats table via a raw SQLite connection. Bypasses db.Open
+// because db.Open runs the backfill, which would re-write the hash
+// that this helper exists to observe (e.g. after runClassifierRebuild
+// deletes it).
+func classifierHashInSQLite(t *testing.T, dbPath string) string {
 	t.Helper()
 	conn, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		t.Fatalf("open raw sqlite: %v", err)
-	}
+	require.NoError(t, err, "open raw sqlite")
 	defer conn.Close()
 	var v string
 	err = conn.QueryRow(
@@ -75,34 +112,42 @@ func readStoredHash(t *testing.T, dbPath string) string {
 	if errors.Is(err, sql.ErrNoRows) {
 		return ""
 	}
-	if err != nil {
-		t.Fatalf("query stats: %v", err)
-	}
+	require.NoError(t, err, "query stats")
 	return v
 }
 
+// runClassifierRebuildTest runs runClassifierRebuild against cfg,
+// returning captured output and any error.
+func runClassifierRebuildTest(
+	t *testing.T, cfg config.Config, includePG bool,
+) (string, error) {
+	t.Helper()
+	out := &bytes.Buffer{}
+	err := runClassifierRebuild(context.Background(), cfg, out, includePG)
+	return out.String(), err
+}
+
+// requireClassifierRebuild runs the rebuild and asserts it succeeds,
+// returning the captured output.
+func requireClassifierRebuild(
+	t *testing.T, cfg config.Config, includePG bool,
+) string {
+	t.Helper()
+	out, err := runClassifierRebuildTest(t, cfg, includePG)
+	require.NoError(t, err, "rebuild")
+	return out
+}
+
 func TestClassifierRebuildClearsSQLiteHash(t *testing.T) {
-	dir := classifierTestEnv(t, []string{"You are analyzing an essay"})
-	cfg, err := config.LoadMinimal()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	cfg.DBPath = filepath.Join(dir, "sessions.db")
-	applyClassifierConfig(cfg)
-	seedHash(t, cfg)
-	if got := readStoredHash(t, cfg.DBPath); got == "" {
-		t.Fatalf("precondition: expected stored hash, got empty")
-	}
+	fx := newClassifierFixture(t, []string{"You are analyzing an essay"})
+	seedClassifierHash(t, fx.Cfg)
+	require.NotEmpty(t, classifierHashInSQLite(t, fx.Cfg.DBPath),
+		"precondition: expected stored hash, got empty")
 
-	if err := runClassifierRebuild(
-		context.Background(), cfg, &bytes.Buffer{},
-	); err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
+	requireClassifierRebuild(t, fx.Cfg, false)
 
-	if got := readStoredHash(t, cfg.DBPath); got != "" {
-		t.Errorf("expected hash cleared, got %q", got)
-	}
+	assert.Empty(t, classifierHashInSQLite(t, fx.Cfg.DBPath),
+		"expected hash cleared")
 }
 
 func TestClassifierRebuildPrintsLoadedPrefixes(t *testing.T) {
@@ -110,110 +155,95 @@ func TestClassifierRebuildPrintsLoadedPrefixes(t *testing.T) {
 		"You are analyzing an essay",
 		"You are grading quotes",
 	}
-	dir := classifierTestEnv(t, prefixes)
-	cfg, err := config.LoadMinimal()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	cfg.DBPath = filepath.Join(dir, "sessions.db")
-	applyClassifierConfig(cfg)
-	seedHash(t, cfg)
+	fx := newClassifierFixture(t, prefixes)
+	seedClassifierHash(t, fx.Cfg)
 
-	out := &bytes.Buffer{}
-	if err := runClassifierRebuild(
-		context.Background(), cfg, out,
-	); err != nil {
-		t.Fatalf("rebuild: %v", err)
-	}
-	got := out.String()
+	got := requireClassifierRebuild(t, fx.Cfg, false)
 	for _, p := range prefixes {
-		if !strings.Contains(got, p) {
-			t.Errorf("output missing %q:\n%s", p, got)
-		}
+		assert.Contains(t, got, p, "output missing %q", p)
 	}
-	if !strings.Contains(got, "loaded 2 user automation prefix") {
-		t.Errorf("output missing count line:\n%s", got)
+	assert.Contains(t, got, "loaded 2 user automation prefix",
+		"output missing count line")
+	assert.Contains(t, got, "restart",
+		"output missing restart reminder")
+}
+
+func TestClassifierRebuildGuard(t *testing.T) {
+	tests := []struct {
+		name    string
+		tr      transport
+		wantErr bool
+	}{
+		{
+			name:    "http transport refused",
+			tr:      transport{Mode: transportHTTP, URL: "http://127.0.0.1:8080"},
+			wantErr: true,
+		},
+		{
+			name:    "direct read-only refused",
+			tr:      transport{Mode: transportDirect, DirectReadOnly: true},
+			wantErr: true,
+		},
+		{
+			name:    "direct writable allowed",
+			tr:      transport{Mode: transportDirect},
+			wantErr: false,
+		},
 	}
-	if !strings.Contains(got, "restart") {
-		t.Errorf("output missing restart reminder:\n%s", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := guardClassifierRebuild(tt.tr)
+			if !tt.wantErr {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "daemon",
+				"error should mention daemon")
+		})
 	}
 }
 
-func TestClassifierRebuildRefusesOnHTTPTransport(t *testing.T) {
-	dir := classifierTestEnv(t, nil)
-	cfg, err := config.LoadMinimal()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	cfg.DBPath = filepath.Join(dir, "sessions.db")
+func TestClassifierRebuildRefusesBackgroundLaunchLock(t *testing.T) {
+	fx := newClassifierFixture(t, nil)
+	require.NoError(t, os.MkdirAll(fx.Dir, 0o700))
+	launchLock, ok := acquireBackgroundLaunchLock(fx.Dir)
+	require.True(t, ok)
+	t.Cleanup(func() { require.NoError(t, launchLock.Unlock()) })
 
-	tr := transport{Mode: transportHTTP, URL: "http://127.0.0.1:8080"}
-	err = guardClassifierRebuild(tr)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "daemon") {
-		t.Errorf("error should mention daemon, got: %v", err)
-	}
+	_, err := runClassifierRebuildTest(t, fx.Cfg, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "daemon launch is in progress")
 }
 
-func TestClassifierRebuildRefusesOnDirectReadOnly(t *testing.T) {
-	tr := transport{Mode: transportDirect, DirectReadOnly: true}
-	err := guardClassifierRebuild(tr)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "daemon") {
-		t.Errorf("error should mention daemon, got: %v", err)
-	}
+// TestClassifierRebuildSkipsConfiguredPGByDefault confirms that
+// configured sync PG is not touched by the local recovery command
+// unless the caller explicitly opts in.
+func TestClassifierRebuildSkipsConfiguredPGByDefault(t *testing.T) {
+	fx := newClassifierFixture(t, nil, withUnreachablePG)
+	seedClassifierHash(t, fx.Cfg)
+
+	requireClassifierRebuild(t, fx.Cfg, false)
 }
 
-func TestClassifierRebuildAllowsDirectWritable(t *testing.T) {
-	tr := transport{Mode: transportDirect, DirectReadOnly: false}
-	if err := guardClassifierRebuild(tr); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
+// TestClassifierRebuildPGFlagHardFailsOnPGUnreachable confirms
+// that when PG cleanup is explicitly requested and the connection
+// fails, runClassifierRebuild returns an error instead of silently
+// skipping the PG delete.
+func TestClassifierRebuildPGFlagHardFailsOnPGUnreachable(t *testing.T) {
+	fx := newClassifierFixture(t, nil, withUnreachablePG)
+	seedClassifierHash(t, fx.Cfg)
 
-// TestClassifierRebuildHardFailsOnPGUnreachable confirms
-// that when PG is configured (pg.url non-empty) and the
-// connection fails, runClassifierRebuild returns an error
-// instead of silently skipping the PG delete.
-func TestClassifierRebuildHardFailsOnPGUnreachable(t *testing.T) {
-	dir := classifierTestEnv(t, nil)
-	cfg, err := config.LoadMinimal()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	cfg.DBPath = filepath.Join(dir, "sessions.db")
-	// Point at a deliberately-unreachable PG URL. Use port 1
-	// (commonly closed) so Open returns quickly without
-	// blocking the test.
-	cfg.PG.URL = "postgres://nobody:nobody@127.0.0.1:1/nonexistent?sslmode=disable&connect_timeout=2"
-	cfg.PG.AllowInsecure = true
-	applyClassifierConfig(cfg)
-	seedHash(t, cfg)
-
-	err = runClassifierRebuild(
-		context.Background(), cfg, &bytes.Buffer{},
-	)
-	if err == nil {
-		t.Fatal("expected error for unreachable PG, got nil")
-	}
-	if !strings.Contains(err.Error(), "PG") &&
-		!strings.Contains(err.Error(), "pg") {
-		t.Errorf("error should mention PG, got: %v", err)
-	}
+	_, err := runClassifierRebuildTest(t, fx.Cfg, true)
+	require.Error(t, err, "expected error for unreachable PG")
+	lower := strings.ToLower(err.Error())
+	assert.Contains(t, lower, "pg",
+		"error should mention PG, got: %v", err)
 	// Lock the spec contract: the error must surface the
 	// 'pg push --full' remediation hint so a future refactor
 	// can't silently drop it.
-	if !strings.Contains(err.Error(), "pg push --full") {
-		t.Errorf(
-			"error should mention 'pg push --full' "+
-				"remediation, got: %v",
-			err,
-		)
-	}
+	assert.Contains(t, err.Error(), "pg push --full",
+		"error should mention 'pg push --full' remediation")
 }
 
 // TestClassifierRebuildSkipsPGWhenNotConfigured verifies the
@@ -221,21 +251,10 @@ func TestClassifierRebuildHardFailsOnPGUnreachable(t *testing.T) {
 // NOT attempt PG cleanup and returns nil even if PG would
 // otherwise be unreachable.
 func TestClassifierRebuildSkipsPGWhenNotConfigured(t *testing.T) {
-	dir := classifierTestEnv(t, nil)
-	cfg, err := config.LoadMinimal()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	cfg.DBPath = filepath.Join(dir, "sessions.db")
-	cfg.PG.URL = ""
-	applyClassifierConfig(cfg)
-	seedHash(t, cfg)
+	fx := newClassifierFixture(t, nil, withoutPG)
+	seedClassifierHash(t, fx.Cfg)
 
-	if err := runClassifierRebuild(
-		context.Background(), cfg, &bytes.Buffer{},
-	); err != nil {
-		t.Fatalf("unexpected error when PG unconfigured: %v", err)
-	}
+	requireClassifierRebuild(t, fx.Cfg, false)
 }
 
 // TestClassifierCommandIsHidden pins the UX decision that the
@@ -244,7 +263,6 @@ func TestClassifierRebuildSkipsPGWhenNotConfigured(t *testing.T) {
 // this group is a recovery hatch.
 func TestClassifierCommandIsHidden(t *testing.T) {
 	cmd := newClassifierCommand()
-	if !cmd.Hidden {
-		t.Errorf("classifier command should be Hidden=true; got false")
-	}
+	assert.True(t, cmd.Hidden,
+		"classifier command should be Hidden=true; got false")
 }

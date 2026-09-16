@@ -1,116 +1,259 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // AgentType identifies the AI agent that produced a session.
 type AgentType string
 
 const (
-	AgentClaude        AgentType = "claude"
-	AgentCodex         AgentType = "codex"
-	AgentCopilot       AgentType = "copilot"
-	AgentGemini        AgentType = "gemini"
-	AgentOpenCode      AgentType = "opencode"
-	AgentOpenHands     AgentType = "openhands"
-	AgentCursor        AgentType = "cursor"
-	AgentIflow         AgentType = "iflow"
-	AgentAmp           AgentType = "amp"
-	AgentZencoder      AgentType = "zencoder"
-	AgentVSCodeCopilot AgentType = "vscode-copilot"
-	AgentPi            AgentType = "pi"
-	AgentQwen          AgentType = "qwen"
-	AgentOpenClaw      AgentType = "openclaw"
-	AgentKimi          AgentType = "kimi"
-	AgentClaudeAI      AgentType = "claude-ai"
-	AgentChatGPT       AgentType = "chatgpt"
-	AgentKiro          AgentType = "kiro"
-	AgentKiroIDE       AgentType = "kiro-ide"
-	AgentCortex        AgentType = "cortex"
-	AgentHermes        AgentType = "hermes"
-	AgentForge         AgentType = "forge"
-	AgentPiebald       AgentType = "piebald"
-	AgentWarp          AgentType = "warp"
-	AgentPositron      AgentType = "positron"
+	AgentClaude         AgentType = "claude"
+	AgentOpenClaude     AgentType = "openclaude"
+	AgentCowork         AgentType = "cowork"
+	AgentCodex          AgentType = "codex"
+	AgentTraeX          AgentType = "traex"
+	AgentCopilot        AgentType = "copilot"
+	AgentGemini         AgentType = "gemini"
+	AgentGeminiApps     AgentType = "gemini-apps"
+	AgentMiMoCode       AgentType = "mimocode"
+	AgentOpenCode       AgentType = "opencode"
+	AgentOpenCodeReview AgentType = "opencodereview"
+	AgentKilo           AgentType = "kilo"
+	AgentKiloLegacy     AgentType = "kilo-legacy"
+	AgentOpenHands      AgentType = "openhands"
+	AgentCursor         AgentType = "cursor"
+	AgentCursorIDE      AgentType = "cursor-ide"
+	AgentIflow          AgentType = "iflow"
+	AgentAmp            AgentType = "amp"
+	AgentZencoder       AgentType = "zencoder"
+	AgentVSCodeCopilot  AgentType = "vscode-copilot"
+	AgentWindsurf       AgentType = "windsurf"
+	AgentTrae           AgentType = "trae"
+	AgentVSCopilot      AgentType = "visualstudio-copilot"
+	AgentPi             AgentType = "pi"
+	AgentTau            AgentType = "tau"
+	AgentPrimeAgent     AgentType = "prime-agent"
+	AgentOMP            AgentType = "omp"
+	AgentQwen           AgentType = "qwen"
+	AgentCommandCode    AgentType = "commandcode"
+	AgentDeepSeekTUI    AgentType = "deepseek-tui"
+	AgentOpenClaw       AgentType = "openclaw"
+	AgentQClaw          AgentType = "qclaw"
+	AgentKimi           AgentType = "kimi"
+	AgentKimiWork       AgentType = "kimi-work"
+	AgentClaudeAI       AgentType = "claude-ai"
+	AgentChatGPT        AgentType = "chatgpt"
+	AgentKiro           AgentType = "kiro"
+	AgentKiroIDE        AgentType = "kiro-ide"
+	AgentCortex         AgentType = "cortex"
+	AgentHermes         AgentType = "hermes"
+	AgentGrok           AgentType = "grok"
+	AgentGoose          AgentType = "goose"
+	AgentWorkBuddy      AgentType = "workbuddy"
+	AgentForge          AgentType = "forge"
+	AgentDevin          AgentType = "devin"
+	AgentPiebald        AgentType = "piebald"
+	AgentWarp           AgentType = "warp"
+	AgentPositron       AgentType = "positron"
+	AgentPositAssistant AgentType = "posit-assistant"
+	AgentZCode          AgentType = "zcode"
+	AgentAntigravity    AgentType = "antigravity"
+	AgentAntigravityCLI AgentType = "antigravity-cli"
+	AgentVibe           AgentType = "vibe"
+	AgentZed            AgentType = "zed"
+	AgentQwenPaw        AgentType = "qwenpaw"
+	AgentGptme          AgentType = "gptme"
+	AgentQoder          AgentType = "qoder"
+	AgentShelley        AgentType = "shelley"
+	AgentAider          AgentType = "aider"
+	AgentReasonix       AgentType = "reasonix"
+	AgentEvener         AgentType = "evener"
+	AgentIcodemate      AgentType = "icodemate"
+	AgentRooCode        AgentType = "roocode"
+	AgentPoolside       AgentType = "poolside"
+	AgentOmnigent       AgentType = "omnigent"
+	AgentCodebuff       AgentType = "codebuff"
+	AgentFreebuff       AgentType = "freebuff"
 )
+
+const AgentDeepSeekHarness AgentType = "deepseek-harness"
 
 // AgentDef describes a supported coding agent's filesystem
 // layout, configuration keys, and session ID conventions.
 type AgentDef struct {
-	Type         AgentType
-	DisplayName  string   // "Claude Code", "Codex", etc.
-	EnvVar       string   // env var for dir override
-	ConfigKey    string   // TOML key in config.toml ("" = none)
-	DefaultDirs  []string // paths relative to $HOME
-	IDPrefix     string   // session ID prefix ("" for Claude)
-	WatchSubdirs []string // subdirs to watch (nil = watch root)
-	ShallowWatch bool     // true = watch root only, rely on periodic sync for subdirs
-	FileBased    bool     // false for DB-backed agents
+	Type              AgentType
+	DisplayName       string // "Claude Code", "Codex", etc.
+	EnvVar            string // env var for dir override
+	NativeEnvVar      string // native session-dir env var, used when EnvVar is empty
+	DefaultRootEnvVar string // env var that re-roots DefaultDirs before $HOME fallback
+	DefaultRootDir    string // home-relative prefix replaced by the root env (empty = first component)
+	ConfigKey         string // optional legacy top-level TOML directory key
+	// HomesSupported enables [agents.<id>].homes. Each home re-roots
+	// DefaultDirs the same way DefaultRootEnvVar does; roots are additive.
+	HomesSupported bool
+	DefaultDirs    []string // paths relative to $HOME
+	IDPrefix       string   // session ID prefix ("" for Claude)
+	WatchSubdirs   []string // subdirs to watch (nil = watch root)
+	ShallowWatch   bool     // true = watch root only, rely on periodic sync for subdirs
+	FileBased      bool     // false for DB-backed agents
+	Usage          UsageCapabilities
+	// PostAnswerToolWork marks transcript formats that may emit their
+	// user-facing answer before later tool calls in the same turn.
+	PostAnswerToolWork bool
 
-	// DiscoverFunc finds session files under a root directory.
-	// Nil for non-file-based agents.
-	DiscoverFunc func(string) []DiscoveredFile
+	// PeriodicReconcile opts the agent into scheduled scoped reconciliation
+	// when its declared watcher coverage is deliberately non-authoritative,
+	// such as shallow directory watches or bounded database change cursors.
+	// Expensive scheduling inputs default to unsupported.
+	PeriodicReconcile bool
 
-	// FindSourceFunc locates a single session's source file
-	// given a root directory and the raw session ID (prefix
-	// already stripped). Nil for non-file-based agents.
-	FindSourceFunc func(string, string) string
+	// RemoteSyncExcluded keeps every path under the agent's roots out of
+	// remote sync artifacts: resolve scripts, manifests, archives, delta
+	// roots, and tar commands. Set for stores that co-locate transcripts
+	// with secrets or state that cannot be copied safely; each artifact
+	// seam checks it so exclusion fails closed.
+	RemoteSyncExcluded bool
+
+	// WatchRootsFunc resolves the directories to watch for live
+	// updates under a configured root, for agents whose watch
+	// targets depend on the on-disk layout rather than a static
+	// WatchSubdirs list. When set, it takes precedence over
+	// WatchSubdirs. Nil for agents that use WatchSubdirs.
+	WatchRootsFunc func(string) []string
+
+	// ShallowWatchRootsFunc resolves directories to watch shallowly
+	// (root only) for a configured root, in addition to the agent's
+	// normal recursive watch. Used for sibling metadata files that
+	// live outside the session tree, such as Codex's
+	// session_index.jsonl. Nil for agents with no such files.
+	ShallowWatchRootsFunc func(string) []string
+}
+
+type UsageCapabilities struct {
+	NoPerMessageTokenData bool
+	AICreditsDenominated  bool
 }
 
 // Registry lists all supported agents. Order is stable and
 // used for iteration in config, sync, and watcher setup.
 var Registry = []AgentDef{
 	{
-		Type:           AgentClaude,
-		DisplayName:    "Claude Code",
-		EnvVar:         "CLAUDE_PROJECTS_DIR",
-		ConfigKey:      "claude_project_dirs",
-		DefaultDirs:    []string{".claude/projects"},
-		IDPrefix:       "",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverClaudeProjects,
-		FindSourceFunc: FindClaudeSourceFile,
+		Type:              AgentClaude,
+		DisplayName:       "Claude Code",
+		EnvVar:            "CLAUDE_PROJECTS_DIR",
+		DefaultRootEnvVar: "CLAUDE_CONFIG_DIR",
+		ConfigKey:         "claude_project_dirs",
+		HomesSupported:    true,
+		DefaultDirs:       []string{".claude/projects"},
+		IDPrefix:          "",
+		FileBased:         true,
 	},
 	{
-		Type:        AgentCodex,
-		DisplayName: "Codex",
-		EnvVar:      "CODEX_SESSIONS_DIR",
-		ConfigKey:   "codex_sessions_dirs",
+		Type:              AgentOpenClaude,
+		DisplayName:       "OpenClaude",
+		EnvVar:            "OPENCLAUDE_PROJECTS_DIR",
+		DefaultRootEnvVar: "OPENCLAUDE_CONFIG_DIR",
+		ConfigKey:         "openclaude_project_dirs",
+		DefaultDirs:       []string{".openclaude/projects"},
+		IDPrefix:          "openclaude:",
+		FileBased:         true,
+	},
+	{
+		Type:         AgentCowork,
+		DisplayName:  "Claude Cowork",
+		EnvVar:       "COWORK_DIR",
+		ConfigKey:    "cowork_dirs",
+		DefaultDirs:  coworkDefaultDirs(),
+		IDPrefix:     "cowork:",
+		FileBased:    true,
+		ShallowWatch: true,
+	},
+	{
+		Type:              AgentCodex,
+		DisplayName:       "Codex",
+		EnvVar:            "CODEX_SESSIONS_DIR",
+		DefaultRootEnvVar: "CODEX_HOME",
+		ConfigKey:         "codex_sessions_dirs",
+		HomesSupported:    true,
 		DefaultDirs: []string{
 			".codex/sessions",
 			".codex/archived_sessions",
 		},
-		IDPrefix:       "codex:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverCodexSessions,
-		FindSourceFunc: FindCodexSourceFile,
+		IDPrefix:              "codex:",
+		FileBased:             true,
+		ShallowWatchRootsFunc: ResolveCodexShallowWatchRoots,
+		PostAnswerToolWork:    true,
 	},
 	{
-		Type:           AgentCopilot,
-		DisplayName:    "Copilot",
-		EnvVar:         "COPILOT_DIR",
-		ConfigKey:      "copilot_dirs",
-		DefaultDirs:    []string{".copilot"},
-		IDPrefix:       "copilot:",
-		WatchSubdirs:   []string{"session-state"},
-		FileBased:      true,
-		DiscoverFunc:   DiscoverCopilotSessions,
-		FindSourceFunc: FindCopilotSourceFile,
+		// TRAE CLI 2.0 is a closed-source fork of codex-rs and writes
+		// byte-compatible rollout JSONL, so it reuses the Codex parser
+		// through a relabel hook. It is a distinct agent rather than a
+		// Codex source because resuming needs `traex resume` and the two
+		// tools keep separate session archives. Unlike the Trae IDE entry
+		// below, nothing here is encrypted, so remote sync is not excluded.
+		Type:        AgentTraeX,
+		DisplayName: "TraeX",
+		EnvVar:      "TRAEX_SESSIONS_DIR",
+		ConfigKey:   "traex_sessions_dirs",
+		DefaultDirs: []string{
+			".trae/cli/sessions",
+			// `traex archive <id>` moves a rollout out of the dated tree into
+			// this flat directory, exactly as `codex archive` does.
+			".trae/cli/archived_sessions",
+		},
+		IDPrefix:           "traex:",
+		FileBased:          true,
+		PostAnswerToolWork: true,
+		// No ShallowWatchRootsFunc: that hook exists for Codex's sibling
+		// session_index.jsonl, which TraeX never writes. Watching
+		// ~/.trae/cli shallowly would deliver nothing but churn from the
+		// SQLite WALs TRAE CLI keeps there.
 	},
 	{
-		Type:           AgentGemini,
-		DisplayName:    "Gemini",
-		EnvVar:         "GEMINI_DIR",
-		ConfigKey:      "gemini_dirs",
-		DefaultDirs:    []string{".gemini"},
-		IDPrefix:       "gemini:",
-		WatchSubdirs:   []string{"tmp"},
+		Type:         AgentCopilot,
+		DisplayName:  "Copilot",
+		EnvVar:       "COPILOT_DIR",
+		ConfigKey:    "copilot_dirs",
+		DefaultDirs:  []string{".copilot"},
+		IDPrefix:     "copilot:",
+		WatchSubdirs: []string{"session-state"},
+		FileBased:    true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+			AICreditsDenominated:  true,
+		},
+	},
+	{
+		Type:         AgentGemini,
+		DisplayName:  "Gemini",
+		EnvVar:       "GEMINI_DIR",
+		ConfigKey:    "gemini_dirs",
+		DefaultDirs:  []string{".gemini"},
+		IDPrefix:     "gemini:",
+		WatchSubdirs: []string{"tmp"},
+		FileBased:    true,
+	},
+	{
+		Type:        AgentMiMoCode,
+		DisplayName: "MiMoCode",
+		EnvVar:      "MIMOCODE_DIR",
+		ConfigKey:   "mimocode_dirs",
+		DefaultDirs: []string{".local/share/mimocode"},
+		IDPrefix:    "mimocode:",
+		WatchSubdirs: []string{
+			"storage/session_diff",
+			"storage/message",
+			"storage/part",
+		},
 		FileBased:      true,
-		DiscoverFunc:   DiscoverGeminiSessions,
-		FindSourceFunc: FindGeminiSourceFile,
+		WatchRootsFunc: ResolveMiMoCodeWatchRoots,
 	},
 	{
 		Type:        AgentOpenCode,
@@ -125,64 +268,126 @@ var Registry = []AgentDef{
 			"storage/part",
 		},
 		FileBased:      true,
-		DiscoverFunc:   DiscoverOpenCodeSessions,
-		FindSourceFunc: FindOpenCodeSourceFile,
+		WatchRootsFunc: ResolveOpenCodeWatchRoots,
 	},
 	{
-		Type:           AgentOpenHands,
-		DisplayName:    "OpenHands CLI",
-		EnvVar:         "OPENHANDS_CONVERSATIONS_DIR",
-		ConfigKey:      "openhands_dirs",
-		DefaultDirs:    []string{".openhands/conversations"},
-		IDPrefix:       "openhands:",
-		FileBased:      true,
-		ShallowWatch:   true,
-		DiscoverFunc:   DiscoverOpenHandsSessions,
-		FindSourceFunc: FindOpenHandsSourceFile,
+		Type:        AgentOpenCodeReview,
+		DisplayName: "Open Code Review",
+		EnvVar:      "OPENCODEREVIEW_DIR",
+		ConfigKey:   "opencodereview_dirs",
+		DefaultDirs: []string{".opencodereview/sessions"},
+		IDPrefix:    "opencodereview:",
+		FileBased:   true,
 	},
 	{
-		Type:           AgentCursor,
-		DisplayName:    "Cursor",
-		EnvVar:         "CURSOR_PROJECTS_DIR",
-		ConfigKey:      "cursor_project_dirs",
-		DefaultDirs:    []string{".cursor/projects"},
-		IDPrefix:       "cursor:",
+		Type:        AgentKilo,
+		DisplayName: "Kilo",
+		EnvVar:      "KILO_DIR",
+		ConfigKey:   "kilo_dirs",
+		DefaultDirs: []string{".local/share/kilo"},
+		IDPrefix:    "kilo:",
+		WatchSubdirs: []string{
+			"storage/session",
+			"storage/message",
+			"storage/part",
+		},
 		FileBased:      true,
-		DiscoverFunc:   DiscoverCursorSessions,
-		FindSourceFunc: FindCursorSourceFile,
+		WatchRootsFunc: ResolveKiloWatchRoots,
 	},
 	{
-		Type:           AgentAmp,
-		DisplayName:    "Amp",
-		EnvVar:         "AMP_DIR",
-		ConfigKey:      "amp_dirs",
-		DefaultDirs:    []string{".local/share/amp/threads"},
-		IDPrefix:       "amp:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverAmpSessions,
-		FindSourceFunc: FindAmpSourceFile,
+		// Kilo (legacy) is the legacy RooCode-derived VSCode
+		// extension from Kilocode. Sessions live under
+		// <vscode-globalStorage>/kilocode.kilo-code/tasks/<uuid>/
+		// with task_metadata.json (only `files_in_context`), the
+		// Claude-shaped api_conversation_history.json, and the
+		// Cline-shaped ui_messages.json. Default paths use the
+		// lowercase extension id that VSCode actually writes
+		// on disk, not the mixed-case marketplace id.
+		//
+		// LEGACY-ONLY: covers the pre-OpenCode extension
+		// (RooCode-derived). After Kilo rebuilt the extension on an
+		// OpenCode core (beta 2026-03-10, GA 2026-04-02), new
+		// sessions moved to ~/.local/share/kilo/kilo.db — the same
+		// SQLite the Kilo CLI uses — and are tracked by the `kilo`
+		// agent. This agent is frozen at the legacy tasks/<uuid>/
+		// format for historical sessions.
+		Type:        AgentKiloLegacy,
+		DisplayName: "Kilo (legacy)",
+		EnvVar:      "KILO_LEGACY_DIR",
+		ConfigKey:   "kilo_legacy_dirs",
+		DefaultDirs: kiloLegacyDefaultDirs(),
+		IDPrefix:    "kilo-legacy:",
+		FileBased:   true,
+		Usage:       UsageCapabilities{NoPerMessageTokenData: true},
 	},
 	{
-		Type:           AgentZencoder,
-		DisplayName:    "Zencoder",
-		EnvVar:         "ZENCODER_DIR",
-		ConfigKey:      "zencoder_dirs",
-		DefaultDirs:    []string{".zencoder/sessions"},
-		IDPrefix:       "zencoder:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverZencoderSessions,
-		FindSourceFunc: FindZencoderSourceFile,
+		Type:              AgentOpenHands,
+		DisplayName:       "OpenHands CLI",
+		EnvVar:            "OPENHANDS_CONVERSATIONS_DIR",
+		ConfigKey:         "openhands_dirs",
+		DefaultDirs:       []string{".openhands/conversations"},
+		IDPrefix:          "openhands:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
-		Type:           AgentIflow,
-		DisplayName:    "iFlow",
-		EnvVar:         "IFLOW_DIR",
-		ConfigKey:      "iflow_dirs",
-		DefaultDirs:    []string{".iflow/projects"},
-		IDPrefix:       "iflow:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverIflowProjects,
-		FindSourceFunc: FindIflowSourceFile,
+		Type:        AgentCursor,
+		DisplayName: "Cursor",
+		EnvVar:      "CURSOR_PROJECTS_DIR",
+		ConfigKey:   "cursor_project_dirs",
+		DefaultDirs: []string{".cursor/projects"},
+		IDPrefix:    "cursor:",
+		FileBased:   true,
+	},
+	{
+		// Cursor IDE (the GUI editor) is a distinct product from Cursor Agent
+		// (the CLI, see AgentCursor above): it stores every chat session in
+		// one shared VS Code-style global-state SQLite database
+		// (state.vscdb), fanned out into one session per composer addressed
+		// by a "<db>#<composerID>" virtual path.
+		Type:        AgentCursorIDE,
+		DisplayName: "Cursor IDE",
+		EnvVar:      "CURSOR_IDE_DIR",
+		ConfigKey:   "cursor_ide_dirs",
+		DefaultDirs: cursorIDEDefaultDirs(),
+		IDPrefix:    "cursor-ide:",
+		FileBased:   true,
+		// state.vscdb is VS Code's shared global-state database: besides
+		// Cursor's own chat data, its ItemTable co-locates Cursor's live
+		// auth tokens (observed keys cursorAuth/accessToken and
+		// cursorAuth/refreshToken) plus whatever other installed extensions
+		// have stored there, and composerData blobs carry per-composer sync
+		// encryption keys. Remote sync stays disabled until there is an
+		// allowlisted export schema, matching Omnigent's chat.db precedent.
+		RemoteSyncExcluded: true,
+	},
+	{
+		Type:        AgentAmp,
+		DisplayName: "Amp",
+		EnvVar:      "AMP_DIR",
+		ConfigKey:   "amp_dirs",
+		DefaultDirs: []string{".local/share/amp/threads"},
+		IDPrefix:    "amp:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentZencoder,
+		DisplayName: "Zencoder",
+		EnvVar:      "ZENCODER_DIR",
+		ConfigKey:   "zencoder_dirs",
+		DefaultDirs: []string{".zencoder/sessions"},
+		IDPrefix:    "zencoder:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentIflow,
+		DisplayName: "iFlow",
+		EnvVar:      "IFLOW_DIR",
+		ConfigKey:   "iflow_dirs",
+		DefaultDirs: []string{".iflow/projects"},
+		IDPrefix:    "iflow:",
+		FileBased:   true,
 	},
 	{
 		Type:        AgentVSCodeCopilot,
@@ -208,20 +413,125 @@ var Registry = []AgentDef{
 			"workspaceStorage",
 			"globalStorage",
 		},
-		FileBased:      true,
-		DiscoverFunc:   DiscoverVSCodeCopilotSessions,
-		FindSourceFunc: FindVSCodeCopilotSourceFile,
+		FileBased: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+			AICreditsDenominated:  true,
+		},
 	},
 	{
-		Type:           AgentPi,
-		DisplayName:    "Pi",
-		EnvVar:         "PI_DIR",
-		ConfigKey:      "pi_dirs",
-		DefaultDirs:    []string{".pi/agent/sessions"},
-		IDPrefix:       "pi:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverPiSessions,
-		FindSourceFunc: FindPiSourceFile,
+		Type:        AgentWindsurf,
+		DisplayName: "Windsurf",
+		EnvVar:      "WINDSURF_DIR",
+		ConfigKey:   "windsurf_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Roaming/Windsurf/User",
+			"AppData/Roaming/Windsurf - Next/User",
+			// macOS
+			"Library/Application Support/Windsurf/User",
+			"Library/Application Support/Windsurf - Next/User",
+			// Linux
+			".config/Windsurf/User",
+			".config/Windsurf - Next/User",
+		},
+		IDPrefix: "windsurf:",
+		WatchSubdirs: []string{
+			"workspaceStorage",
+		},
+		FileBased: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+			AICreditsDenominated:  true,
+		},
+	},
+	{
+		Type:        AgentTrae,
+		DisplayName: "Trae",
+		EnvVar:      "TRAE_DIR",
+		ConfigKey:   "trae_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Roaming/Trae/User",
+			"AppData/Roaming/Trae CN/User",
+			"AppData/Roaming/TRAE SOLO CN/User",
+			// macOS
+			"Library/Application Support/Trae/User",
+			"Library/Application Support/Trae CN/User",
+			"Library/Application Support/TRAE SOLO CN/User",
+			// Linux
+			".config/Trae/User",
+			".config/Trae CN/User",
+			".config/TRAE SOLO CN/User",
+		},
+		IDPrefix:     "trae:",
+		WatchSubdirs: []string{"workspaceStorage", "globalStorage"},
+		FileBased:    true,
+		Usage:        UsageCapabilities{NoPerMessageTokenData: true},
+		// Trae's modern layout stores sessions as encrypted state that a
+		// remote machine cannot read; shipping it would copy opaque
+		// encrypted blobs.
+		RemoteSyncExcluded: true,
+	},
+	{
+		Type:        AgentVSCopilot,
+		DisplayName: "Visual Studio Copilot",
+		EnvVar:      "VISUALSTUDIO_COPILOT_DIR",
+		ConfigKey:   "visualstudio_copilot_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Local/Temp/VSGitHubCopilotLogs/traces",
+			// macOS
+			"Library/Caches/VSGitHubCopilotLogs/traces",
+			// Linux
+			".cache/VSGitHubCopilotLogs/traces",
+		},
+		IDPrefix:  "visualstudio-copilot:",
+		FileBased: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+			AICreditsDenominated:  true,
+		},
+	},
+	{
+		Type:              AgentPi,
+		DisplayName:       "Pi",
+		EnvVar:            "PI_DIR",
+		NativeEnvVar:      "PI_CODING_AGENT_SESSION_DIR",
+		DefaultRootEnvVar: "PI_CODING_AGENT_DIR",
+		DefaultRootDir:    ".pi/agent",
+		ConfigKey:         "pi_dirs",
+		HomesSupported:    true,
+		DefaultDirs:       []string{".pi/agent/sessions"},
+		IDPrefix:          "pi:",
+		FileBased:         true,
+	},
+	{
+		Type:        AgentTau,
+		DisplayName: "Tau",
+		EnvVar:      "TAU_SESSIONS_DIR",
+		ConfigKey:   "tau_dirs",
+		DefaultDirs: []string{".tau/sessions"},
+		IDPrefix:    "tau:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentPrimeAgent,
+		DisplayName: "Prime Agent",
+		EnvVar:      "PRIME_AGENT_SESSION_DIR",
+		ConfigKey:   "prime_agent_dirs",
+		DefaultDirs: []string{".prime/agent/sessions"},
+		IDPrefix:    "prime-agent:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentOMP,
+		DisplayName: "OhMyPi",
+		EnvVar:      "OMP_DIR",
+		ConfigKey:   "omp_dirs",
+		DefaultDirs: []string{".omp/agent/sessions"},
+		IDPrefix:    "omp:",
+		FileBased:   true,
 	},
 	{
 		Type:        AgentQwen,
@@ -233,31 +543,94 @@ var Registry = []AgentDef{
 		// Sessions live under <projectsDir>/<encoded-project>/chats/<id>.jsonl,
 		// so the projects root must be watched recursively — pinning the
 		// watch to a "chats" subdir of the root catches no events.
-		FileBased:      true,
-		DiscoverFunc:   DiscoverQwenSessions,
-		FindSourceFunc: FindQwenSourceFile,
+		FileBased: true,
 	},
 	{
-		Type:           AgentOpenClaw,
-		DisplayName:    "OpenClaw",
-		EnvVar:         "OPENCLAW_DIR",
-		ConfigKey:      "openclaw_dirs",
-		DefaultDirs:    []string{".openclaw/agents"},
-		IDPrefix:       "openclaw:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverOpenClawSessions,
-		FindSourceFunc: FindOpenClawSourceFile,
+		Type:        AgentCommandCode,
+		DisplayName: "Command Code",
+		EnvVar:      "COMMANDCODE_PROJECTS_DIR",
+		ConfigKey:   "commandcode_project_dirs",
+		DefaultDirs: []string{".commandcode/projects"},
+		IDPrefix:    "commandcode:",
+		FileBased:   true,
 	},
 	{
-		Type:           AgentKimi,
-		DisplayName:    "Kimi",
-		EnvVar:         "KIMI_DIR",
-		ConfigKey:      "kimi_dirs",
-		DefaultDirs:    []string{".kimi/sessions"},
-		IDPrefix:       "kimi:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverKimiSessions,
-		FindSourceFunc: FindKimiSourceFile,
+		Type:        AgentDeepSeekTUI,
+		DisplayName: "DeepSeek TUI",
+		EnvVar:      "DEEPSEEK_TUI_SESSIONS_DIR",
+		ConfigKey:   "deepseek_tui_sessions_dirs",
+		DefaultDirs: []string{
+			".codewhale/sessions",
+			".deepseek/sessions",
+		},
+		IDPrefix:  "deepseek-tui:",
+		FileBased: true,
+	},
+	{
+		Type:              AgentDeepSeekHarness,
+		DisplayName:       "DeepSeek Harness",
+		EnvVar:            "DEEPSEEK_HARNESS_SESSIONS_DIR",
+		DefaultRootEnvVar: "DSH_HOME",
+		ConfigKey:         "deepseek_harness_sessions_dirs",
+		DefaultDirs:       []string{".dsh/sessions"},
+		IDPrefix:          "deepseek-harness:",
+		FileBased:         true,
+	},
+	{
+		Type:        AgentOpenClaw,
+		DisplayName: "OpenClaw",
+		EnvVar:      "OPENCLAW_DIR",
+		ConfigKey:   "openclaw_dirs",
+		DefaultDirs: []string{
+			".openclaw/agents",
+			".kimi_openclaw/agents",
+		},
+		IDPrefix:  "openclaw:",
+		FileBased: true,
+	},
+	{
+		Type:        AgentQClaw,
+		DisplayName: "QClaw",
+		EnvVar:      "QCLAW_DIR",
+		ConfigKey:   "qclaw_dirs",
+		DefaultDirs: []string{".qclaw/agents"},
+		IDPrefix:    "qclaw:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentKimi,
+		DisplayName: "Kimi",
+		EnvVar:      "KIMI_DIR",
+		ConfigKey:   "kimi_dirs",
+		DefaultDirs: []string{
+			".kimi/sessions",
+			".kimi-code/sessions",
+		},
+		IDPrefix:  "kimi:",
+		FileBased: true,
+	},
+	{
+		// Kimi Work (the kimi-desktop app's "daimon" runtime) stores
+		// conversations as kimi-code kernel sessions: wire.jsonl
+		// transcripts under <root>/wd_<workspace>_<hash>/<session>/
+		// agents/<agent>/wire.jsonl. Only conv-* session directories are
+		// user conversations; aux sessions (ctitle-*, sklsum-*, dvlt-*)
+		// are filtered out by the provider.
+		Type:        AgentKimiWork,
+		DisplayName: "Kimi Work",
+		EnvVar:      "KIMI_WORK_DIR",
+		ConfigKey:   "kimi_work_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+			// Linux
+			".config/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+			".local/share/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+			// Windows
+			"AppData/Roaming/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+		},
+		IDPrefix:  "kimi-work:",
+		FileBased: true,
 	},
 	{
 		Type:        AgentClaudeAI,
@@ -272,26 +645,31 @@ var Registry = []AgentDef{
 		FileBased:   false,
 	},
 	{
-		Type:           AgentKiro,
-		DisplayName:    "Kiro",
-		EnvVar:         "KIRO_SESSIONS_DIR",
-		ConfigKey:      "kiro_dirs",
-		DefaultDirs:    []string{".kiro/sessions/cli"},
-		IDPrefix:       "kiro:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverKiroSessions,
-		FindSourceFunc: FindKiroSourceFile,
+		Type:        AgentGeminiApps,
+		DisplayName: "Gemini Apps",
+		IDPrefix:    "gemini-apps:",
+		FileBased:   false,
 	},
 	{
-		Type:           AgentKiroIDE,
-		DisplayName:    "Kiro IDE",
-		EnvVar:         "KIRO_IDE_DIR",
-		ConfigKey:      "kiro_ide_dirs",
-		DefaultDirs:    kiroIDEDefaultDirs(),
-		IDPrefix:       "kiro-ide:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverKiroIDESessions,
-		FindSourceFunc: FindKiroIDESourceFile,
+		Type:        AgentKiro,
+		DisplayName: "Kiro",
+		EnvVar:      "KIRO_SESSIONS_DIR",
+		ConfigKey:   "kiro_dirs",
+		DefaultDirs: []string{
+			".kiro/sessions",
+			".local/share/kiro-cli",
+		},
+		IDPrefix:  "kiro:",
+		FileBased: true,
+	},
+	{
+		Type:        AgentKiroIDE,
+		DisplayName: "Kiro IDE",
+		EnvVar:      "KIRO_IDE_DIR",
+		ConfigKey:   "kiro_ide_dirs",
+		DefaultDirs: kiroIDEDefaultDirs(),
+		IDPrefix:    "kiro-ide:",
+		FileBased:   true,
 	},
 	{
 		Type:        AgentCortex,
@@ -301,21 +679,50 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{
 			".snowflake/cortex/conversations",
 		},
-		IDPrefix:       "cortex:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverCortexSessions,
-		FindSourceFunc: FindCortexSourceFile,
+		IDPrefix:  "cortex:",
+		FileBased: true,
 	},
 	{
-		Type:           AgentHermes,
-		DisplayName:    "Hermes Agent",
-		EnvVar:         "HERMES_SESSIONS_DIR",
-		ConfigKey:      "hermes_sessions_dirs",
-		DefaultDirs:    []string{".hermes/sessions"},
-		IDPrefix:       "hermes:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverHermesSessions,
-		FindSourceFunc: FindHermesSourceFile,
+		Type:                  AgentHermes,
+		DisplayName:           "Hermes Agent",
+		EnvVar:                "HERMES_SESSIONS_DIR",
+		ConfigKey:             "hermes_sessions_dirs",
+		DefaultDirs:           []string{".hermes/sessions"},
+		IDPrefix:              "hermes:",
+		FileBased:             true,
+		WatchRootsFunc:        ResolveHermesWatchRoots,
+		ShallowWatchRootsFunc: ResolveHermesShallowWatchRoots,
+	},
+	{
+		Type:        AgentGrok,
+		DisplayName: "Grok",
+		EnvVar:      "GROK_DIR",
+		ConfigKey:   "grok_dirs",
+		DefaultDirs: []string{".grok/sessions"},
+		IDPrefix:    "grok:",
+		FileBased:   true,
+	},
+	{
+		Type:              AgentGoose,
+		DisplayName:       "Goose",
+		EnvVar:            "GOOSE_PATH_ROOT",
+		ConfigKey:         "goose_dirs",
+		DefaultDirs:       gooseDefaultDirs(),
+		IDPrefix:          "goose:",
+		FileBased:         false,
+		PeriodicReconcile: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+	},
+	{
+		Type:        AgentWorkBuddy,
+		DisplayName: "WorkBuddy",
+		EnvVar:      "WORKBUDDY_PROJECTS_DIR",
+		ConfigKey:   "workbuddy_project_dirs",
+		DefaultDirs: []string{".workbuddy/projects"},
+		IDPrefix:    "workbuddy:",
+		FileBased:   true,
 	},
 	{
 		Type:        AgentForge,
@@ -325,6 +732,18 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".forge"},
 		IDPrefix:    "forge:",
 		FileBased:   false,
+	},
+	{
+		Type:        AgentDevin,
+		DisplayName: "Devin",
+		EnvVar:      "DEVIN_DIR",
+		ConfigKey:   "devin_dirs",
+		DefaultDirs: []string{
+			"Library/Application Support/devin",
+			".local/share/devin",
+		},
+		IDPrefix:  "devin:",
+		FileBased: false,
 	},
 	{
 		Type:        AgentPiebald,
@@ -359,23 +778,262 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{
 			"Library/Application Support/Positron/User",
 		},
-		IDPrefix:       "positron:",
-		WatchSubdirs:   []string{"workspaceStorage"},
-		FileBased:      true,
-		DiscoverFunc:   DiscoverPositronSessions,
-		FindSourceFunc: FindPositronSourceFile,
+		IDPrefix:     "positron:",
+		WatchSubdirs: []string{"workspaceStorage"},
+		FileBased:    true,
 	},
-}
-
-// NonFileBackedAgents returns agent types where FileBased is false.
-func NonFileBackedAgents() []AgentType {
-	var agents []AgentType
-	for _, def := range Registry {
-		if !def.FileBased {
-			agents = append(agents, def.Type)
-		}
-	}
-	return agents
+	{
+		// Posit Assistant (posit-dev/assistant) stores one directory per
+		// conversation under workspaces/<workspaceId>/<conversationId>/,
+		// holding a conversation.json message tree plus an append-only
+		// lm-messages.jsonl transcript. Distinct from the Positron IDE's
+		// built-in Assistant above, which uses VS Code chatSessions files.
+		Type:        AgentPositAssistant,
+		DisplayName: "Posit Assistant",
+		EnvVar:      "POSIT_ASSISTANT_DIR",
+		ConfigKey:   "posit_assistant_dirs",
+		DefaultDirs: []string{".posit/assistant/workspaces"},
+		IDPrefix:    "posit-assistant:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentZCode,
+		DisplayName: "ZCode",
+		EnvVar:      "ZCODE_DIR",
+		ConfigKey:   "zcode_dirs",
+		DefaultDirs: []string{
+			".zcode/cli/db",
+			".zcode/cli",
+		},
+		IDPrefix:  "zcode:",
+		FileBased: false,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+	},
+	{
+		Type:         AgentZed,
+		DisplayName:  "Zed",
+		EnvVar:       "ZED_DIR",
+		ConfigKey:    "zed_dirs",
+		DefaultDirs:  zedDefaultDirs(),
+		IDPrefix:     "zed:",
+		FileBased:    true,
+		WatchSubdirs: []string{"threads"},
+	},
+	{
+		Type:        AgentAntigravity,
+		DisplayName: "Antigravity",
+		EnvVar:      "ANTIGRAVITY_DIR",
+		ConfigKey:   "antigravity_dirs",
+		DefaultDirs: []string{".gemini/antigravity"},
+		IDPrefix:    "antigravity:",
+		WatchSubdirs: []string{
+			"conversations",
+			"brain",
+			"annotations",
+		},
+		FileBased: true,
+	},
+	{
+		Type:        AgentAntigravityCLI,
+		DisplayName: "Antigravity CLI",
+		EnvVar:      "ANTIGRAVITY_CLI_DIR",
+		ConfigKey:   "antigravity_cli_dirs",
+		DefaultDirs: []string{".gemini/antigravity-cli"},
+		IDPrefix:    "antigravity-cli:",
+		WatchSubdirs: []string{
+			"conversations",
+			"implicit",
+			"brain",
+		},
+		FileBased: true,
+	},
+	{
+		Type:        AgentQwenPaw,
+		DisplayName: "QwenPaw",
+		EnvVar:      "QWENPAW_DIR",
+		ConfigKey:   "qwenpaw_dirs",
+		DefaultDirs: []string{".copaw/workspaces"},
+		IDPrefix:    "qwenpaw:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentGptme,
+		DisplayName: "gptme",
+		EnvVar:      "GPTME_DIR",
+		ConfigKey:   "gptme_dirs",
+		DefaultDirs: []string{".local/share/gptme/logs"},
+		IDPrefix:    "gptme:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentQoder,
+		DisplayName: "Qoder",
+		EnvVar:      "QODER_PROJECTS_DIR",
+		ConfigKey:   "qoder_project_dirs",
+		DefaultDirs: qoderDefaultDirs(),
+		IDPrefix:    "qoder:",
+		FileBased:   true,
+	},
+	{
+		// Shelley (exe.dev) stores all conversations in a single
+		// SQLite DB at ~/.config/shelley/shelley.db. Like Zed, each
+		// conversation is addressed by a virtual path (dbPath#id).
+		Type:        AgentShelley,
+		DisplayName: "Shelley",
+		EnvVar:      "SHELLEY_DIR",
+		ConfigKey:   "shelley_dirs",
+		DefaultDirs: []string{".config/shelley"},
+		IDPrefix:    "shelley:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentVibe,
+		DisplayName: "Mistral Vibe",
+		EnvVar:      "VIBE_SESSIONS_DIR",
+		ConfigKey:   "vibe_session_dirs",
+		DefaultDirs: []string{".vibe/logs/session"},
+		IDPrefix:    "vibe:",
+		FileBased:   true,
+	},
+	{
+		// Aider has no central session store. It writes one Markdown
+		// chat log per repo at <repo>/.aider.chat.history.md. There is
+		// no safe canonical root: an always-on $HOME walk is prone to
+		// macOS privacy prompts (Documents/Downloads/Music/Photos) during
+		// passive background refreshes, and to surprising work. Users must
+		// opt in by setting AIDER_DIR or the aider_dirs config key to a
+		// code root they want scanned. A configured broad root such as
+		// $HOME still gets the bounded, symlink-safe, depth-capped,
+		// time-budgeted walk with protected-folder pruning.
+		//
+		// ShallowWatch is true because users can still opt into broad
+		// roots; watch those roots shallowly and rely on the 15-minute
+		// periodic sync to pick up new repos' history files. Aider history
+		// is append-mostly, so this is an acceptable latency tradeoff.
+		Type:              AgentAider,
+		DisplayName:       "Aider",
+		EnvVar:            "AIDER_DIR",
+		ConfigKey:         "aider_dirs",
+		IDPrefix:          "aider:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
+	},
+	{
+		Type:              AgentEvener,
+		DisplayName:       "Evener",
+		EnvVar:            "EVENER_DIR",
+		ConfigKey:         "evener_dirs",
+		DefaultDirs:       []string{".local/state/evener"},
+		IDPrefix:          "evener:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+	},
+	{
+		Type:         AgentReasonix,
+		DisplayName:  "Reasonix",
+		EnvVar:       "REASONIX_DIR",
+		ConfigKey:    "reasonix_dirs",
+		DefaultDirs:  []string{".reasonix", "AppData/Roaming/reasonix"},
+		IDPrefix:     "reasonix:",
+		WatchSubdirs: []string{"sessions", "archive", "projects"},
+		FileBased:    true,
+	},
+	{
+		Type:           AgentIcodemate,
+		DisplayName:    "IcodeMate",
+		EnvVar:         "ICODEMATE_DIR",
+		ConfigKey:      "icodemate_dirs",
+		DefaultDirs:    []string{".local/share/icodemate", ".icodemate/cli/projects"},
+		IDPrefix:       "icodemate:",
+		WatchSubdirs:   []string{"storage/session_diff"},
+		FileBased:      true,
+		WatchRootsFunc: ResolveIcodemateWatchRoots,
+	},
+	{
+		// RooCode (rooveterinaryinc.roo-cline) is a VSCode extension that
+		// stores sessions in VSCode's globalStorage directory under
+		// tasks/<taskId>/. Each task directory holds history_item.json
+		// (metadata) and ui_messages.json (transcript). VSCode
+		// canonicalizes globalStorage directory names to lowercase, so
+		// the default paths must use the lowercase extension ID to be
+		// discoverable on case-sensitive Linux filesystems. RooCode was
+		// shut down on May 15, 2026; ZooCode is the active community fork.
+		Type:        AgentRooCode,
+		DisplayName: "RooCode",
+		EnvVar:      "ROOCODE_DIR",
+		ConfigKey:   "roocode_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+			// Linux
+			".config/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+			// Windows
+			"AppData/Roaming/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+		},
+		IDPrefix:  "roocode:",
+		FileBased: true,
+	},
+	{
+		Type:        AgentPoolside,
+		DisplayName: "Poolside",
+		EnvVar:      "POOLSIDE_DIR",
+		ConfigKey:   "poolside_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/poolside",
+			// Linux
+			".local/state/poolside",
+			// Windows
+			"AppData/Roaming/poolside",
+		},
+		IDPrefix:  "poolside:",
+		FileBased: true,
+	},
+	{
+		// Omnigent stores every conversation in one shared SQLite database
+		// (chat.db); the provider fans it out into one session per conversation
+		// addressed by a "<db>#<id>" virtual path.
+		Type:              AgentOmnigent,
+		DisplayName:       "Omnigent",
+		EnvVar:            "OMNIGENT_DIR",
+		ConfigKey:         "omnigent_dirs",
+		DefaultDirs:       []string{".omnigent"},
+		IDPrefix:          "omnigent:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		// chat.db co-locates transcripts with authentication secrets, and
+		// copying or sanitizing the source database can retain deleted
+		// pages. Remote sync stays disabled until Omnigent has a fresh,
+		// allowlisted export schema.
+		RemoteSyncExcluded: true,
+	},
+	{
+		// Codebuff and Freebuff share the same on-disk layout under
+		// ~/.config/manicode/projects/<project>/chats/<timestamp>/. Each
+		// session directory holds chat-messages.json (primary),
+		// run-state.json (model/token metadata), and chat-meta.json.
+		// Freebuff sessions do carry their own agent type: the parser
+		// sets Agent = AgentFreebuff and emits freebuff:-prefixed IDs
+		// when run-state.json agentType contains "free". Freebuff has
+		// no separate registry entry or provider factory, though; sync
+		// canonicalizes freebuff onto this Codebuff def (AgentByPrefix
+		// maps freebuff: IDs here), which avoids double-discovery and
+		// skip-cache contention over the shared roots.
+		Type:              AgentCodebuff,
+		DisplayName:       "Codebuff",
+		EnvVar:            "CODEBUFF_DIR",
+		ConfigKey:         "codebuff_dirs",
+		DefaultDirs:       []string{".config/manicode/projects"},
+		IDPrefix:          "codebuff:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+	},
 }
 
 // AgentByType returns the AgentDef for the given type.
@@ -386,6 +1044,92 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 		}
 	}
 	return AgentDef{}, false
+}
+
+// RemoteSyncExcludedAgent reports whether the agent's raw source tree must
+// stay out of every remote sync artifact. Unknown agents are not excluded.
+func RemoteSyncExcludedAgent(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && def.RemoteSyncExcluded
+}
+
+// AgentHasPostAnswerToolWork reports whether the agent may continue calling
+// tools after emitting its user-facing answer. Unknown agents return false.
+func AgentHasPostAnswerToolWork(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && def.PostAnswerToolWork
+}
+
+// AgentNameLacksPerMessageTokenData reports whether the named agent
+// records no per-message token data. Names match registry types
+// exactly and unknown names fail closed; CSV filter parsing trims its
+// parts before calling. Freebuff is treated as a Codebuff alias.
+func AgentNameLacksPerMessageTokenData(agent string) bool {
+	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
+	return ok && def.Usage.NoPerMessageTokenData
+}
+
+// AgentNameUsesAICredits reports whether the named agent's cost is
+// denominated in AI credits rather than USD. Freebuff is treated as
+// a Codebuff alias.
+func AgentNameUsesAICredits(agent string) bool {
+	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
+	return ok && def.Usage.AICreditsDenominated
+}
+
+// AgentFilterLacksPerMessageTokenData reports whether a (possibly
+// comma-separated) agent filter selects only agents without
+// per-message token data, with at least one entry.
+func AgentFilterLacksPerMessageTokenData(agentFilter string) bool {
+	return agentFilterMatches(agentFilter, AgentNameLacksPerMessageTokenData)
+}
+
+func agentFilterMatches(agentFilter string, match func(string) bool) bool {
+	matched := false
+	for part := range strings.SplitSeq(agentFilter, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !match(part) {
+			return false
+		}
+		matched = true
+	}
+	return matched
+}
+
+// AgentIsCopilot reports whether t is one of the GitHub Copilot
+// family agents. Copilot-specific user-facing wording keys on this
+// identity; the usage capabilities above intentionally do not imply
+// it, so a future agent can adopt NoPerMessageTokenData or
+// AICreditsDenominated without inheriting Copilot messaging.
+func AgentIsCopilot(t AgentType) bool {
+	switch t {
+	case AgentCopilot, AgentVSCodeCopilot, AgentVSCopilot:
+		return true
+	}
+	return false
+}
+
+// AgentNameIsCopilot reports whether the agent name identifies a
+// Copilot-family agent. Names match exactly, like the capability
+// helpers above.
+func AgentNameIsCopilot(agent string) bool {
+	return AgentIsCopilot(AgentType(agent))
+}
+
+// AgentFilterIsCopilot reports whether a (possibly comma-separated)
+// agent filter selects only Copilot-family agents, with at least one
+// entry.
+func AgentFilterIsCopilot(agentFilter string) bool {
+	return agentFilterMatches(agentFilter, AgentNameIsCopilot)
 }
 
 // StripHostPrefix splits a remote session ID into its host
@@ -408,6 +1152,16 @@ func StripHostPrefix(id string) (host, rawID string) {
 // stripped before matching.
 func AgentByPrefix(sessionID string) (AgentDef, bool) {
 	_, rawID := StripHostPrefix(sessionID)
+	// Freebuff shares the Codebuff provider but emits sessions with the
+	// "freebuff:" prefix. Return a copy with the freebuff prefix so
+	// callers that strip the prefix (FindSourceFile, ProviderNormalizeRawSessionID)
+	// work correctly.
+	if strings.HasPrefix(rawID, string(AgentFreebuff)+":") {
+		if def, ok := AgentByType(AgentCodebuff); ok {
+			def.IDPrefix = string(AgentFreebuff) + ":"
+			return def, true
+		}
+	}
 	for _, def := range Registry {
 		if def.IDPrefix != "" &&
 			strings.HasPrefix(rawID, def.IDPrefix) {
@@ -440,7 +1194,31 @@ type RoleType string
 const (
 	RoleUser      RoleType = "user"
 	RoleAssistant RoleType = "assistant"
+	// RoleSystem and RoleTool are emitted by several parsers (for
+	// system-injected notices and standalone tool-result records) and
+	// persist to the messages table, so they are part of the known
+	// role enum even though the user/assistant pair carries the common
+	// case.
+	RoleSystem RoleType = "system"
+	RoleTool   RoleType = "tool"
 )
+
+// SourceSubtypeToolResult marks a user- or system-role row whose text is tool
+// output rather than something a person or model wrote. Providers that have
+// no separate tool role set it on fallback rows so storage policies that drop
+// tool output can recognize them.
+const SourceSubtypeToolResult = "tool_result"
+
+// Transcript fidelity values for ParsedSession.TranscriptFidelity. Empty
+// is treated as full (no degradation signalled).
+const (
+	TranscriptFidelityFull    = "full"
+	TranscriptFidelitySummary = "summary"
+)
+
+// SessionKindNonInteractive marks a provider session whose durable metadata
+// identifies a non-interactive invocation.
+const SessionKindNonInteractive = "non-interactive"
 
 // FileInfo holds file system metadata for a session source file.
 type FileInfo struct {
@@ -450,39 +1228,84 @@ type FileInfo struct {
 	Inode  int64
 	Device int64
 	Hash   string
+	// ChangeTime is the change time captured from the same descriptor the
+	// parser read its snapshot from. Zero means the platform could not
+	// provide one; checkpoint consumers then rebuild conservatively.
+	ChangeTime int64
 }
 
 // ParsedSession holds session metadata extracted from a JSONL file.
 type ParsedSession struct {
-	ID               string
-	Project          string
-	Machine          string
-	Agent            AgentType
+	ID         string
+	Project    string
+	Machine    string
+	Agent      AgentType
+	AgentLabel string
+	Entrypoint string
+	// SessionKind is a provider-owned top-level session classification marker
+	// (for example, Claude Code "bg" or Grok "non-interactive"); empty for
+	// interactive sessions and for agents that do not emit one.
+	SessionKind      string
 	ParentSessionID  string
 	RelationshipType RelationshipType
 	Cwd              string
 	GitBranch        string
 	SourceSessionID  string
 	SourceVersion    string
-	MalformedLines   int
-	IsTruncated      bool
-	FirstMessage     string
-	DisplayName      string
-	StartedAt        time.Time
-	EndedAt          time.Time
-	MessageCount     int
-	UserMessageCount int
-	File             FileInfo
+	// TranscriptFidelity classifies how complete a stored transcript is
+	// relative to the agent's full session data: "full" when the
+	// high-resolution source was used, "summary" for a degraded/fallback
+	// decode. Empty means full (parser did not classify). Currently set
+	// only by the Antigravity CLI parser.
+	TranscriptFidelity string
+	// GenMetadataWithoutUsage reports whether this Antigravity session's steps
+	// table carried gen_metadata rows but none decoded into a usage event --
+	// an early warning that a newer agy build changed the gen_metadata wire
+	// format the token-block heuristic depends on. Set by both Antigravity
+	// parsers; false for every other agent.
+	GenMetadataWithoutUsage bool
+	MalformedLines          int
+	IsTruncated             bool
+	FirstMessage            string
+	SessionName             string
+	// SessionNamePresent distinguishes an explicitly present provider title
+	// (including a blank title) from no title signal. Codex needs this because
+	// current releases may omit session_index.jsonl entirely, while an older
+	// index entry with a blank thread_name explicitly clears a stored title.
+	SessionNamePresent bool
+	StartedAt          time.Time
+	EndedAt            time.Time
+	MessageCount       int
+	UserMessageCount   int
+	File               FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or
 	// agent format does not yet support classification).
 	TerminationStatus TerminationStatus
 
+	// ClaudeLinearParse reports whether the Claude full parser fell
+	// back to linear processing for this session's file (multi-root or
+	// unresolvable-parent uuid DAG). Linearity is monotonic across
+	// appends, so the incremental parser skips fork detection for
+	// linear-bound sessions. Only set by the Claude parser; nil for
+	// all other agents.
+	ClaudeLinearParse *bool
+
 	TotalOutputTokens    int
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
 	HasPeakContextTokens bool
+
+	// UsageEvents carries parser-emitted aggregate usage rows for
+	// agents whose session-level accounting is computed inline
+	// (e.g. VSCode Copilot). The sync engine forwards these into
+	// the usage_events table for catalog-based cost pricing.
+	UsageEvents []ParsedUsageEvent
+
+	// CountsAuthoritative marks parsers that own MessageCount and
+	// UserMessageCount even when they intentionally emit no transcript rows.
+	CountsAuthoritative bool
 
 	// aggregateTokenPresenceKnown marks session aggregate token
 	// coverage as parser-owned and authoritative.
@@ -496,9 +1319,46 @@ type ParsedToolCall struct {
 	ToolName          string // raw name from session data
 	Category          string // normalized: Read, Edit, Write, Bash, etc.
 	InputJSON         string // raw JSON of the input object
+	FilePath          string // resolved edit/write target path, when known natively
 	SkillName         string // skill name when ToolName is "Skill"
 	SubagentSessionID string // linked subagent session file (e.g. "agent-{task_id}")
 	ResultEvents      []ParsedToolResultEvent
+	// Rendering is the exact text, if any, the parser inlined into the
+	// message content for this call. Storage policies that drop tool inputs
+	// replace it verbatim, so it must match the content byte for byte.
+	Rendering string
+}
+
+// ParsedToolCallPosition identifies one emitted tool-call occurrence by its
+// stable normalized message ordinal and call index.
+type ParsedToolCallPosition struct {
+	MessageOrdinal int
+	CallIndex      int
+}
+
+// ParsedToolCallUpdate carries result events for a tool call that was parsed
+// before the current append-only chunk. TargetKnown is required for safe
+// incremental application when a provider reuses call IDs.
+type ParsedToolCallUpdate struct {
+	ToolUseID      string
+	MessageOrdinal int
+	CallIndex      int
+	TargetKnown    bool
+	ResultEvents   []ParsedToolResultEvent
+}
+
+// ParsedMessageTokenUsageUpdate carries token metadata for an assistant
+// message that was committed before the current append-only chunk. Codex
+// emits a token_count record immediately after a late tool result, so the
+// target assistant message may not be present in the incremental message
+// slice even though its ordinal is known from the stored transcript.
+type ParsedMessageTokenUsageUpdate struct {
+	Ordinal          int
+	TokenUsage       jsontext.Value
+	ContextTokens    int
+	OutputTokens     int
+	HasContextTokens bool
+	HasOutputTokens  bool
 }
 
 // ParsedToolResult holds metadata about a tool result block in a
@@ -512,6 +1372,9 @@ type ParsedToolResult struct {
 // ParsedToolResultEvent is a canonical chronological update attached
 // to a tool call. Used for Codex subagent terminal status updates.
 type ParsedToolResultEvent struct {
+	// RawContentDigest is optional import metadata captured before sanitization.
+	// Sync workers compute it before queuing large bodies for archive writes.
+	RawContentDigest  []byte `json:"-"`
 	ToolUseID         string
 	AgentID           string
 	SubagentSessionID string
@@ -535,8 +1398,12 @@ type ParsedMessage struct {
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
 
-	Model            string
-	TokenUsage       json.RawMessage
+	Model           string
+	ReasoningEffort string
+	// ProviderID identifies the billing provider for this response, such as
+	// Posit Assistant's "positai" managed service or BYO "anthropic".
+	ProviderID       string
+	TokenUsage       jsontext.Value
 	ContextTokens    int
 	OutputTokens     int
 	HasContextTokens bool
@@ -550,8 +1417,13 @@ type ParsedMessage struct {
 	ClaudeMessageID string
 	ClaudeRequestID string
 
-	SourceType        string
-	SourceSubtype     string
+	SourceType    string
+	SourceSubtype string
+	// PromptSource is the Claude Code per-entry prompt-origin marker
+	// on user turns (e.g. "typed", "queued", "system", "sdk"); empty
+	// on older transcripts that predate the field and for agents that
+	// do not emit it.
+	PromptSource      string
 	SourceUUID        string
 	SourceParentUUID  string
 	IsSidechain       bool
@@ -577,12 +1449,13 @@ type ParsedUsageEvent struct {
 	MessageOrdinal           *int
 	Source                   string
 	Model                    string
+	ProviderID               string
 	InputTokens              int
 	OutputTokens             int
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 	ReasoningTokens          int
-	CostUSD                  *float64
+	Cost                     *money.Money
 	CostStatus               string
 	CostSource               string
 	OccurredAt               string
@@ -596,8 +1469,21 @@ func accumulateMessageTokenUsage(
 	sess *ParsedSession,
 	messages []ParsedMessage,
 ) {
+	_ = accumulateMessageTokenUsageContext(
+		context.Background(), sess, messages,
+	)
+}
+
+func accumulateMessageTokenUsageContext(
+	ctx context.Context,
+	sess *ParsedSession,
+	messages []ParsedMessage,
+) error {
 	sess.aggregateTokenPresenceKnown = true
-	for _, m := range messages {
+	for i, m := range messages {
+		if err := contextErrEvery(ctx, i); err != nil {
+			return err
+		}
 		if m.HasOutputTokens {
 			sess.HasTotalOutputTokens = true
 			sess.TotalOutputTokens += m.OutputTokens
@@ -609,6 +1495,82 @@ func accumulateMessageTokenUsage(
 			}
 		}
 	}
+	return ctx.Err()
+}
+
+// applyUsageEventTokenTotals recomputes session token totals from the
+// usage-event set whenever events exist. Callers must only use it when
+// events are a superset of per-message token metadata — true for the
+// Antigravity gen_metadata parsers, where every token-bearing message
+// derives from a gen row that also emits an event and undecodable
+// steps emit events with no message. Deriving totals from events
+// therefore covers transcripts that dropped steps (sidecar wins,
+// undecodable rows) without double counting. Message-derived totals
+// are kept where the events are silent.
+//
+// Peak context counts the full context window per event: fresh input
+// plus cache-creation and cache-read tokens. That keeps event-derived
+// session totals consistent with per-message ContextTokens attribution
+// (input + cacheRead) from parsers whose events carry cache fields,
+// such as the Antigravity CLI sidecar parser.
+func applyUsageEventTokenTotals(
+	sess *ParsedSession,
+	events []ParsedUsageEvent,
+) {
+	totalOutput, hasOutput, peakContext, hasContext :=
+		UsageEventTokenAggregate(events)
+	if hasOutput {
+		sess.HasTotalOutputTokens = true
+		sess.TotalOutputTokens = totalOutput
+	}
+	if hasContext {
+		sess.HasPeakContextTokens = true
+		sess.PeakContextTokens = peakContext
+	}
+}
+
+// UsageEventTokenAggregate is the canonical event-derived token rollup:
+// the sum of POSITIVE per-event output tokens and the peak per-event full
+// context (input + cache-creation + cache-read) where that context is
+// positive, each with a presence flag. It is the single source of truth
+// shared by applyUsageEventTokenTotals (parser side) and the sync layer's
+// post-sanitize aggregate reconciliation, so the two never drift: a value
+// that did not contribute to the stored aggregate (zero or negative) is
+// excluded on both sides, before and after clamping.
+func UsageEventTokenAggregate(
+	events []ParsedUsageEvent,
+) (totalOut int, hasOut bool, peakCtx int, hasCtx bool) {
+	totalOut, hasOut, peakCtx, hasCtx, _ = UsageEventTokenAggregateContext(
+		context.Background(), events,
+	)
+	return
+}
+
+// UsageEventTokenAggregateContext is the bounded form of the canonical
+// event-derived token rollup.
+func UsageEventTokenAggregateContext(
+	ctx context.Context, events []ParsedUsageEvent,
+) (totalOut int, hasOut bool, peakCtx int, hasCtx bool, err error) {
+	for _, ev := range events {
+		if err = ctx.Err(); err != nil {
+			return
+		}
+		if ev.OutputTokens > 0 {
+			hasOut = true
+			totalOut += ev.OutputTokens
+		}
+		context := ev.InputTokens +
+			ev.CacheCreationInputTokens +
+			ev.CacheReadInputTokens
+		if context > 0 {
+			hasCtx = true
+			if context > peakCtx {
+				peakCtx = context
+			}
+		}
+	}
+	err = ctx.Err()
+	return
 }
 
 // InferTokenPresence determines whether context/output tokens were
@@ -628,7 +1590,7 @@ func InferTokenPresence(
 		return hasContext, hasOutput
 	}
 
-	var payload map[string]json.RawMessage
+	var payload map[string]jsontext.Value
 	if err := json.Unmarshal(tokenUsage, &payload); err != nil {
 		return hasContext, hasOutput
 	}
@@ -678,13 +1640,27 @@ func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
 func (s ParsedSession) TokenCoverage(
 	msgs []ParsedMessage,
 ) (bool, bool) {
+	hasTotal, hasPeak, _ := s.TokenCoverageContext(
+		context.Background(), msgs,
+	)
+	return hasTotal, hasPeak
+}
+
+// TokenCoverageContext reports aggregate coverage while allowing bounded
+// transcript preparation to stop between messages.
+func (s ParsedSession) TokenCoverageContext(
+	ctx context.Context, msgs []ParsedMessage,
+) (bool, bool, error) {
 	hasTotal, hasPeak := s.AggregateTokenPresence()
 	for _, m := range msgs {
+		if err := ctx.Err(); err != nil {
+			return false, false, err
+		}
 		msgHasCtx, msgHasOut := m.TokenPresence()
 		hasTotal = hasTotal || msgHasOut
 		hasPeak = hasPeak || msgHasCtx
 	}
-	return hasTotal, hasPeak
+	return hasTotal, hasPeak, ctx.Err()
 }
 
 // ParseResult pairs a parsed session with its messages.
@@ -692,6 +1668,19 @@ type ParseResult struct {
 	Session     ParsedSession
 	Messages    []ParsedMessage
 	UsageEvents []ParsedUsageEvent
+	// Checkpoint is opaque provider continuation state (a parser
+	// checkpoint) that the sync engine persists after this result's
+	// session rows commit, so later appends can resume without rescanning
+	// the transcript prefix. Empty for providers without checkpoints.
+	Checkpoint []byte
+	// CheckpointHashState is the resumable SHA-256 state covering the
+	// parsed snapshot [0, Session.File.Size), captured on the same read
+	// pass as the parse. CheckpointAnchorDigest is the digest of the
+	// snapshot's trailing anchor window. Both are empty for providers
+	// without single-pass hashing; the engine persists them with the
+	// checkpoint so it never re-reads the source after a full parse.
+	CheckpointHashState    []byte
+	CheckpointAnchorDigest string
 }
 
 // InferRelationshipTypes sets RelationshipType on results that have

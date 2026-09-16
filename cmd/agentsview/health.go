@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -10,8 +11,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
+	"github.com/spf13/cobra"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/service"
 )
 
 // HealthConfig configures the `health` command.
@@ -25,29 +27,27 @@ const (
 	maxHealthLimit     = db.MaxSessionLimit
 )
 
-func runHealth(args []string, cfg HealthConfig) {
-	appCfg, err := config.LoadMinimal()
+func runHealth(cmd *cobra.Command, args []string, cfg HealthConfig) {
+	svc, cleanup, err := resolveService(cmd)
 	if err != nil {
-		fatal("loading config: %v", err)
+		fatal("resolving service: %v", err)
 	}
-	applyClassifierConfig(appCfg)
-	database, err := db.Open(appCfg.DBPath)
-	if err != nil {
-		fatal("opening database: %v", err)
-	}
-	defer database.Close()
+	defer cleanup()
 
-	ctx := context.Background()
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	if len(args) == 0 {
-		runHealthList(ctx, database, cfg)
+		runHealthList(ctx, svc, cfg)
 		return
 	}
-	runHealthDetail(ctx, database, args[0], cfg.JSON)
+	runHealthDetail(ctx, svc, args[0], cfg.JSON)
 }
 
 func runHealthList(
-	ctx context.Context, database *db.DB, cfg HealthConfig,
+	ctx context.Context, svc service.SessionService, cfg HealthConfig,
 ) {
 	limit := cfg.Limit
 	if limit <= 0 {
@@ -57,9 +57,7 @@ func runHealthList(
 		limit = maxHealthLimit
 	}
 
-	page, err := database.ListSessions(ctx, db.SessionFilter{
-		Limit: limit,
-	})
+	page, err := svc.List(ctx, healthListFilter(limit))
 	if err != nil {
 		fatal("listing sessions: %v", err)
 	}
@@ -77,10 +75,10 @@ func runHealthList(
 }
 
 func runHealthDetail(
-	ctx context.Context, database *db.DB,
+	ctx context.Context, svc service.SessionService,
 	sessionID string, asJSON bool,
 ) {
-	resolved, err := resolveSessionID(ctx, database, sessionID)
+	resolved, err := resolveHealthSessionID(ctx, svc, sessionID)
 	if err != nil {
 		fatal("resolving session id: %v", err)
 	}
@@ -89,7 +87,7 @@ func runHealthDetail(
 			"session not found: %s\n", sessionID)
 		os.Exit(1)
 	}
-	sess, err := database.GetSessionFull(ctx, resolved)
+	sess, err := svc.Get(ctx, resolved)
 	if err != nil {
 		fatal("getting session: %v", err)
 	}
@@ -103,7 +101,66 @@ func runHealthDetail(
 		writeJSON(os.Stdout, sess)
 		return
 	}
-	printHealthDetail(os.Stdout, *sess)
+	printHealthDetail(os.Stdout, sess.Session)
+}
+
+func healthListFilter(limit int) service.ListFilter {
+	return service.ListFilter{
+		Limit:            limit,
+		IncludeOneShot:   true,
+		IncludeAutomated: true,
+	}
+}
+
+func resolveHealthSessionID(
+	ctx context.Context,
+	svc service.SessionService,
+	partial string,
+) (string, error) {
+	if partial == "" {
+		return "", nil
+	}
+	exactDetail, err := svc.Get(ctx, partial)
+	if err != nil {
+		return "", err
+	}
+	matches, err := svc.FindSessionIDsByPartial(
+		ctx, partial, resolveLookupLimit,
+	)
+	if err != nil {
+		return "", err
+	}
+	if exactDetail != nil {
+		for _, m := range matches {
+			if m != partial && shortID(m) == partial {
+				return "", ambiguousMatchErr(partial, matches)
+			}
+		}
+		return partial, nil
+	}
+	switch len(matches) {
+	case 0:
+		return "", nil
+	case 1:
+		return matches[0], nil
+	}
+
+	exact := ""
+	for _, m := range matches {
+		if m == partial {
+			exact = m
+			break
+		}
+	}
+	if exact != "" {
+		for _, m := range matches {
+			if m != exact && shortID(m) == partial {
+				return "", ambiguousMatchErr(partial, matches)
+			}
+		}
+		return exact, nil
+	}
+	return "", ambiguousMatchErr(partial, matches)
 }
 
 // resolveLookupLimit caps the partial-match query for
@@ -226,6 +283,7 @@ func printHealthDetail(w io.Writer, s db.Session) {
 		s.ConsecutiveFailureMax)
 	fmt.Fprintf(w, "  Final failure streak: %d\n",
 		s.FinalFailureStreak)
+	fmt.Fprintf(w, "  Secret findings:      %d\n", s.SecretLeakCount)
 	fmt.Fprintf(w, "  Compactions:          %s\n",
 		formatCompactions(
 			s.CompactionCount, s.MidTaskCompactionCount,
@@ -364,9 +422,8 @@ func shortID(id string) string {
 }
 
 func writeJSON(w io.Writer, v any) {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
+	enc := jsontext.NewEncoder(w, jsontext.WithIndent("  "))
+	if err := json.MarshalEncode(enc, v); err != nil {
 		fatal("encoding json: %v", err)
 	}
 }

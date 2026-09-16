@@ -4,18 +4,18 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/service"
-	"github.com/wesm/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/sync"
 )
 
 func newSessionSyncCommand() *cobra.Command {
@@ -25,56 +25,36 @@ func newSessionSyncCommand() *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if remote, _ := cmd.Flags().GetString("server"); remote != "" {
-				return errors.New("--server not yet implemented")
-			}
-			cfg, err := config.LoadPFlags(cmd.Flags())
-			if err != nil {
-				return fmt.Errorf("loading config: %w", err)
-			}
-			tr, err := detectTransport(cfg.DataDir, 0)
-			if err != nil {
-				return err
-			}
-			if tr.Mode == transportHTTP && tr.ReadOnly {
-				return fmt.Errorf(
-					"daemon at %s is read-only (pg serve); cannot sync: "+
-						"stop 'pg serve' and run 'agentsview sync' against "+
-						"the local DB, or start a local daemon",
-					tr.URL,
-				)
-			}
-			if tr.Mode == transportDirect && tr.DirectReadOnly {
-				// A daemon is active but its TCP probe failed.
-				// Opening a writable engine here would race the
-				// daemon for SQLite write ownership, so refuse
-				// rather than compete.
-				return errors.New(
-					"local daemon is active but not responding; " +
-						"refusing to sync directly to avoid competing " +
-						"for write ownership. Retry once the daemon " +
-						"is reachable, or stop it to sync locally",
-				)
-			}
-
-			svc, cleanup, err := syncService(cfg, tr)
+			svc, cleanup, err := resolveFreshWritableService(cmd)
 			if err != nil {
 				return err
 			}
 			defer cleanup()
 
-			detail, err := svc.Sync(cmd.Context(), classifySyncArg(args[0]))
+			detail, err := svc.Sync(
+				cmd.Context(), classifySyncArgForCommand(cmd, args[0]),
+			)
 			if err != nil {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(detail)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), detail)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "synced: %s\n",
 				sanitizeTerminal(detail.ID))
 			return nil
 		},
 	}
+}
+
+func classifySyncArgForCommand(
+	cmd *cobra.Command, arg string,
+) service.SyncInput {
+	remote, _ := cmd.Flags().GetString("server")
+	if remote != "" && looksLikePath(arg) {
+		return service.SyncInput{Path: arg}
+	}
+	return classifySyncArg(arg)
 }
 
 // syncService resembles newService but constructs a real
@@ -89,16 +69,26 @@ func syncService(
 		return service.NewHTTPBackend(tr.URL, cfg.AuthToken, tr.ReadOnly),
 			func() {}, nil
 	}
-	applyClassifierConfig(cfg)
-	d, err := db.Open(cfg.DBPath)
+	d, lock, err := openWriteDB(context.Background(), cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening db: %w", err)
 	}
 	engine := sync.NewEngine(d, sync.EngineConfig{
-		AgentDirs: cfg.AgentDirs,
-		Machine:   "local",
+		AgentDirs:          cfg.AgentDirs,
+		SourceMachines:     cfg.SourceMachines,
+		ProviderMetadata:   cfg.ProviderMetadata,
+		DisabledAgents:     cfg.DisabledAgents,
+		IncludeCwdPrefixes: cfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths: cfg.ScanProtectedPaths,
+		Machine:            cfg.InstallationID,
+		ArchiveContent:     cfg.ArchiveContent,
 	})
-	cleanup := func() { d.Close() }
+	// Close the engine before the DB so pending debounced signal
+	// recomputes flush while the DB is still open.
+	cleanup := func() {
+		engine.Close()
+		closeWriteDB(d, lock)
+	}
 	return service.NewDirectBackend(d, engine), cleanup, nil
 }
 

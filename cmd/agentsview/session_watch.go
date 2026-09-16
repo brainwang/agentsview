@@ -3,7 +3,8 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 
 	"github.com/spf13/cobra"
 )
@@ -15,6 +16,11 @@ func newSessionWatchCommand() *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := rejectFormatFlags(
+				cmd, "session watch", "NDJSON",
+			); err != nil {
+				return err
+			}
 			svc, cleanup, err := resolveService(cmd)
 			if err != nil {
 				return err
@@ -29,9 +35,9 @@ func newSessionWatchCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc := jsontext.NewEncoder(cmd.OutOrStdout())
 			for ev := range ch {
-				if err := enc.Encode(ev); err != nil {
+				if err := json.MarshalEncode(enc, ev); err != nil {
 					return err
 				}
 			}

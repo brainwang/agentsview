@@ -2,24 +2,23 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/parser"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
-// newTestDB opens a fresh SQLite DB in a temp dir for a single test.
+// newTestDB opens a fresh SQLite DB for a single test.
 func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	d, err := db.Open(path)
-	if err != nil {
-		t.Fatalf("opening test db: %v", err)
-	}
-	t.Cleanup(func() { d.Close() })
-	return d
+	return dbtest.OpenTestDB(t)
 }
 
 // upsertSession inserts a session with minimal required fields.
@@ -37,9 +36,7 @@ func upsertSession(
 	if startedAt != "" {
 		s.StartedAt = &startedAt
 	}
-	if err := d.UpsertSession(s); err != nil {
-		t.Fatalf("upsert %s: %v", id, err)
-	}
+	require.NoError(t, d.UpsertSession(s), "upsert %s", id)
 }
 
 func TestResolveSessionID_PrefixedInput_NoEvidence_UnchangedNotKnown(t *testing.T) {
@@ -53,12 +50,8 @@ func TestResolveSessionID_PrefixedInput_NoEvidence_UnchangedNotKnown(t *testing.
 	// missing source file.
 	input := "codex:019d5490-fe31-7e62-838c-8ba4193f245d"
 	got, known := resolveRawSessionID(ctx, d, nil, input)
-	if got != input {
-		t.Errorf("got %q, want %q", got, input)
-	}
-	if known {
-		t.Errorf("known = true, want false (no evidence)")
-	}
+	assert.Equal(t, input, got)
+	assert.False(t, known, "known should be false (no evidence)")
 }
 
 func TestResolveSessionID_HostPrefixedInput_ReturnedUnchanged(t *testing.T) {
@@ -69,12 +62,8 @@ func TestResolveSessionID_HostPrefixedInput_ReturnedUnchanged(t *testing.T) {
 	// resolution short-circuits without touching DB or disk.
 	input := "other-host~codex:abc-123"
 	got, known := resolveRawSessionID(ctx, d, nil, input)
-	if got != input {
-		t.Errorf("got %q, want %q", got, input)
-	}
-	if !known {
-		t.Errorf("known = false, want true (host-prefixed)")
-	}
+	assert.Equal(t, input, got)
+	assert.True(t, known, "known should be true (host-prefixed)")
 }
 
 func TestResolveSessionID_BareClaudeUUID_ExactMatch(t *testing.T) {
@@ -87,12 +76,8 @@ func TestResolveSessionID_BareClaudeUUID_ExactMatch(t *testing.T) {
 	upsertSession(t, d, id, "claude", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, id)
-	if got != id {
-		t.Errorf("got %q, want %q", got, id)
-	}
-	if !known {
-		t.Errorf("known = false, want true (DB match)")
-	}
+	assert.Equal(t, id, got)
+	assert.True(t, known, "known should be true (DB match)")
 }
 
 func TestResolveSessionID_BareCodexUUID_ResolvesToPrefixed(t *testing.T) {
@@ -104,12 +89,8 @@ func TestResolveSessionID_BareCodexUUID_ResolvesToPrefixed(t *testing.T) {
 	upsertSession(t, d, stored, "codex", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, bare)
-	if got != stored {
-		t.Errorf("got %q, want %q", got, stored)
-	}
-	if !known {
-		t.Errorf("known = false, want true (DB match)")
-	}
+	assert.Equal(t, stored, got)
+	assert.True(t, known, "known should be true (DB match)")
 }
 
 func TestResolveSessionID_Ambiguous_MostRecentWins(t *testing.T) {
@@ -123,12 +104,8 @@ func TestResolveSessionID_Ambiguous_MostRecentWins(t *testing.T) {
 	upsertSession(t, d, "amp:"+bare, "amp", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, bare)
-	if got != "amp:"+bare {
-		t.Errorf("got %q, want amp:%s (most recent)", got, bare)
-	}
-	if !known {
-		t.Errorf("known = false, want true")
-	}
+	assert.Equal(t, "amp:"+bare, got, "most recent should win")
+	assert.True(t, known)
 }
 
 func TestResolveSessionID_NotInDB_FoundOnDisk(t *testing.T) {
@@ -140,25 +117,17 @@ func TestResolveSessionID_NotInDB_FoundOnDisk(t *testing.T) {
 	codexDir := filepath.Join(t.TempDir(), "codex-sessions")
 	bare := "33333333-3333-3333-3333-333333333333"
 	dayDir := filepath.Join(codexDir, "2026", "04", "17")
-	if err := os.MkdirAll(dayDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
+	require.NoError(t, os.MkdirAll(dayDir, 0o755), "mkdir")
 	fname := "rollout-2026-04-17T10-00-00-" + bare + ".jsonl"
 	fpath := filepath.Join(dayDir, fname)
-	if err := os.WriteFile(fpath, []byte("{}\n"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	require.NoError(t, os.WriteFile(fpath, []byte("{}\n"), 0o644), "write")
 
 	agentDirs := map[parser.AgentType][]string{
 		parser.AgentCodex: {codexDir},
 	}
 	got, known := resolveRawSessionID(ctx, d, agentDirs, bare)
-	if got != "codex:"+bare {
-		t.Errorf("got %q, want codex:%s (disk probe)", got, bare)
-	}
-	if !known {
-		t.Errorf("known = false, want true (disk probe found match)")
-	}
+	assert.Equal(t, "codex:"+bare, got, "disk probe")
+	assert.True(t, known, "disk probe found match")
 }
 
 func TestResolveSessionID_NotFoundAnywhere_PassThrough(t *testing.T) {
@@ -167,12 +136,8 @@ func TestResolveSessionID_NotFoundAnywhere_PassThrough(t *testing.T) {
 
 	bare := "44444444-4444-4444-4444-444444444444"
 	got, known := resolveRawSessionID(ctx, d, nil, bare)
-	if got != bare {
-		t.Errorf("got %q, want %q (pass-through)", got, bare)
-	}
-	if known {
-		t.Errorf("known = true, want false (nothing found)")
-	}
+	assert.Equal(t, bare, got, "pass-through")
+	assert.False(t, known, "known should be false (nothing found)")
 }
 
 func TestResolveSessionID_BareClaudeAndPrefixedSameUUID_ClaudeExactWins(t *testing.T) {
@@ -187,12 +152,8 @@ func TestResolveSessionID_BareClaudeAndPrefixedSameUUID_ClaudeExactWins(t *testi
 	upsertSession(t, d, "codex:"+bare, "codex", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, bare)
-	if got != bare {
-		t.Errorf("got %q, want %q (exact claude match)", got, bare)
-	}
-	if !known {
-		t.Errorf("known = false, want true")
-	}
+	assert.Equal(t, bare, got, "exact claude match")
+	assert.True(t, known)
 }
 
 func TestResolveSessionID_ExactMatchWinsOverNewerCollisions(t *testing.T) {
@@ -211,13 +172,9 @@ func TestResolveSessionID_ExactMatchWinsOverNewerCollisions(t *testing.T) {
 		"2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, bare)
-	if got != bare {
-		t.Errorf("got %q, want %q (exact match must beat "+
-			"newer suffix collisions)", got, bare)
-	}
-	if !known {
-		t.Errorf("known = false, want true")
-	}
+	assert.Equal(t, bare, got,
+		"exact match must beat newer suffix collisions")
+	assert.True(t, known)
 }
 
 func TestResolveSessionID_KimiRawID_ResolvesToPrefixed(t *testing.T) {
@@ -231,12 +188,8 @@ func TestResolveSessionID_KimiRawID_ResolvesToPrefixed(t *testing.T) {
 	upsertSession(t, d, stored, "kimi", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, raw)
-	if got != stored {
-		t.Errorf("got %q, want %q (kimi raw ID resolves)", got, stored)
-	}
-	if !known {
-		t.Errorf("known = false, want true")
-	}
+	assert.Equal(t, stored, got, "kimi raw ID resolves")
+	assert.True(t, known)
 }
 
 func TestResolveSessionID_OpenClawRawID_ResolvesToPrefixed(t *testing.T) {
@@ -249,13 +202,8 @@ func TestResolveSessionID_OpenClawRawID_ResolvesToPrefixed(t *testing.T) {
 	upsertSession(t, d, stored, "openclaw", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, raw)
-	if got != stored {
-		t.Errorf("got %q, want %q (openclaw raw ID resolves)",
-			got, stored)
-	}
-	if !known {
-		t.Errorf("known = false, want true")
-	}
+	assert.Equal(t, stored, got, "openclaw raw ID resolves")
+	assert.True(t, known)
 }
 
 func TestResolveSessionID_CanonicalKimiID_ResolvesWhenInDB(t *testing.T) {
@@ -270,12 +218,8 @@ func TestResolveSessionID_CanonicalKimiID_ResolvesWhenInDB(t *testing.T) {
 	upsertSession(t, d, input, "kimi", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, input)
-	if got != input {
-		t.Errorf("got %q, want %q (exact DB match)", got, input)
-	}
-	if !known {
-		t.Errorf("known = false, want true (exact DB match)")
-	}
+	assert.Equal(t, input, got, "exact DB match")
+	assert.True(t, known, "exact DB match")
 }
 
 func TestResolveSessionID_CanonicalCodexID_OnDiskNotInDB(t *testing.T) {
@@ -283,33 +227,149 @@ func TestResolveSessionID_CanonicalCodexID_OnDiskNotInDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Canonical "codex:<uuid>" not yet synced but present on
-	// disk must resolve via the canonical disk probe — which
-	// strips the prefix before calling FindSourceFunc (the
-	// underlying finder rejects colon-bearing IDs).
+	// disk must resolve via the canonical disk probe, which strips
+	// the prefix before asking the agent source lookup.
 	codexDir := filepath.Join(t.TempDir(), "codex-sessions")
 	uuid := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	dayDir := filepath.Join(codexDir, "2026", "04", "17")
-	if err := os.MkdirAll(dayDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
+	require.NoError(t, os.MkdirAll(dayDir, 0o755), "mkdir")
 	fname := "rollout-2026-04-17T10-00-00-" + uuid + ".jsonl"
-	if err := os.WriteFile(
+	require.NoError(t, os.WriteFile(
 		filepath.Join(dayDir, fname), []byte("{}\n"), 0o644,
-	); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	), "write")
 
 	agentDirs := map[parser.AgentType][]string{
 		parser.AgentCodex: {codexDir},
 	}
 	input := "codex:" + uuid
 	got, known := resolveRawSessionID(ctx, d, agentDirs, input)
-	if got != input {
-		t.Errorf("got %q, want %q (canonical on disk)", got, input)
+	assert.Equal(t, input, got, "canonical on disk")
+	assert.True(t, known, "canonical disk probe")
+}
+
+func TestResolveSessionID_ProviderAuthoritativeCursorOnDiskNotInDB(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	cursorDir := t.TempDir()
+	rawID := "provider-cursor"
+	transcriptPath := filepath.Join(
+		cursorDir,
+		"Users-fiona-Documents-demo",
+		"agent-transcripts",
+		rawID+".jsonl",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(transcriptPath), 0o755))
+	require.NoError(t, os.WriteFile(
+		transcriptPath,
+		[]byte(`{"role":"user","content":"hi"}`+"\n"),
+		0o644,
+	))
+
+	agentDirs := map[parser.AgentType][]string{
+		parser.AgentCursor: {cursorDir},
 	}
-	if !known {
-		t.Errorf("known = false, want true (canonical disk probe)")
+	got, known := resolveRawSessionID(ctx, d, agentDirs, rawID)
+	assert.Equal(t, "cursor:"+rawID, got,
+		"provider FindSource should resolve unsynced raw cursor IDs")
+	assert.True(t, known, "provider disk probe")
+
+	got, known = resolveRawSessionID(ctx, d, agentDirs, "cursor:"+rawID)
+	assert.Equal(t, "cursor:"+rawID, got,
+		"canonical provider ID should resolve via provider FindSource")
+	assert.True(t, known, "canonical provider disk probe")
+}
+
+func TestResolveSessionID_DevinCanonicalID_OnDiskNotInDB(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	root := t.TempDir()
+	cliDir := filepath.Join(root, "cli")
+	transcriptsDir := filepath.Join(cliDir, "transcripts")
+	require.NoError(t, os.MkdirAll(transcriptsDir, 0o755))
+	dbPath := filepath.Join(cliDir, "sessions.db")
+	devinDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, devinDB.Close()) })
+	_, err = devinDB.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			working_directory TEXT,
+			model TEXT,
+			created_at INTEGER,
+			last_activity_at INTEGER,
+			main_chain_id INTEGER,
+			hidden INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO sessions
+			(id, title, working_directory, model, created_at, last_activity_at, hidden)
+		VALUES
+			('session-123', 'Devin session', '/cwd/devin', 'devin-1', 1700000000000, 1700000001000, 0);
+	`)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(transcriptsDir, "session-123.json"),
+		[]byte(`{"messages":[]}`+"\n"),
+		0o644,
+	))
+
+	agentDirs := map[parser.AgentType][]string{
+		parser.AgentDevin: {root},
 	}
+	got, known := resolveRawSessionID(ctx, d, agentDirs, "devin:session-123")
+	assert.Equal(t, "devin:session-123", got)
+	assert.True(t, known,
+		"provider-backed Devin IDs should resolve via FindSource even though FileBased is false")
+}
+
+func TestResolveSessionID_GooseOnDiskNotInDB(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "data", "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	dbPath := filepath.Join(sessionsDir, parser.GooseDBName)
+	gooseDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, gooseDB.Close()) })
+	_, err = gooseDB.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			working_dir TEXT NOT NULL,
+			created_at TIMESTAMP,
+			updated_at TIMESTAMP
+		);
+		CREATE TABLE messages (
+			id INTEGER PRIMARY KEY,
+			message_id TEXT,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content_json TEXT NOT NULL,
+			created_timestamp INTEGER NOT NULL,
+			timestamp TIMESTAMP,
+			tokens INTEGER,
+			metadata_json TEXT
+		);
+		INSERT INTO sessions (id, working_dir, created_at, updated_at)
+		VALUES ('session-123', '/cwd/goose', '2026-08-03 10:00:00', '2026-08-03 10:01:00');
+	`)
+	require.NoError(t, err)
+
+	agentDirs := map[parser.AgentType][]string{
+		parser.AgentGoose: {root},
+	}
+	got, known := resolveRawSessionID(ctx, d, agentDirs, "session-123")
+	assert.Equal(t, "goose:session-123", got)
+	assert.True(t, known,
+		"provider-backed Goose raw IDs should resolve before archive sync")
+
+	got, known = resolveRawSessionID(ctx, d, agentDirs, "goose:session-123")
+	assert.Equal(t, "goose:session-123", got)
+	assert.True(t, known,
+		"provider-backed Goose canonical IDs should resolve before archive sync")
 }
 
 func TestResolveSessionID_RawOpenClawCollidesWithCodexPrefix(t *testing.T) {
@@ -328,13 +388,9 @@ func TestResolveSessionID_RawOpenClawCollidesWithCodexPrefix(t *testing.T) {
 		"2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, raw)
-	if got != stored {
-		t.Errorf("got %q, want %q (raw openclaw must beat "+
-			"canonical-prefix short-circuit)", got, stored)
-	}
-	if !known {
-		t.Errorf("known = false, want true")
-	}
+	assert.Equal(t, stored, got,
+		"raw openclaw must beat canonical-prefix short-circuit")
+	assert.True(t, known)
 }
 
 func TestResolveSessionID_UnderscoreID_NoFalseMatch(t *testing.T) {
@@ -354,47 +410,52 @@ func TestResolveSessionID_UnderscoreID_NoFalseMatch(t *testing.T) {
 	upsertSession(t, d, real, "codex", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, raw)
-	if got != real {
-		t.Errorf("got %q, want %q (underscore is literal)",
-			got, real)
-	}
-	if !known {
-		t.Errorf("known = false, want true")
+	assert.Equal(t, real, got, "underscore is literal")
+	assert.True(t, known)
+}
+
+func TestAgentHasDiskSourceLookupIncludesProviderAuthoritativeAgents(t *testing.T) {
+	for _, agent := range []parser.AgentType{
+		parser.AgentGptme,
+		parser.AgentPi,
+		parser.AgentOMP,
+		parser.AgentWorkBuddy,
+		parser.AgentCortex,
+		parser.AgentKimi,
+		parser.AgentQwenPaw,
+		parser.AgentOpenHands,
+		parser.AgentCursor,
+		parser.AgentDevin,
+		parser.AgentGoose,
+		parser.AgentWarp,
+		parser.AgentVibe,
+		parser.AgentClaude,
+		parser.AgentCowork,
+		parser.AgentHermes,
+	} {
+		def, ok := parser.AgentByType(agent)
+		require.True(t, ok, "agent %s", agent)
+		assert.True(t, agentHasDiskSourceLookup(def),
+			"token-use source probe must include %s", agent)
 	}
 }
 
-func TestTokenUseExitCode_Found(t *testing.T) {
-	sess := &db.Session{
-		ID:                   "codex:xxx",
-		HasTotalOutputTokens: true,
-		TotalOutputTokens:    100,
-	}
-	if got := tokenUseExitCode(sess); got != 0 {
-		t.Errorf("got %d, want 0", got)
-	}
+func TestUsageExitCode_TokenData(t *testing.T) {
+	u := &db.SessionUsage{HasTokenData: true}
+	assert.Equal(t, tokenUseExitOK, usageExitCode(u))
 }
 
-func TestTokenUseExitCode_NoData(t *testing.T) {
-	sess := &db.Session{ID: "codex:xxx"}
-	if got := tokenUseExitCode(sess); got != 3 {
-		t.Errorf("got %d, want 3", got)
-	}
+func TestUsageExitCode_CostOnly(t *testing.T) {
+	u := &db.SessionUsage{HasTokenData: false, HasCost: true}
+	assert.Equal(t, tokenUseExitOK, usageExitCode(u),
+		"cost-only must not be exit 3")
 }
 
-func TestTokenUseExitCode_NotFound(t *testing.T) {
-	if got := tokenUseExitCode(nil); got != 2 {
-		t.Errorf("got %d, want 2", got)
-	}
+func TestUsageExitCode_NoData(t *testing.T) {
+	u := &db.SessionUsage{}
+	assert.Equal(t, tokenUseExitNoTokenData, usageExitCode(u))
 }
 
-func TestTokenUseExitCode_PeakContextOnly(t *testing.T) {
-	// Having only peak_context token data is still "has data".
-	sess := &db.Session{
-		ID:                   "claude:xxx",
-		HasPeakContextTokens: true,
-		PeakContextTokens:    50000,
-	}
-	if got := tokenUseExitCode(sess); got != 0 {
-		t.Errorf("got %d, want 0", got)
-	}
+func TestUsageExitCode_NotFound(t *testing.T) {
+	assert.Equal(t, tokenUseExitNotFound, usageExitCode(nil))
 }

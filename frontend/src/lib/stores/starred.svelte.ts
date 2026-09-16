@@ -1,4 +1,4 @@
-import * as api from "../api/client.js";
+import { StarredService } from "../api/generated/index";
 
 const STORAGE_KEY = "agentsview-starred-sessions";
 
@@ -32,7 +32,7 @@ class StarredStore {
     const mutVer = this.mutationVersion;
     const rid = ++this.refreshId;
     try {
-      const res = await api.listStarred();
+      const res = await StarredService.getApiV1Starred();
       if (this.mutationVersion === mutVer && this.refreshId === rid) {
         this.ids = new Set(res.session_ids);
       }
@@ -97,7 +97,7 @@ class StarredStore {
       const mutVer = this.mutationVersion;
       const rid = ++this.refreshId;
       try {
-        await api.bulkStarSessions(toMigrate);
+        await StarredService.postApiV1StarredBulk({ session_ids: toMigrate });
       } catch {
         // Bulk star failed — merge into memory and preserve
         // localStorage for retry on next page reload.
@@ -110,7 +110,7 @@ class StarredStore {
       // stale IDs are never re-migrated on a later reload.
       clearLocalStorage();
       try {
-        const refreshed = await api.listStarred();
+        const refreshed = await StarredService.getApiV1Starred();
         if (this.mutationVersion === mutVer && this.refreshId === rid) {
           this.ids = new Set(refreshed.session_ids);
         }
@@ -146,7 +146,11 @@ class StarredStore {
     next.add(sessionId);
     this.ids = next;
     this.mutationVersion++;
-    this.enqueue(sessionId, () => api.starSession(sessionId));
+    this.enqueue(sessionId, () => {
+      return StarredService.putApiV1SessionsByIdStar({
+        id: sessionId,
+      });
+    });
   }
 
   unstar(sessionId: string) {
@@ -158,17 +162,24 @@ class StarredStore {
     // Mirror into localStorage while the legacy key exists so
     // a migration retry doesn't re-star this session.
     removeFromLocalStorage(sessionId);
-    this.enqueue(sessionId, () => api.unstarSession(sessionId));
+    this.enqueue(sessionId, () => {
+      return StarredService.deleteApiV1SessionsByIdStar({
+        id: sessionId,
+      });
+    });
   }
 
-  private enqueue(
-    sessionId: string,
-    op: () => Promise<unknown>,
-  ) {
+  private enqueue(sessionId: string, op: () => Promise<unknown>) {
     const prev = this.queues.get(sessionId) ?? Promise.resolve();
     const chain: Promise<void> = prev
-      .then(() => op(), () => op())
-      .then(() => {}, () => {})
+      .then(
+        () => op(),
+        () => op(),
+      )
+      .then(
+        () => {},
+        () => {},
+      )
       .then(() => {
         if (this.queues.get(sessionId) === chain) {
           this.queues.delete(sessionId);
@@ -188,13 +199,15 @@ class StarredStore {
     if (this.queues.size > 0) return;
     const mutVer = this.mutationVersion;
     const rid = ++this.refreshId;
-    api.listStarred().then((res) => {
-      if (this.mutationVersion === mutVer && this.refreshId === rid) {
-        this.ids = new Set(res.session_ids);
-      }
-    }).catch(() => {
-      // Server unavailable; keep optimistic state.
-    });
+    StarredService.getApiV1Starred()
+      .then((res) => {
+        if (this.mutationVersion === mutVer && this.refreshId === rid) {
+          this.ids = new Set(res.session_ids);
+        }
+      })
+      .catch(() => {
+        // Server unavailable; keep optimistic state.
+      });
   }
 
   /**
@@ -212,17 +225,16 @@ class StarredStore {
       this.reconcileTimer = null;
       const mutVer = this.mutationVersion;
       const rid = ++this.refreshId;
-      api.listStarred().then((res) => {
-        if (
-          this.mutationVersion === mutVer &&
-          this.refreshId === rid
-        ) {
-          this.ids = new Set(res.session_ids);
-        }
-        this.reconcileRetries = 0;
-      }).catch(() => {
-        this.scheduleReconcile();
-      });
+      StarredService.getApiV1Starred()
+        .then((res) => {
+          if (this.mutationVersion === mutVer && this.refreshId === rid) {
+            this.ids = new Set(res.session_ids);
+          }
+          this.reconcileRetries = 0;
+        })
+        .catch(() => {
+          this.scheduleReconcile();
+        });
     }, delay);
   }
 

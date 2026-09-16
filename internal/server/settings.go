@@ -1,22 +1,38 @@
 package server
 
 import (
-	"encoding/json"
-	"log"
-	"net/http"
+	"github.com/danielgtaylor/huma/v2"
 
-	"github.com/wesm/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // settingsResponse is the JSON shape returned by GET /api/v1/settings.
 type settingsResponse struct {
-	AgentDirs        map[string][]string `json:"agent_dirs"`
-	Terminal         terminalResponse    `json:"terminal"`
-	GithubConfigured bool                `json:"github_configured"`
-	Host             string              `json:"host"`
-	Port             int                 `json:"port"`
-	AuthToken        string              `json:"auth_token,omitempty"`
-	RequireAuth      bool                `json:"require_auth"`
+	AgentDirs        map[string][]string       `json:"agent_dirs"`
+	SessionProviders []sessionProviderResponse `json:"session_providers"`
+	DisabledAgents   []parser.AgentType        `json:"disabled_agents"`
+	Terminal         terminalResponse          `json:"terminal"`
+	GithubConfigured bool                      `json:"github_configured"`
+	Host             string                    `json:"host"`
+	Port             int                       `json:"port"`
+	ChartPalette     config.ChartPalette       `json:"chart_palette"`
+	ZoomLevel        *config.ZoomLevel         `json:"zoom_level,omitempty"`
+	ToolResultImages string                    `json:"tool_result_images" enum:"keep,drop,offload" doc:"Inline tool-result image retention applied to ingestion after a daemon restart"`
+	AuthToken        string                    `json:"auth_token,omitempty"`
+	RequireAuth      bool                      `json:"require_auth"`
+	ReadOnly         bool                      `json:"read_only"`
+}
+
+type sessionProviderResponse struct {
+	ID                 parser.AgentType `json:"id"`
+	DisplayName        string           `json:"display_name"`
+	Dirs               []string         `json:"dirs"`
+	PostAnswerToolWork bool             `json:"post_answer_tool_work,omitzero"`
+	// HomesSupported reports whether the provider accepts alternate home
+	// directories through agent_homes. Homes lists the configured ones.
+	HomesSupported bool     `json:"homes_supported"`
+	Homes          []string `json:"homes"`
 }
 
 // terminalResponse mirrors config.TerminalConfig for JSON output.
@@ -26,113 +42,43 @@ type terminalResponse struct {
 	CustomArgs string `json:"custom_args,omitempty"`
 }
 
-func (s *Server) handleGetSettings(
-	w http.ResponseWriter, r *http.Request,
-) {
-	// Hold the read lock for the entire duration of building the
-	// response to prevent a data race with concurrent writes.
-	s.mu.RLock()
-	dirs := make(map[string][]string)
-	for _, def := range parser.Registry {
-		if !def.FileBased && def.EnvVar == "" {
-			continue
-		}
-		d := s.cfg.AgentDirs[def.Type]
-		if d == nil {
-			d = []string{}
-		}
-		dirs[string(def.Type)] = d
-	}
-
-	tc := s.cfg.Terminal
-	if tc.Mode == "" {
-		tc.Mode = "auto"
-	}
-
-	resp := settingsResponse{
-		AgentDirs: dirs,
-		Terminal: terminalResponse{
-			Mode:       tc.Mode,
-			CustomBin:  tc.CustomBin,
-			CustomArgs: tc.CustomArgs,
-		},
-		GithubConfigured: s.cfg.GithubToken != "",
-		Host:             s.cfg.Host,
-		Port:             s.cfg.Port,
-		RequireAuth:      s.cfg.RequireAuth,
-	}
-
-	// Only expose auth_token to localhost requests, never to remote clients.
-	if isLocalhostRequest(r) {
-		resp.AuthToken = s.cfg.AuthToken
-	}
-	s.mu.RUnlock()
-
-	writeJSON(w, http.StatusOK, resp)
-}
-
 // settingsUpdateRequest is the JSON body for PUT /api/v1/settings.
 // All fields are optional; only non-nil fields are applied.
 type settingsUpdateRequest struct {
-	Terminal    *terminalResponse `json:"terminal,omitempty"`
-	AuthToken   *string           `json:"auth_token,omitempty"`
-	RequireAuth *bool             `json:"require_auth,omitempty"`
+	Terminal         *terminalResponse `json:"terminal,omitempty"`
+	AuthToken        *string           `json:"auth_token,omitempty"`
+	RequireAuth      *bool             `json:"require_auth,omitempty"`
+	ChartPalette     *string           `json:"chart_palette,omitempty"`
+	ZoomLevel        *config.ZoomLevel `json:"zoom_level,omitempty"`
+	ToolResultImages *string           `json:"tool_result_images,omitempty" enum:"keep,drop,offload" doc:"Inline tool-result image retention applied to ingestion after a daemon restart"`
+	DisabledAgents   *[]string         `json:"disabled_agents,omitempty"`
+	// AgentHomes replaces the alternate home list for each listed provider.
+	// An empty list clears that provider's homes.
+	AgentHomes *map[string][]string `json:"agent_homes,omitempty"`
 }
 
-func (s *Server) handleUpdateSettings(
-	w http.ResponseWriter, r *http.Request,
-) {
-	if s.db.ReadOnly() {
-		writeError(w, http.StatusNotImplemented,
-			"settings cannot be modified in read-only mode")
-		return
-	}
+// toolResultImagesKeepValue is the documented spelling of the keep policy.
+// config.ToolResultImagesKeep is the empty string, which neither the API nor
+// a settings-written config.toml ever emits.
+const toolResultImagesKeepValue = "keep"
 
-	var req settingsUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
+// toolResultImagesValue renders a retention policy in its documented spelling.
+func toolResultImagesValue(policy config.ToolResultImages) string {
+	if policy == config.ToolResultImagesDrop || policy == config.ToolResultImagesOffload {
+		return string(policy)
 	}
+	return toolResultImagesKeepValue
+}
 
-	patch := make(map[string]any)
+// humaZoomLevel supplies the API schema without coupling config to Huma.
+// Runtime values remain config.ZoomLevel, encoded as numeric percentages.
+type humaZoomLevel int
 
-	// Terminal config is deliberately excluded from the generic
-	// settings endpoint. It must be updated through the dedicated
-	// POST /api/v1/config/terminal endpoint which validates
-	// custom_bin and custom_args to prevent command injection.
-	if req.Terminal != nil {
-		writeError(w, http.StatusBadRequest,
-			"terminal config must be updated via POST /api/v1/config/terminal")
-		return
+func (humaZoomLevel) Schema(huma.Registry) *huma.Schema {
+	values := config.ZoomLevelValues()
+	enum := make([]any, len(values))
+	for i, value := range values {
+		enum[i] = int(value)
 	}
-
-	if req.AuthToken != nil {
-		patch["auth_token"] = *req.AuthToken
-	}
-
-	if req.RequireAuth != nil {
-		patch["require_auth"] = *req.RequireAuth
-	}
-
-	if len(patch) == 0 {
-		// Nothing to update; return current settings.
-		s.handleGetSettings(w, r)
-		return
-	}
-
-	s.mu.Lock()
-	err := s.cfg.SaveSettings(patch)
-	// Auto-generate auth token when require_auth is enabled.
-	if err == nil && s.cfg.RequireAuth {
-		err = s.cfg.EnsureAuthToken()
-	}
-	s.mu.Unlock()
-	if err != nil {
-		log.Printf("save settings: %v", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-
-	// Return the full updated settings.
-	s.handleGetSettings(w, r)
+	return &huma.Schema{Type: huma.TypeInteger, Enum: enum}
 }

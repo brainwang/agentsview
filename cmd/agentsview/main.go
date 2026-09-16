@@ -5,21 +5,32 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"slices"
+	"sort"
+	"strings"
 	"syscall"
+	"testing"
 	"time"
 	_ "time/tzdata"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/parser"
-	"github.com/wesm/agentsview/internal/server"
-	"github.com/wesm/agentsview/internal/signals"
-	"github.com/wesm/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/recall/extract"
+	"go.kenn.io/agentsview/internal/remotesync"
+	"go.kenn.io/agentsview/internal/secrets"
+	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/signals"
+	"go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/telemetry"
 )
 
 var (
@@ -29,15 +40,39 @@ var (
 )
 
 const (
-	periodicSyncInterval  = 15 * time.Minute
-	unwatchedPollInterval = 2 * time.Minute
-	watcherDebounce       = 500 * time.Millisecond
-	recursiveWatchBudget  = 8192
+	periodicSyncInterval           = 15 * time.Minute
+	telemetryPingInterval          = 24 * time.Hour
+	unwatchedPollInterval          = 2 * time.Minute
+	watcherBatchDelay              = 500 * time.Millisecond
+	watcherSyncMinInterval         = 5 * time.Second
+	deferredStartupSyncGracePeriod = 30 * time.Second
+	recursiveWatchBudget           = 8192
+)
+
+const (
+	// archiveAuditInterval is the daily cadence for the full-archive audit: a
+	// rare safety net for silent watcher event loss now that the unscoped
+	// 15-minute reconcile is gone.
+	archiveAuditInterval = 24 * time.Hour
+	// archiveAuditRetryInitial is the first retry delay after a failed audit. It
+	// doubles on each subsequent failure and is capped at archiveAuditInterval.
+	archiveAuditRetryInitial = time.Hour
 )
 
 func main() {
+	// Turn on the agentsview-test-fixture deny-list before any scan
+	// runs. The secrets package keeps the filter off by default so unit
+	// tests in this repo (which use the same random-looking fixtures
+	// production scans would suppress) can assert positive rule paths;
+	// the binary always wants the filter on.
+	secrets.EnableFixtureDeny()
+
 	if err := executeCLI(); err != nil {
-		fatal("%v", err)
+		code := exitCodeFromError(err)
+		if !isSilentExitError(err) {
+			fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		}
+		os.Exit(code)
 	}
 }
 
@@ -46,6 +81,9 @@ func main() {
 // inaccessible.
 func warnMissingDirs(dirs []string, label string) {
 	for _, d := range dirs {
+		if strings.HasPrefix(d, "s3://") {
+			continue // remote source has no local path
+		}
 		_, err := os.Stat(d)
 		if err == nil {
 			continue
@@ -64,23 +102,141 @@ func warnMissingDirs(dirs []string, label string) {
 	}
 }
 
-func runServe(cfg config.Config) {
+type serveOptions struct {
+	ReplaceDaemon   bool
+	NoSyncExplicit  bool
+	SkipInitialSync bool
+	Pprof           bool
+}
+
+// serveMemoryLimitBytes is the default Go soft memory limit for the
+// long-running serve daemon. Full parses of multi-megabyte transcripts
+// otherwise balloon the heap to several hundred megabytes; the pages
+// are freed afterwards but macOS keeps them in the process RSS
+// indefinitely, so the daemon's reported memory ratchets to the
+// largest transient since startup. A soft limit makes the GC hold the
+// heap near the cap during those bursts instead. CGO memory (SQLite)
+// is outside the limit, so total RSS settles somewhat above it.
+const serveMemoryLimitBytes = 256 << 20
+
+// applyServeMemoryLimit installs the default soft memory limit unless
+// the operator already set one via GOMEMLIMIT. Only the serve daemon
+// is capped: one-shot CLI commands exit immediately, and the resync
+// worker child returns all memory to the OS when it exits, so a cap
+// would only slow its full-archive rebuild down.
+func applyServeMemoryLimit() {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	debug.SetMemoryLimit(serveMemoryLimitBytes)
+}
+
+func runServe(cfg config.Config, opts serveOptions) {
 	start := time.Now()
 	setupLogFile(cfg.DataDir)
+	applyServeMemoryLimit()
+	applyServeMallocTuning()
 
 	if err := validateServeConfig(cfg); err != nil {
 		fatal("invalid serve config: %v", err)
 	}
 
-	// Write the startup lock immediately after config setup,
-	// before opening the DB, so token-use never sees a window
-	// with no lock and no state file during startup.
-	server.WriteStartupLock(cfg.DataDir)
-	defer server.RemoveStartupLock(cfg.DataDir)
+	// Remote sync archive endpoints always require bearer auth, even when
+	// general API auth is disabled. Ensure a token exists before publishing
+	// startup state so daemon probes and remote collectors share one token.
+	if err := ensureServeAuthToken(&cfg); err != nil {
+		log.Fatalf("Failed to generate auth token: %v", err)
+	}
+	if cfg.RequireAuth {
+		// Startup output may be captured by service managers or log files,
+		// so never write the bearer token itself.
+		if cfg.AuthToken != "" && !runningAsBackgroundChild() {
+			fmt.Println("Auth enabled. Token is configured.")
+		}
+	}
 
-	applyClassifierConfig(cfg)
-	database := mustOpenDB(cfg)
-	defer database.Close()
+	cont, releaseForegroundServeLaunch, err := prepareForegroundServeDaemon(
+		&cfg,
+		serveReplacementOptions{
+			Replace:        opts.ReplaceDaemon,
+			NoSyncExplicit: opts.NoSyncExplicit,
+		},
+	)
+	if err != nil {
+		fatal("%v", err)
+	}
+	if !cont {
+		return
+	}
+	defer releaseForegroundServeLaunch()
+
+	// Acquire the daemon start lock immediately after config setup,
+	// before opening the DB, so token-use never sees a window
+	// with no lock and no runtime record during startup.
+	MarkDaemonStarting(cfg.DataDir)
+	defer UnmarkDaemonStarting(cfg.DataDir)
+	startupProgress := newStartupStateWriter(cfg.DataDir, time.Now)
+
+	// The signal context is created before the startup worker so SIGTERM can
+	// interrupt the worker pass. The server is fully drained by
+	// waitForServerRuntime before defers unwind, so registering stop here
+	// (rather than after the DB defer) does not affect shutdown ordering.
+	ctx, stop := signal.NotifyContext(
+		context.Background(), os.Interrupt, syscall.SIGTERM,
+	)
+	defer stop()
+
+	// Run the archive-scale startup sync in a short-lived worker process before
+	// taking the write lock, so its allocation high-water returns to the OS
+	// instead of pinning the daemon. The daemon then opens the DB, starts the
+	// watcher, and closes the worker-to-watcher event gap below. The worker
+	// acquires the write lock the daemon has not taken yet; on any failure the
+	// daemon falls back to its in-process initial sync.
+	var workerStartupResult workerResult
+	workerSyncDone := false
+	if opts.SkipInitialSync && !cfg.NoSync {
+		needsResync, err := db.ArchiveNeedsResync(cfg.DBPath)
+		if err != nil {
+			fatal("checking archive before startup: %v", err)
+		}
+		// A required archive reparse must finish before either launcher
+		// publishes readiness, even when routine ingestion is deferred.
+		opts.SkipInitialSync = !needsResync
+	}
+	if !opts.SkipInitialSync && !cfg.NoSync && !testing.Testing() {
+		startupProgress.SetPhase("initial sync")
+		result, syncErr := runStartupSyncViaWorker(ctx, cfg, startupProgress)
+		workerStartupResult, workerSyncDone = startupWorkerOutcome(result, syncErr)
+		switch {
+		case syncErr == nil:
+		case errors.Is(syncErr, errWorkerSpawn):
+			log.Printf(
+				"startup sync worker spawn failed: %v "+
+					"(falling back to in-process initial sync)", syncErr,
+			)
+		default:
+			// The worker ran but reported a non-authoritative terminal result.
+			// Do NOT re-run the archive-scale sync in process: carry the
+			// aborted result forward so the bounded gap reconciliation and
+			// RecordStartupReconciled still open watcher dispatch with the
+			// incomplete stats.
+			log.Printf(
+				"ERROR: startup sync worker ran but did not complete: %v "+
+					"(surfacing incomplete pass; not re-syncing in process)",
+				syncErr,
+			)
+		}
+	}
+
+	startupProgress.SetPhase("opening database")
+	database, writeLock := mustOpenWriteDB(context.Background(), cfg)
+	runtimeRecordDataDir := ""
+	defer func() {
+		closeWriteDB(database, writeLock)
+		if runtimeRecordDataDir != "" {
+			RemoveDaemonRuntime(runtimeRecordDataDir)
+		}
+	}()
 
 	if n := len(db.UserAutomationPrefixes()); n > 0 {
 		log.Printf("loaded %d user automation prefix(es) from config", n)
@@ -99,92 +255,224 @@ func runServe(cfg config.Config) {
 	// Remove stale temp DB from a prior crashed resync.
 	cleanResyncTemp(cfg.DBPath)
 
-	ctx, stop := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM,
-	)
-	defer stop()
+	idleTracker := newDaemonIdleTracker(cfg, stop)
+
+	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
+		InstallationID: cfg.InstallationID,
+		Version:        version,
+		Commit:         commit,
+	})
+	defer func() {
+		if err := telemetryReporter.Close(); err != nil {
+			log.Printf("close telemetry: %v", err)
+		}
+	}()
 
 	broadcaster := server.NewBroadcaster(cfg.EventsCoalesceInterval)
 
+	vectorServe, err := setupVectorServing(ctx, cfg, database, idleTracker)
+	if err != nil {
+		fatal("setting up vector index: %v", err)
+	}
+	if vectorServe.Close != nil {
+		defer func() {
+			if cerr := vectorServe.Close(); cerr != nil {
+				log.Printf("close vectors.db: %v", cerr)
+			}
+		}()
+	}
+
+	emitter := wrapEmbeddingSyncEmitter(
+		broadcaster, vectorServe, cfg.Vector.Embed.RunAfterSyncEnabled(),
+	)
+
+	extractSched, err := setupRecallExtraction(cfg, database, idleTracker)
+	if err != nil {
+		fatal("setting up recall extraction: %v", err)
+	}
+	if extractSched != nil {
+		if vectorServe.RecallMutationNotify != nil {
+			extractSched.onPassFinished = vectorServe.RecallMutationNotify
+		}
+		emitter = extractTeeEmitter{primary: emitter, scheduler: extractSched}
+	}
+
 	var engine *sync.Engine
+	var stopWatcher func()
+	var openWatcherDispatch func()
+	var queueWatchRetry func(sync.WatchBatch)
+	var unwatchedPoller *sharedUnwatchedPollCoordinator
+	var completeWorkerStartup func()
 	if !cfg.NoSync {
+		var onStartupReconciled func(sync.SyncStats, error)
 		engine = sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:               cfg.AgentDirs,
-			Machine:                 "local",
+			SourceMachines:          cfg.SourceMachines,
+			ProviderMetadata:        cfg.ProviderMetadata,
+			DisabledAgents:          cfg.DisabledAgents,
+			IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
+			ScanProtectedPaths:      cfg.ScanProtectedPaths,
+			Machine:                 cfg.InstallationID,
 			BlockedResultCategories: cfg.ResultContentBlockedCategories,
-			Emitter:                 broadcaster,
+			ArchiveContent:          cfg.ArchiveContent,
+			Emitter:                 emitter,
+			DeferStartupMaintenance: deferStartupMaintenance(
+				opts.SkipInitialSync, workerSyncDone,
+			),
+			OnStartupReconciled: func(stats sync.SyncStats, err error) {
+				onStartupReconciled(stats, err)
+			},
 		})
-
-		if database.NeedsResync() {
-			signalsCovered := runInitialResync(ctx, engine)
-			if ctx.Err() == nil {
-				if err := database.Vacuum(); err != nil {
-					log.Printf("vacuum after resync: %v", err)
+		defer engine.Close()
+		unwatchedPoller = newUnwatchedPollCoordinator(ctx, engine, idleTracker)
+		defer unwatchedPoller.Stop()
+		stopWatcher, openWatcherDispatch, _, queueWatchRetry = startFileWatcher(
+			cfg, engine, func(_ context.Context, batch sync.WatchBatch) error {
+				done, ok := idleTracker.BeginWork()
+				if !ok {
+					return context.Canceled
 				}
-				// Only short-circuit BackfillSignals when resync
-				// rewrote every session through the inline signal
-				// path. Aborted resyncs fall back to incremental
-				// sync (existing rows untouched) and orphans are
-				// copied as-is from the previous DB without
-				// recompute -- both leave sessions that still
-				// need backfill.
-				if signalsCovered {
-					if err := database.MarkSignalsBackfillDone(); err != nil {
-						log.Printf(
-							"mark signals backfill done: %v", err,
-						)
+				defer done()
+				// The serve ctx reaches watcher-driven syncs so SIGTERM can
+				// interrupt database reconciliation before Stop waits for it.
+				return syncWatchBatch(ctx, engine, batch, func() watchRecoveryScope {
+					return probeWatchRecoveryScope(cfg)
+				})
+			},
+			sync.WatcherOptions{
+				OnCoverageDegraded: func(degradedRoots []string) error {
+					scopes := make([]pollingScope, 0, len(degradedRoots))
+					for _, r := range degradedRoots {
+						scopes = append(scopes, pollingScope{Root: r})
 					}
+					return unwatchedPoller.AddObligation(pollingObligation{
+						Key: "watcher-fallback", Scopes: scopes,
+					})
+				},
+				OnPollingRequired: func(obligation sync.PollingObligation) error {
+					return unwatchedPoller.AddObligation(syncObligationToPoller(obligation))
+				},
+				OnPollingReleased: unwatchedPoller.RemoveObligation,
+			},
+		)
+		defer stopWatcher()
+		onStartupReconciled = newStartupReconciliationHandler(
+			ctx,
+			database.CheckpointWALTruncateWithRetry,
+			openWatcherDispatch,
+		)
+
+		if !opts.SkipInitialSync {
+			if workerSyncDone {
+				// The worker already ran the full startup pass out of process.
+				// Close the worker-to-watcher event gap with a bounded streaming
+				// reconciliation over the currently available watch roots (warm:
+				// the worker persisted skip state into the archive, which the
+				// engine loaded at init), then acknowledge startup. Unavailable
+				// scopes are deferred to their probes rather than reconciled as
+				// empty. Without this the daemon's engine never runs an
+				// in-process sync, so OnStartupReconciled would never fire and
+				// the watcher would stay in collecting mode forever.
+				//
+				// The reconciliation runs after the HTTP server is listening
+				// and the startup banner is printed: it can take a while on a
+				// large archive, and the archive the worker just synced is
+				// fully servable. The watcher keeps collecting events and
+				// startup maintenance keeps waiting until
+				// RecordStartupReconciled fires.
+				completeWorkerStartup = func() {
+					completeWorkerStartupReconciliation(
+						ctx,
+						reconcileRootPaths(cfg),
+						statsFromWorkerResult(workerStartupResult),
+						engine.ReconcileWatchRoots,
+						queueWatchRetry,
+						engine.RecordStartupReconciled,
+					)
 				}
+			} else if database.NeedsResync() {
+				startupProgress.SetPhase("full resync")
+				signalsCovered, _ := runInitialResync(ctx, engine, startupProgress)
+				if ctx.Err() == nil {
+					finishInitialResync(database, signalsCovered)
+				}
+			} else {
+				startupProgress.SetPhase("initial sync")
+				runInitialSync(ctx, engine, startupProgress)
 			}
-		} else {
-			runInitialSync(ctx, engine)
-		}
-		if ctx.Err() != nil {
-			return
+			if ctx.Err() != nil {
+				return
+			}
 		}
 
 		// Backfill runs in the background. On a large DB (e.g.
 		// after copying tens of thousands of orphaned sessions
 		// during a resync), walking every row to recompute
 		// signals would otherwise block the HTTP server from
-		// listening for minutes. Backfill is idempotent and
-		// guarded by a one-shot marker, so concurrent writes
-		// from the file watcher and periodic sync are safe.
-		go func() {
-			if err := database.BackfillSignals(
-				ctx,
-				func(bCtx context.Context, id string) error {
-					return engine.RecomputeSignals(bCtx, id)
-				},
-			); err != nil && ctx.Err() == nil {
+		// listening for minutes. Startup maintenance waits for
+		// a deferred foreground sync and shares its lock with
+		// later sync/resync database swaps.
+		go idleTracker.Do(func() {
+			err := engine.RunStartupMaintenance(ctx, func() error {
+				return database.BackfillSignals(
+					ctx,
+					engine.BackfillSignalComputer(),
+				)
+			})
+			if err != nil && ctx.Err() == nil {
 				log.Printf("signals backfill: %v", err)
 			}
-		}()
-
-		go startPeriodicSync(engine, database)
+		})
+		validRemotes := true
+		if err := cfg.ValidateRemoteHosts(); err != nil {
+			log.Printf("warning: remote_hosts config invalid, skipping periodic remote sync: %v", err)
+			validRemotes = false
+		}
+		stopLiveActivity := startLiveActivityPoller(
+			ctx, cfg, database, engine, idleTracker,
+		)
+		defer stopLiveActivity()
+		go startPeriodicSync(
+			ctx, cfg, engine, database, writeLock, idleTracker, validRemotes, emitter,
+		)
 	}
 
-	// Seed model_pricing after any resync swap so the new DB
-	// file (which doesn't carry pricing across the swap) is
-	// populated before the dashboard starts answering
-	// requests. Synchronous fallback upsert so the first
-	// usage page load does not observe an empty table;
-	// background LiteLLM refresh follows immediately.
-	seedPricing(database)
-
-	// When auth is required, ensure a token exists.
-	if cfg.RequireAuth {
-		if err := cfg.EnsureAuthToken(); err != nil {
-			log.Fatalf("Failed to generate auth token: %v", err)
-		}
-		if cfg.AuthToken != "" {
-			fmt.Printf("Auth enabled. Token: %s\n", cfg.AuthToken)
-		}
+	identityBackfillEngine := engine
+	if identityBackfillEngine == nil {
+		identityBackfillEngine = sync.NewEngine(database, sync.EngineConfig{
+			Machine:            cfg.InstallationID,
+			ScanProtectedPaths: cfg.ScanProtectedPaths,
+			ArchiveContent:     cfg.ArchiveContent,
+		})
 	}
+	go idleTracker.Do(func() {
+		err := identityBackfillEngine.RunStartupMaintenance(ctx, func() error {
+			return identityBackfillEngine.BackfillProjectIdentitySnapshots(ctx)
+		})
+		if err != nil && ctx.Err() == nil {
+			log.Printf("project identity backfill: %v", err)
+		}
+	})
+
+	// Seed model_pricing so a fresh database (first run, or a
+	// resync whose pricing copy failed) is populated before
+	// the dashboard starts answering requests. Resyncs also
+	// copy pricing across the swap themselves, since this seed
+	// only runs once per daemon lifetime. Synchronous fallback
+	// upsert so the first usage page load does not observe an
+	// empty table; the scheduler's background LiteLLM refresh
+	// follows immediately.
+	var pricingRefreshRunner pricingRefreshExclusiveRunner
+	if engine != nil {
+		pricingRefreshRunner = engine
+	}
+	seedPricing(database, pricingRefreshRunner)
+	go startPeriodicPricingRefresh(ctx, database, pricingRefreshRunner)
 
 	rtOpts := serveRuntimeOptions{
-		Mode:          "serve",
-		RequestedPort: cfg.Port,
+		Mode:           "serve",
+		RequestedPort:  cfg.Port,
+		OnCaddyStarted: startupProgress.SetCaddyProcess,
 	}
 	preparedCfg, prepErr := prepareServeRuntimeConfig(cfg, rtOpts)
 	if prepErr != nil {
@@ -192,7 +480,7 @@ func runServe(cfg config.Config) {
 	}
 	cfg = preparedCfg
 
-	srv := server.New(cfg, database, engine,
+	srvOpts := []server.Option{
 		server.WithVersion(server.VersionInfo{
 			Version:   version,
 			Commit:    commit,
@@ -201,8 +489,44 @@ func runServe(cfg config.Config) {
 		server.WithDataDir(cfg.DataDir),
 		server.WithBaseContext(ctx),
 		server.WithBroadcaster(broadcaster),
-	)
+		server.WithIdleTracker(idleTracker),
+		server.WithHTTPRemoteCleanupRegistry(httpRemoteCleanupRegistry),
+		server.WithPprof(opts.Pprof),
+	}
+	srvOpts = append(srvOpts, vectorServe.ServerOpts...)
+	if src := newVectorPushSource(cfg); src != nil {
+		srvOpts = append(srvOpts, server.WithVectorPushSource(src))
+	}
+	if extractSched != nil {
+		// Trash, restore, and permanent-delete routes change extraction
+		// eligibility; the retraction pass must hear about them even when
+		// no sync activity follows. Notify never blocks.
+		srvOpts = append(srvOpts,
+			server.WithSessionMutationNotifier(extractSched.Notify))
+		if manager, ok := extractSched.mgr.(*extract.Manager); ok {
+			srvOpts = append(srvOpts,
+				server.WithRecallExtractionStatusProvider(manager))
+		}
+	}
+	if engine != nil {
+		srvOpts = append(srvOpts, server.WithLocalSyncRunner(
+			newForegroundSyncRunner(ctx, cfg, engine, database, writeLock),
+		))
+		srvOpts = append(srvOpts, server.WithLocalResyncRunner(
+			newForegroundResyncRunner(ctx, cfg, engine, database),
+		))
+	}
+	if engine != nil {
+		srvOpts = append(srvOpts, server.WithLocalCompactRunner(
+			newForegroundCompactRunner(engine, database),
+		))
+	}
+	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
+		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
+	))
+	srv := server.New(cfg, database, engine, srvOpts...)
 
+	startupProgress.SetPhase("starting HTTP server")
 	rt, err := startServerWithOptionalCaddy(ctx, cfg, srv, rtOpts)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -211,22 +535,45 @@ func runServe(cfg config.Config) {
 		fatal("%v", err)
 	}
 
-	// Server is ready — write the definitive state file with the
-	// final port and remove the startup lock. If the state file
-	// write fails, keep the startup lock as a fallback "server
+	// Server is ready — write the definitive kit runtime record with the
+	// final port and release the start lock. If the runtime record
+	// write fails, keep the start lock as a fallback "server
 	// is active" marker so token-use doesn't start a competing
 	// on-demand sync against our live DB.
-	if _, sfErr := server.WriteStateFile(
+	if _, sfErr := writeDaemonRuntimeWithAuthAndNoSync(
 		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, false,
+		rt.Cfg.RequireAuth, rt.Cfg.NoSync,
+		rt.Caddy.Pid(),
 	); sfErr != nil {
-		log.Printf(
-			"warning: could not write state file: %v"+
-				" (keeping startup lock as fallback)",
-			sfErr,
+		reportRuntimeRecordWrite(
+			os.Stdout, sfErr, "keeping start lock as fallback",
+			"To fix permissions, run: icacls <dir> /setowner <user>",
 		)
 	} else {
-		defer server.RemoveStateFile(rt.Cfg.DataDir, rt.Cfg.Port)
-		server.RemoveStartupLock(rt.Cfg.DataDir)
+		runtimeRecordDataDir = rt.Cfg.DataDir
+		UnmarkDaemonStarting(rt.Cfg.DataDir)
+	}
+	releaseForegroundServeLaunch()
+	if idleTracker != nil {
+		idleTracker.Touch()
+		go idleTracker.Run(ctx)
+	}
+	startDaemonUsageCacheBackfill(ctx, database, idleTracker)
+	if engine != nil && opts.SkipInitialSync {
+		go func() {
+			timer := time.NewTimer(deferredStartupSyncGracePeriod)
+			defer timer.Stop()
+			ran, fallbackErr := runDeferredStartupSyncFallback(
+				ctx, cfg, engine, database, writeLock, idleTracker, timer.C,
+			)
+			if fallbackErr != nil && ctx.Err() == nil {
+				log.Printf("deferred startup sync: %v", fallbackErr)
+			} else if ran {
+				log.Printf(
+					"deferred startup sync completed after no foreground request arrived",
+				)
+			}
+		}()
 	}
 
 	if rt.PublicURL == rt.LocalURL {
@@ -237,23 +584,705 @@ func runServe(cfg config.Config) {
 		)
 	} else {
 		fmt.Printf(
-			"agentsview %s backend at %s, public at %s (started in %s)\n",
+			"agentsview %s listening at %s, browser URL: %s (started in %s)\n",
 			version, rt.LocalURL, rt.PublicURL,
 			time.Since(start).Round(time.Millisecond),
 		)
 	}
 	fmt.Printf("Database: %s\n", cfg.DBPath)
 
-	if engine != nil {
-		stopWatcher, unwatchedDirs := startFileWatcher(cfg, engine)
-		defer stopWatcher()
-		if len(unwatchedDirs) > 0 {
-			go startUnwatchedPoll(engine)
-		}
+	startTelemetryPings(ctx, telemetryReporter)
+
+	if vectorServe.Scheduler != nil {
+		go vectorServe.Scheduler.Run(ctx)
+		// Registered after the vectors.db Close defer above, so LIFO
+		// unwind order runs Stop (which waits for any in-flight
+		// TryBuild to return) before vectors.db is closed.
+		defer vectorServe.Scheduler.Stop()
+	}
+	if vectorServe.RecallScheduler != nil {
+		go vectorServe.RecallScheduler.Run(ctx)
+		defer vectorServe.RecallScheduler.Stop()
+	}
+
+	if extractSched != nil {
+		go extractSched.Run(ctx)
+		// Stop waits for any in-flight extraction pass, so the archive
+		// is never closed under one.
+		defer extractSched.Stop()
+	}
+
+	// Run the deferred worker-startup gap reconciliation now that the URL
+	// banner is out and every background service is started. It holds the
+	// engine's sync mutex, not this goroutine's defers, so a SIGTERM during
+	// a long reconciliation still unwinds through waitForServerRuntime.
+	if completeWorkerStartup != nil {
+		completeWorkerStartup()
 	}
 
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("%v", err)
+	}
+}
+
+type usageCacheBackfiller interface {
+	StartUsageCacheBackfill(context.Context) error
+	WaitUsageCacheBackfill(context.Context) error
+	SetUsageCacheBackfillStarted(func())
+}
+
+func startDaemonUsageCacheBackfill(
+	ctx context.Context, backfiller usageCacheBackfiller,
+	idleTracker *server.IdleTracker,
+) {
+	backfiller.SetUsageCacheBackfillStarted(func() {
+		done, ok := idleTracker.BeginWork()
+		if !ok {
+			return
+		}
+		go func() {
+			defer done()
+			if err := backfiller.WaitUsageCacheBackfill(ctx); err != nil &&
+				ctx.Err() == nil {
+				log.Printf("usage cache backfill: %v", err)
+			}
+		}()
+	})
+	if err := backfiller.StartUsageCacheBackfill(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("usage cache backfill: %v", err)
+	}
+}
+
+func runDeferredStartupSyncFallback(
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
+	idleTracker *server.IdleTracker,
+	timeout <-chan time.Time,
+) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timeout:
+	}
+
+	done, ok := idleTracker.BeginWork()
+	if !ok {
+		return false, nil
+	}
+	defer done()
+
+	// A foreground `agentsview sync` may have already driven startup
+	// reconciliation through newForegroundSyncRunner; skip the redundant worker
+	// pass in that case. This is only the fast path: a foreground worker still
+	// in flight records reconciliation before releasing the exclusive lock, and
+	// runWorkerSyncPass rechecks the gate while holding that lock, so the timer
+	// firing mid-pass cannot launch a second archive-scale worker.
+	if engine.StartupReconciled() {
+		return false, nil
+	}
+
+	// Route the skipped startup sync through the worker so it does not run at
+	// archive scale in the daemon. Only a failure in which no worker ran — a
+	// spawn or pre-launch handoff failure — (or a test binary) falls back to
+	// the in-process path; a worker that ran and reported failure is surfaced
+	// without re-running. Both paths acknowledge startup so the watcher leaves
+	// collecting mode.
+	if !testing.Testing() {
+		_, ran, err := runWorkerSyncPass(
+			ctx, ctx, cfg, engine, database, lock, true, nil,
+		)
+		if err == nil || !workerNeverRan(err) {
+			return ran, err
+		}
+		log.Printf(
+			"deferred startup sync worker did not run: %v "+
+				"(falling back in-process)", err,
+		)
+	}
+
+	_, ran, err := engine.RunStartupSyncFallback(ctx, nil)
+	return ran, err
+}
+
+// runStartupSyncViaWorker runs the daemon's startup sync in a short-lived
+// worker process, relaying its progress phases into the startup-state writer so
+// `serve status` reports live phases, and to the console so a foreground serve
+// shows the same "Running initial sync..." progress the in-process path prints.
+// It must run before the daemon takes the write lock so the worker can acquire
+// it. It returns the worker's terminal result (used to acknowledge startup) and
+// any launch/protocol error.
+//
+// The brief specifies a plain error return; it returns the result too so the
+// caller can pass the worker's discovery outcome to RecordStartupReconciled.
+func runStartupSyncViaWorker(
+	ctx context.Context, cfg config.Config, progress *startupStateWriter,
+) (workerResult, error) {
+	fmt.Println("Running initial sync...")
+	t := time.Now()
+	resyncAnnounced := false
+	progressShown := false
+	terminal := isTerminalWriter(os.Stdout)
+	onLine := func(l workerLine) {
+		if l.Progress == nil {
+			return
+		}
+		p := *l.Progress
+		// Resync progress maps onto the "full resync" phase; the plain initial
+		// sync keeps the "initial sync" phase set before this call.
+		if p.Resync {
+			progress.SetPhase("full resync")
+			if !resyncAnnounced {
+				resyncAnnounced = true
+				fmt.Println("Data version changed, running full resync...")
+			}
+		}
+		if writeSyncProgress(os.Stdout, terminal, p) {
+			progressShown = true
+		}
+		progress.SetDetail(startupProgressDetail(p))
+	}
+	result, err := launchSyncWorker(ctx, cfg, "startup", onLine)
+	if err == nil && result.Stats != nil {
+		printSyncSummary(*result.Stats, t)
+	} else if progressShown {
+		// Terminate the in-place \r progress line so the next console
+		// output (fallback messages, the startup banner) starts clean.
+		fmt.Println()
+	}
+	return result, err
+}
+
+// startupWorkerOutcome decides how runServe proceeds after the startup worker.
+// It discriminates a spawn failure (the worker never ran) from a ran-and-failed
+// worker (a valid terminal result reporting incomplete discovery).
+//
+//   - err == nil: the worker completed; carry its result, done = true.
+//   - errors.Is(err, errWorkerSpawn): the worker never ran; done = false so the
+//     caller runs the in-process initial sync fallback.
+//   - any other err: the worker ran but did not complete; done = true with an
+//     aborted result (synthesized when the terminal record is unusable) so the
+//     caller surfaces the incomplete pass through gap reconciliation rather than
+//     re-running the archive-scale sync in process.
+func startupWorkerOutcome(result workerResult, err error) (workerResult, bool) {
+	switch {
+	case err == nil:
+		return result, true
+	case errors.Is(err, errWorkerSpawn):
+		return workerResult{}, false
+	default:
+		if result.Status == "" {
+			result.Status = "aborted"
+		}
+		result.DiscoveryComplete = false
+		return result, true
+	}
+}
+
+// deferStartupMaintenance reports whether archive-wide startup backfills must
+// wait for RecordStartupReconciled instead of starting immediately. Two paths
+// defer them: a daemon launched with the initial sync skipped (a foreground
+// client drives startup, released by its sync or the bounded fallback), and
+// the worker path, where the gap reconciliation runs only after the HTTP
+// server is up — maintenance released at construction would grab the sync
+// mutex first and stall that reconciliation, keeping watcher dispatch in
+// collecting mode. RecordStartupReconciled releases the gate in both cases.
+func deferStartupMaintenance(skipInitialSync, workerSyncDone bool) bool {
+	return skipInitialSync || workerSyncDone
+}
+
+// statsFromWorkerResult maps a worker terminal result onto SyncStats. The
+// worker carries the complete public SyncStats payload so /sync and /resync
+// responses keep parity with in-process passes; the summary counters are the
+// fallback for a terminal record without one. Either way, Aborted mirrors the
+// worker's DiscoveryComplete verdict: providerFailures does not cross the
+// worker protocol, and AuthoritativeDiscoveryComplete() must stay accurate on
+// the daemon side.
+func statsFromWorkerResult(r workerResult) sync.SyncStats {
+	if r.Stats != nil {
+		stats := *r.Stats
+		if r.Tombstoned > stats.Tombstoned {
+			stats.Tombstoned = r.Tombstoned
+		}
+		stats.Aborted = !r.DiscoveryComplete
+		return stats
+	}
+	return sync.SyncStats{
+		Synced:     r.Synced,
+		Skipped:    r.Skipped,
+		Failed:     r.Failed,
+		Tombstoned: r.Tombstoned,
+		Aborted:    !r.DiscoveryComplete,
+	}
+}
+
+// reconcileRootPaths returns the scope for the startup gap reconciliation,
+// the archive audit, and the watcher's full recovery: every watch-root path
+// whose physical probe is currently present, plus present unwatched polling
+// dirs. Scopes gated by an unavailable
+// physical path are deferred, mirroring the watcher's polling-obligation
+// probes: an unmounted volume or a missing nested session subtree (e.g.
+// Gemini's <root>/tmp) streams an empty discovery without error, and an
+// authoritative pass over it would tombstone every active session beneath it.
+func reconcileRootPaths(cfg config.Config) []string {
+	return probeWatchRecoveryScope(cfg).available
+}
+
+// watchRecoveryScope is one probed availability snapshot of the configured
+// watch scope: the currently available reconciliation paths plus the
+// configured dirs whose physical scope is missing and therefore deferred to
+// their polling probes.
+type watchRecoveryScope struct {
+	available []string
+	deferred  map[string]struct{}
+}
+
+// probeWatchRecoveryScope computes the probed reconciliation scope backing
+// reconcileRootPaths; see that function for the deferral semantics.
+func probeWatchRecoveryScope(cfg config.Config) watchRecoveryScope {
+	roots, unwatchedDirs, symlinkGatedDirs, _ := collectWatchRoots(cfg)
+	deferred := make(map[string]struct{})
+	// A recursive symlink root never joins the watch roots, so its exact
+	// availability probe is the symlink target itself: os.Stat follows the
+	// link and fails while the target is gone, deferring the configured
+	// scope before an overlapping present path could expand into it.
+	for symRoot, scopes := range symlinkGatedDirs {
+		if _, err := os.Stat(symRoot); err == nil {
+			continue
+		}
+		for _, scope := range scopes {
+			deferred[filepath.Clean(scope.syncDir)] = struct{}{}
+		}
+	}
+	for _, r := range roots {
+		if r.exists {
+			continue
+		}
+		for _, dir := range r.pendingPollingDirs {
+			deferred[filepath.Clean(dir)] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{})
+	var paths []string
+	add := func(path string) {
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	for _, r := range roots {
+		if !r.exists {
+			continue
+		}
+		// A present root sharing a configured dir with a missing physical
+		// subtree (Gemini's shallow <root> next to a missing <root>/tmp,
+		// a provider parent dir over missing session dirs) would expand to
+		// that dir's full provider scope; defer it with the subtree.
+		if slices.ContainsFunc(r.syncDirs(), func(dir string) bool {
+			_, gated := deferred[filepath.Clean(dir)]
+			return gated
+		}) {
+			continue
+		}
+		if overlapsDeferredScope(r.path, deferred) {
+			continue
+		}
+		add(r.path)
+	}
+	for _, dir := range unwatchedDirs {
+		if overlapsDeferredScope(filepath.Clean(dir), deferred) {
+			continue
+		}
+		if _, err := os.Stat(dir); err == nil {
+			add(dir)
+		}
+	}
+	return watchRecoveryScope{available: paths, deferred: deferred}
+}
+
+// overlapsDeferredScope reports whether the engine-side expansion of a
+// present reconciliation path would pull a deferred configured scope back
+// into an authoritative pass. The engine expands a requested root to every
+// configured dir that is its ancestor or descendant, and the tombstone pass
+// sweeps stored paths by root prefix, so a present path related to a deferred
+// dir in either direction (an outer root over an unmounted nested root, or
+// Codex's shallow parent probe over a sibling provider's missing dir) would
+// read that scope as an empty discovery and tombstone every baselined
+// session beneath it. Both sides are normalized to absolute form here because
+// the engine expands roots against configured dirs after filepath.Abs
+// (cleanRootPath): a scope configured relative and a path configured absolute
+// still overlap on the engine side, so they must overlap here too.
+func overlapsDeferredScope(path string, deferred map[string]struct{}) bool {
+	path = absRootPath(path)
+	for dir := range deferred {
+		dir = absRootPath(dir)
+		if path == dir || pathWithinRoot(path, dir) || pathWithinRoot(dir, path) {
+			return true
+		}
+	}
+	return false
+}
+
+// pollingObligationKey returns a reason-namespaced key so different reasons
+// over one physical root produce independent obligations. The reason argument
+// is required so a missing reason is a compile error rather than a silent
+// key collision.
+func pollingObligationKey(reason, path string) string {
+	return reason + ":" + path
+}
+
+// syncObligationToPoller converts a sync.PollingObligation to the local
+// pollingObligation type used by the coordinator.
+func syncObligationToPoller(o sync.PollingObligation) pollingObligation {
+	scopes := make([]pollingScope, 0, len(o.Scopes))
+	for _, s := range o.Scopes {
+		scopes = append(scopes, pollingScope{Agent: parser.AgentType(s.Agent), Root: s.Root})
+	}
+	return pollingObligation{Key: o.Key, Scopes: scopes, Probe: o.Probe}
+}
+
+// absRootPath mirrors the engine's cleanRootPath so daemon-side scope-overlap
+// checks compare the same path form the engine's root expansion uses.
+func absRootPath(path string) string {
+	cleaned := filepath.Clean(path)
+	abs, err := filepath.Abs(cleaned)
+	if err != nil {
+		return cleaned
+	}
+	return abs
+}
+
+// pathWithinRoot reports whether the cleaned path lies strictly below the
+// cleaned root. A cleaned filesystem root ("/" on Unix, a volume root on
+// Windows) already ends in the separator, so the descendant prefix is only
+// suffixed when missing.
+func pathWithinRoot(path, root string) bool {
+	prefix := root
+	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+		prefix += string(filepath.Separator)
+	}
+	return path != root && strings.HasPrefix(path, prefix)
+}
+
+// newForegroundSyncRunner builds the daemon's foreground local-sync runner used
+// by the sync HTTP handler. It routes through the worker so a foreground
+// `agentsview sync` never runs the archive-scale pass in the daemon. A failure
+// in which no worker ran — a spawn or pre-launch handoff failure — (or a test
+// binary) falls back to the in-process SyncThenRun; a worker that ran and
+// reported failure is surfaced without re-running.
+func newForegroundSyncRunner(
+	daemonCtx context.Context,
+	cfg config.Config, engine *sync.Engine, database *db.DB, lock *writeOwnerLock,
+) server.LocalSyncRunner {
+	return func(
+		ctx context.Context, progress func(sync.Progress),
+	) (sync.SyncStats, error) {
+		if !testing.Testing() {
+			onLine := func(l workerLine) {
+				if l.Progress != nil && progress != nil {
+					progress(*l.Progress)
+				}
+			}
+			// runWorkerSyncPass records completion with SyncThenRun parity:
+			// startup acknowledgement (watcher dispatch, startup maintenance)
+			// closes before the exclusive lock is released, and last-sync
+			// state plus the "sync" emit fire after it, so /sync/status and
+			// SSE subscribers observe the worker-backed pass.
+			stats, _, err := runForegroundWorkerSyncPass(
+				ctx, daemonCtx, cfg, engine, database, lock, onLine,
+			)
+			if err == nil || !workerNeverRan(err) {
+				return stats, err
+			}
+			log.Printf(
+				"foreground sync worker did not run: %v "+
+					"(falling back in-process)", err,
+			)
+		}
+		return engine.SyncThenRun(
+			ctx, false, progress, func(bool) error { return nil },
+		)
+	}
+}
+
+// newForegroundResyncRunner builds the daemon's foreground resync runner used by
+// the resync HTTP handler. It builds the replacement archive in a worker process
+// behind the write barrier, then swaps it in and resets caches. A spawn failure
+// (or a test binary) falls back to the in-process resync; a worker that ran and
+// reported failure is surfaced without re-running.
+func newForegroundResyncRunner(
+	daemonCtx context.Context,
+	cfg config.Config, engine *sync.Engine, database *db.DB,
+) server.LocalResyncRunner {
+	return func(
+		ctx context.Context, progress func(sync.Progress),
+	) (sync.SyncStats, error) {
+		if !testing.Testing() {
+			result, err, spawnFailed := runWorkerResyncBuild(
+				ctx, daemonCtx, cfg, engine, database, progress,
+			)
+			if !spawnFailed {
+				if result.Status == "aborted" && ctx.Err() == nil {
+					// Mirror syncThenRunLocked: a safety-aborted resync still
+					// catches up incrementally so safely applicable updates
+					// land instead of surfacing the bare abort. The worker
+					// "sync" mode refuses stale archives, so this warm,
+					// skip-cache-bounded pass runs in process like the
+					// pre-worker path it preserves. Only the worker's explicit
+					// "aborted" verdict takes this path: operational build
+					// failures report "failed" and must surface their error
+					// rather than masquerade as a successful incremental sync.
+					return syncAllReleasingStartupMaintenance(
+						ctx, engine, progress,
+					), nil
+				}
+				return statsFromWorkerResult(result), err
+			}
+			log.Printf(
+				"foreground resync worker spawn failed: %v "+
+					"(falling back in-process)", err,
+			)
+		}
+		// SyncThenRun, not ResyncAll: it keeps the abort-to-incremental
+		// fallback for a safely aborted in-process resync and releases
+		// startup maintenance on success, matching the handler's no-runner
+		// arm (runResyncWithFallback) and the sync runner's fallback above.
+		return engine.SyncThenRun(
+			ctx, true, progress, func(bool) error { return nil },
+		)
+	}
+}
+
+// newForegroundCompactRunner keeps archive compaction behind the same
+// non-blocking maintenance barrier as user-triggered sync and resync.
+func newForegroundCompactRunner(
+	engine *sync.Engine, database *db.DB,
+) server.LocalCompactRunner {
+	return func(
+		ctx context.Context, options db.CompactOptions,
+	) (db.CompactResult, error) {
+		var result db.CompactResult
+		err := engine.TryRunExclusive(func() error {
+			var err error
+			result, err = database.Compact(ctx, options)
+			return err
+		})
+		return result, err
+	}
+}
+
+// syncAllReleasingStartupMaintenance runs an incremental pass and, mirroring
+// SyncThenRun, releases startup maintenance when the pass was not cancelled.
+// SyncAll records startup reconciliation on its own but never releases the
+// maintenance gate; without the explicit release, a skip-initial-sync daemon
+// whose foreground resync took this arm would keep archive-wide backfills
+// gated until shutdown, because the deferred startup fallback observes the
+// closed reconciliation gate and returns without releasing. A cancelled pass
+// that never reconciled leaves the gate closed so the deferred fallback still
+// owns recovery; once startup is reconciled the release is owed regardless of
+// ctx — cancellation can land between SyncAll recording reconciliation and
+// this check, and the deferred fallback skips on the closed reconciliation
+// gate without ever releasing.
+func syncAllReleasingStartupMaintenance(
+	ctx context.Context, engine *sync.Engine, progress func(sync.Progress),
+) sync.SyncStats {
+	stats := engine.SyncAll(ctx, progress)
+	if ctx.Err() == nil || engine.StartupReconciled() {
+		engine.ReleaseStartupMaintenance()
+	}
+	return stats
+}
+
+// runWorkerResyncBuild builds a resync replacement in a worker process behind the
+// write barrier, then swaps it in and resets caches. It closes the writer for the
+// whole build-and-swap window (readers keep serving, direct writes fail with
+// ErrWriterClosed) without releasing the write-owner flock: the worker never
+// opens the live archive writable. The worker's terminal result is returned so
+// the caller can distinguish an explicit safety abort (Status "aborted") from
+// an operational failure. spawnFailed is true only when the worker could not
+// be launched, so the caller falls back in process.
+func runWorkerResyncBuild(
+	ctx context.Context,
+	recoveryCtx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	progress func(sync.Progress),
+) (workerResult, error, bool) {
+	var result workerResult
+	var launchErr error
+	var doneStats sync.SyncStats
+	barrierErr := engine.RunExclusive(func() error {
+		engine.UpdateProgress(sync.Progress{
+			Phase:  sync.PhasePreparingResync,
+			Detail: "Starting resync worker",
+		})
+		defer engine.FinishProgress()
+		relay := func(line workerLine) {
+			if line.Progress != nil {
+				engine.UpdateProgress(*line.Progress)
+			}
+			if progress != nil && line.Progress != nil {
+				progress(*line.Progress)
+			}
+		}
+		if cerr := closeWriterForPass(
+			recoveryCtx, database, "resync build",
+		); cerr != nil {
+			return cerr
+		}
+		result, launchErr = launchSyncWorker(ctx, cfg, "resync-build", relay)
+		if launchErr != nil {
+			// The worker never swapped; restore the writer the barrier closed.
+			// Restoration is mandatory — abandoning it would leave every write
+			// endpoint failing until restart.
+			if rerr := restoreArchiveAccess(
+				recoveryCtx,
+				"reopen writer after failed resync build",
+				database.ReopenWriter,
+			); rerr != nil {
+				launchErr = errors.Join(launchErr, rerr)
+			}
+			return launchErr
+		}
+		installed, serr := engine.SwapResyncDatabase(engine.ResyncTempPath())
+		if serr != nil {
+			if !installed {
+				// The replacement was discarded, so its tombstones never
+				// reached the archive. A post-install failure keeps them:
+				// the replacement is the live archive there.
+				result.Tombstoned = 0
+				if result.Stats != nil {
+					result.Stats.Tombstoned = 0
+				}
+			}
+			// Swap failures happen at or after CloseConnections closed the
+			// reader pool, so when the swap's own recovery did not restore
+			// the archive only a full Reopen brings reads back; ReopenWriter
+			// alone would leave every read on a closed pool until restart.
+			if database.WriterClosed() {
+				if rerr := restoreArchiveAccess(
+					recoveryCtx,
+					"reopen archive after failed resync swap",
+					database.Reopen,
+				); rerr != nil {
+					serr = errors.Join(
+						serr, fmt.Errorf("recovery reopen: %w", rerr),
+					)
+				}
+			}
+			return fmt.Errorf("swap resync database: %w", serr)
+		}
+		// The swap's reopen restored the writer and cleared the barrier;
+		// re-baseline the caches that referenced the replaced database.
+		if cerr := engine.ResetCachesAfterSwap(); cerr != nil {
+			return cerr
+		}
+		// Record the completed resync with ResyncAll parity before the
+		// exclusive lock is released: last-sync state feeds /sync/status
+		// hydration, and the closed startup gate keeps the deferred startup
+		// fallback from launching another archive-scale pass. The emit and
+		// startup callback fire after the lock below.
+		doneStats = statsFromWorkerResult(result)
+		doneStats.ArchiveRebuilt = true
+		engine.RecordStartupReconciledExclusive(doneStats, nil)
+		return nil
+	})
+	if barrierErr != nil {
+		if errors.Is(barrierErr, errWorkerSpawn) {
+			return workerResult{}, barrierErr, true
+		}
+		return result, barrierErr, false
+	}
+	engine.FinishStartupReconciled(doneStats)
+	return result, nil, false
+}
+
+func newStartupReconciliationHandler(
+	ctx context.Context,
+	checkpoint func(context.Context) error,
+	openDispatch func(),
+) func(sync.SyncStats, error) {
+	return func(_ sync.SyncStats, reconciliationErr error) {
+		if ctx.Err() != nil {
+			return
+		}
+		if reconciliationErr == nil {
+			err := checkpoint(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				log.Printf("post-sync wal checkpoint: %v", err)
+			}
+		} else {
+			log.Printf(
+				"startup sync incomplete; opening watcher dispatch with retry coverage: %v",
+				reconciliationErr,
+			)
+		}
+		openDispatch()
+	}
+}
+
+func ensureServeAuthToken(cfg *config.Config) error {
+	if cfg == nil || cfg.AuthToken != "" {
+		return nil
+	}
+	return cfg.EnsureAuthToken()
+}
+
+func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.IdleTracker {
+	if !runningAsBackgroundChild() {
+		return nil
+	}
+	timeout := cfg.DaemonIdleTimeout
+	if raw := os.Getenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			log.Printf(
+				"invalid AGENTSVIEW_DAEMON_IDLE_TIMEOUT %q: %v",
+				raw, err,
+			)
+		} else {
+			timeout = parsed
+		}
+	}
+	if timeout <= 0 {
+		return nil
+	}
+	return server.NewIdleTracker(timeout, func() {
+		log.Printf("idle timeout elapsed; shutting down daemon")
+		stop()
+	})
+}
+
+func startTelemetryPings(ctx context.Context, reporter *telemetry.Reporter) {
+	if reporter == nil || !reporter.Enabled() {
+		return
+	}
+	captureTelemetryPing(ctx, reporter)
+	go func() {
+		ticker := time.NewTicker(telemetryPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				captureTelemetryPing(ctx, reporter)
+			}
+		}
+	}()
+}
+
+func captureTelemetryPing(ctx context.Context, reporter *telemetry.Reporter) {
+	if err := reporter.CaptureDaemonActive(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("capture telemetry event: %v", err)
 	}
 }
 
@@ -273,7 +1302,13 @@ func mustLoadConfig(cmd *cobra.Command) config.Config {
 const maxLogSize = 10 * 1024 * 1024 // 10 MB
 
 func setupLogFile(dataDir string) {
-	logPath := filepath.Join(dataDir, "debug.log")
+	setupLogFileNamed(dataDir, "debug.log")
+}
+
+// setupLogFileNamed redirects the standard logger to the named file
+// in dataDir, truncating it first if it exceeds maxLogSize.
+func setupLogFileNamed(dataDir, name string) {
+	logPath := filepath.Join(dataDir, name)
 	truncateLogFile(logPath, maxLogSize)
 	f, err := os.OpenFile(
 		logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644,
@@ -301,30 +1336,234 @@ func truncateLogFile(path string, limit int64) {
 }
 
 func openDB(cfg config.Config) (*db.DB, error) {
+	if err := clearUsageOnlyVectors(context.Background(), cfg); err != nil {
+		return nil, err
+	}
 	applyClassifierConfig(cfg)
-	database, err := db.Open(cfg.DBPath)
+	database, err := db.OpenWithArchiveContent(cfg.DBPath, cfg.ArchiveContent)
 	if err != nil {
 		return nil, err
+	}
+	database.SetToolResultImages(cfg.ToolResultImages)
+	database.SetAssetsDir(filepath.Join(cfg.DataDir, "assets"))
+	if cfg.InstallationID != "" {
+		unowned, err := database.EnsureInstallationIdentity(context.Background(), cfg.InstallationID)
+		if err != nil {
+			database.Close()
+			return nil, fmt.Errorf("adopting installation identity: %w", err)
+		}
+		if len(unowned) > 0 {
+			log.Printf("archive has sessions under machine keys %q with no recorded local owner; "+
+				"they stay separate until you run `agentsview db adopt-machine` with the keys you own",
+				unowned)
+		}
+	}
+	if cfg.InstallationID != "" && cfg.LocalMachineName != "" {
+		if err := database.SetSyncState(db.MachineLabelKeyPrefix+cfg.InstallationID, cfg.LocalMachineName); err != nil {
+			database.Close()
+			return nil, fmt.Errorf("recording installation display name: %w", err)
+		}
 	}
 	applyCustomPricing(database, cfg)
 	return database, nil
 }
 
-func mustOpenDB(cfg config.Config) *db.DB {
-	database, err := openDB(cfg)
+func openReadOnlyDB(cfg config.Config) (*db.DB, error) {
+	applyClassifierConfig(cfg)
+	database, err := db.OpenReadOnly(cfg.DBPath)
 	if err != nil {
-		fatal("opening database: %v", err)
+		return nil, schemaUpgradeHint(err)
 	}
+	applyCustomPricing(database, cfg)
+	if err := applyCursorSecret(database, cfg); err != nil {
+		database.Close()
+		return nil, err
+	}
+	return database, nil
+}
 
+// schemaUpgradeHint augments a read-only open failure with actionable guidance
+// when the archive is simply older than this binary. The pending migration only
+// runs on a writable open, which read-only commands never perform, so the user
+// must let the daemon (re)start to upgrade the archive. Without this, the raw
+// "schema missing tool_calls.file_path" error leaves upgraders with no path
+// forward; it is the failure reported in issue #929 after a version bump while
+// an older daemon still owned the archive.
+func schemaUpgradeHint(err error) error {
+	if !db.IsSchemaUpgradeRequired(err) {
+		return err
+	}
+	return appendDaemonRestartUpgradeHint(err)
+}
+
+func appendDaemonRestartUpgradeHint(err error) error {
+	return fmt.Errorf("%w\n\n%s", err, daemonRestartUpgradeHint())
+}
+
+func daemonRestartUpgradeHint() string {
+	return "This database was written by an older agentsview version and " +
+		"must be upgraded before it can be read. The upgrade runs when a " +
+		"writable daemon starts, so restart the daemon to let it run:\n" +
+		"  - desktop app: quit and relaunch it\n" +
+		"  - CLI: run `agentsview daemon restart`"
+}
+
+func openWriteDB(
+	ctx context.Context,
+	cfg config.Config,
+) (*db.DB, *writeOwnerLock, error) {
+	return openWriteDBWith(ctx, cfg, openDB)
+}
+
+// Explicit ownership adoption uses the same writer exclusion and interrupted
+// compaction recovery as every other direct archive write, before normal
+// startup can require an ownership choice.
+func openWriteDBWith(
+	ctx context.Context, cfg config.Config,
+	openArchive func(config.Config) (*db.DB, error),
+) (*db.DB, *writeOwnerLock, error) {
+	if err := rejectLiveWritableDaemonBeforeDirectWrite(cfg); err != nil {
+		return nil, nil, err
+	}
+	lock, err := acquireWriteOwnerLock(ctx, writeLockDataDir(cfg))
+	if err != nil {
+		return nil, nil, err
+	}
+	// Settle any interrupted staged compaction before the archive is probed.
+	// Only the canonical archive under the write lock runs this: derived
+	// databases (resync temps, isolated imports) must not interpret the
+	// archive's recovery manifest.
+	if err := db.RecoverCompactManifest(cfg.DBPath); err != nil {
+		_ = lock.Close()
+		return nil, nil, fmt.Errorf(
+			"recovering interrupted archive compaction: %w", err,
+		)
+	}
+	database, err := openArchive(cfg)
+	if err != nil {
+		_ = lock.Close()
+		return nil, nil, err
+	}
+	if err := applyCursorSecret(database, cfg); err != nil {
+		database.Close()
+		_ = lock.Close()
+		return nil, nil, err
+	}
+	return database, lock, nil
+}
+
+func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
+	if runningAsSyncWorker() {
+		// The daemon spawned this worker after closing its writer and
+		// releasing the write lock for the pass, so its still-live runtime
+		// record does not mean it owns the archive. The write-owner flock
+		// acquired next is the real guard: if the daemon has not actually
+		// yielded it, acquireWriteOwnerLock refuses.
+		return nil
+	}
+	dataDir := writeLockDataDir(cfg)
+	if isExternalDaemonStarting(dataDir) || isLegacyDaemonStarting(dataDir) {
+		return fmt.Errorf(
+			"local daemon is starting and owns the SQLite archive; " +
+				"refusing to write directly. Retry once it is ready",
+		)
+	}
+	if isBackgroundLaunchActive(dataDir) &&
+		!ownsForegroundServeLaunchLock(dataDir) &&
+		!runningAsBackgroundChild() {
+		return fmt.Errorf(
+			"local daemon launch is in progress and owns the SQLite archive; " +
+				"refusing to write directly. Retry once it is ready",
+		)
+	}
+	if !hasLiveWritableDaemonRuntime(dataDir, cfg.AuthToken) {
+		return nil
+	}
+	// hasLiveWritableDaemonRuntime intentionally ignores API/data
+	// compatibility so direct writers still refuse when any live local
+	// writable daemon owns the archive. FindDaemonRuntime returns only
+	// compatible daemons; incompatible ones fall through to the detailed
+	// error below.
+	if rt := FindDaemonRuntime(dataDir, cfg.AuthToken); rt != nil && !rt.ReadOnly {
+		return fmt.Errorf(
+			"local daemon at %s owns the SQLite archive; refusing "+
+				"to write directly. Retry through the daemon or run "+
+				"`agentsview daemon stop` first",
+			urlFromDaemonRuntime(rt),
+		)
+	}
+	reason := errLocalDaemonUnreachable.Error()
+	if _, err := FindIncompatibleDaemonRuntime(dataDir, cfg.AuthToken); err != nil {
+		reason = err.Error()
+	}
+	return fmt.Errorf(
+		"%s; refusing to write directly. Retry through the daemon or "+
+			"run `agentsview daemon stop` first",
+		reason,
+	)
+}
+
+func writeLockDataDir(cfg config.Config) string {
+	if cfg.DataDir != "" {
+		return cfg.DataDir
+	}
+	if cfg.DBPath != "" {
+		return filepath.Dir(cfg.DBPath)
+	}
+	return "."
+}
+
+func closeWriteDB(database *db.DB, lock *writeOwnerLock) {
+	if database != nil {
+		if err := database.Close(); err != nil {
+			// A failed close means a connection may still hold the SQLite
+			// file. Keep the write-owner flock so another process cannot
+			// acquire writer ownership alongside the surviving connection;
+			// process exit releases both the connection and the flock.
+			log.Printf(
+				"close sqlite database: %v; keeping write-owner lock", err,
+			)
+			return
+		}
+	}
+	if lock != nil {
+		if err := lock.Close(); err != nil {
+			log.Printf("release sqlite write-owner lock: %v", err)
+		}
+	}
+}
+
+func mustOpenWriteDB(
+	ctx context.Context,
+	cfg config.Config,
+) (*db.DB, *writeOwnerLock) {
+	database, lock, err := openWriteDB(ctx, cfg)
+	if err != nil {
+		fatal("opening writable database: %v", err)
+	}
+	return database, lock
+}
+
+type cursorSecretStore interface {
+	SetCursorSecret(secret []byte)
+}
+
+func applyCursorSecret(database cursorSecretStore, cfg config.Config) error {
 	if cfg.CursorSecret != "" {
 		secret, err := base64.StdEncoding.DecodeString(cfg.CursorSecret)
 		if err != nil {
-			fatal("invalid cursor secret: %v", err)
+			return fmt.Errorf("invalid cursor secret: %w", err)
 		}
 		database.SetCursorSecret(secret)
 	}
+	return nil
+}
 
-	return database
+func applyRequiredCursorSecret(database cursorSecretStore, cfg config.Config) error {
+	if cfg.CursorSecret == "" {
+		return errors.New("cursor secret is not configured")
+	}
+	return applyCursorSecret(database, cfg)
 }
 
 // fatal prints a formatted error to stderr and exits.
@@ -346,11 +1585,17 @@ func cleanResyncTemp(dbPath string) {
 
 func runInitialSync(
 	ctx context.Context, engine *sync.Engine,
-) {
+	startupProgress *startupStateWriter,
+) sync.SyncStats {
 	fmt.Println("Running initial sync...")
 	t := time.Now()
-	stats := engine.SyncAll(ctx, printSyncProgress)
+	progress := newSyncProgressPrinter(os.Stdout)
+	stats := engine.SyncAll(ctx, func(p sync.Progress) {
+		progress(p)
+		startupProgress.SetDetail(startupProgressDetail(p))
+	})
 	printSyncSummary(stats, t)
+	return stats
 }
 
 // runInitialResync runs ResyncAll, falling back to incremental
@@ -359,25 +1604,56 @@ func runInitialSync(
 // path -- see resyncCoversSignals.
 func runInitialResync(
 	ctx context.Context, engine *sync.Engine,
-) bool {
+	startupProgress *startupStateWriter,
+) (bool, sync.SyncStats) {
 	fmt.Println("Data version changed, running full resync...")
 	t := time.Now()
-	stats := engine.ResyncAll(ctx, printSyncProgress)
+	progress := newResyncProgressPrinter(os.Stdout, time.Now)
+	stats := engine.ResyncAll(ctx, func(p sync.Progress) {
+		progress.Print(p)
+		startupProgress.SetDetail(startupProgressDetail(p))
+	})
+	progress.Finish()
 	printSyncSummary(stats, t)
+	resyncStats := stats
 
 	fellBack := false
 	if stats.Aborted && ctx.Err() == nil {
 		fmt.Println("Resync incomplete, running incremental sync...")
 		t = time.Now()
-		fallback := engine.SyncAll(ctx, printSyncProgress)
-		printSyncSummary(fallback, t)
+		progress := newSyncProgressPrinter(os.Stdout)
+		stats = engine.SyncAll(ctx, func(p sync.Progress) {
+			progress(p)
+			startupProgress.SetDetail(startupProgressDetail(p))
+		})
+		printSyncSummary(stats, t)
 		fellBack = true
 	}
 
 	if ctx.Err() != nil {
-		return false
+		return false, stats
 	}
-	return resyncCoversSignals(stats, fellBack)
+	return resyncCoversSignals(resyncStats, fellBack), stats
+}
+
+type signalsBackfillMarker interface {
+	MarkSignalsBackfillDone() error
+}
+
+func finishInitialResync(
+	marker signalsBackfillMarker, signalsCovered bool,
+) {
+	// Only short-circuit BackfillSignals when resync rewrote every
+	// session through the inline signal path. Aborted resyncs fall
+	// back to incremental sync (existing rows untouched) and orphans
+	// are copied as-is from the previous DB without recompute -- both
+	// leave sessions that still need backfill.
+	if !signalsCovered {
+		return
+	}
+	if err := marker.MarkSignalsBackfillDone(); err != nil {
+		log.Printf("mark signals backfill done: %v", err)
+	}
 }
 
 // resyncCoversSignals returns true only when every session in
@@ -403,9 +1679,12 @@ func resyncCoversSignals(
 
 func printSyncSummary(stats sync.SyncStats, t time.Time) {
 	summary := fmt.Sprintf(
-		"\nSync complete: %d sessions synced",
+		"Sync complete: %d sessions synced",
 		stats.Synced,
 	)
+	if isTerminalWriter(os.Stdout) {
+		summary = "\n" + summary
+	}
 	if stats.OrphanedCopied > 0 {
 		summary += fmt.Sprintf(
 			", %d archived sessions preserved",
@@ -418,112 +1697,348 @@ func printSyncSummary(stats sync.SyncStats, t time.Time) {
 	summary += fmt.Sprintf(
 		" in %s\n", time.Since(t).Round(time.Millisecond),
 	)
+	summary += formatAnomalySummary(stats.Anomalies)
 	fmt.Print(summary)
 	for _, w := range stats.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 }
 
-func printSyncProgress(p sync.Progress) {
+type resyncProgressPrinter struct {
+	w        io.Writer
+	now      func() time.Time
+	terminal bool
+	label    string
+	started  time.Time
+	inPlace  bool
+	finished bool
+}
+
+func newResyncProgressPrinter(
+	w io.Writer, now func() time.Time,
+) *resyncProgressPrinter {
+	return &resyncProgressPrinter{
+		w: w, now: now, terminal: isTerminalWriter(w),
+	}
+}
+
+func (p *resyncProgressPrinter) Print(progress sync.Progress) {
+	if p.finished {
+		return
+	}
+	if progress.Phase == sync.PhaseDone {
+		p.printFinalInPlaceProgress(progress)
+		p.finishCurrent()
+		return
+	}
+	label := resyncProgressLabel(progress)
+	if label == "" {
+		return
+	}
+
+	if progress.Phase == sync.PhaseSyncing && progress.SessionsTotal > 0 {
+		if p.label != progress.Detail {
+			p.finishCurrent()
+			p.label = progress.Detail
+			p.started = p.now()
+			if !p.terminal {
+				fmt.Fprintf(
+					p.w, "  %s...\n",
+					strings.TrimSuffix(resyncProgressDisplayLabel(progress), "."),
+				)
+			}
+		}
+		p.inPlace = p.terminal
+		if p.terminal {
+			fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		}
+		return
+	}
+
+	if p.label == label {
+		return
+	}
+	p.finishCurrent()
+	p.label = label
+	p.started = p.now()
+	p.inPlace = false
+	fmt.Fprintf(
+		p.w, "  %s...\n",
+		strings.TrimSuffix(resyncProgressDisplayLabel(progress), "."),
+	)
+}
+
+func (p *resyncProgressPrinter) printFinalInPlaceProgress(progress sync.Progress) {
+	if !p.inPlace || p.label == "" || progress.SessionsTotal == 0 {
+		return
+	}
+	if progress.Detail == "" {
+		progress.Detail = p.label
+	}
+	fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+}
+
+func (p *resyncProgressPrinter) Finish() {
+	p.finished = true
+	p.finishCurrent()
+}
+
+func (p *resyncProgressPrinter) finishCurrent() {
+	if p.label == "" {
+		return
+	}
+	if p.inPlace {
+		fmt.Fprint(p.w, "\n")
+	}
+	elapsed := p.now().Sub(p.started).Round(time.Millisecond)
+	fmt.Fprintf(p.w, "  %s completed in %s\n", p.label, elapsed)
+	p.label = ""
+	p.started = time.Time{}
+	p.inPlace = false
+}
+
+func resyncProgressLabel(p sync.Progress) string {
+	return p.Detail
+}
+
+func resyncProgressDisplayLabel(p sync.Progress) string {
+	if p.Detail == "" {
+		return ""
+	}
+	if p.Hint == "" {
+		return p.Detail
+	}
+	return p.Detail + " - " + p.Hint
+}
+
+// formatAnomalySummary renders the parser/sanitizer anomaly section of a
+// sync summary. It returns an empty string on a clean run so the section
+// is omitted entirely; otherwise it returns a concise, indented block
+// listing per-agent parser malformed lines and the central-validation fix
+// counts observed during the run.
+func formatAnomalySummary(a sync.AnomalyStats) string {
+	if a.IsZero() {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Parser anomalies (this run):\n")
+	if a.UnsupportedSourceLayoutsTotal > 0 {
+		fmt.Fprintf(&b, "  unsupported source layouts: %d total\n", a.UnsupportedSourceLayoutsTotal)
+		for _, agent := range slices.Sorted(maps.Keys(a.UnsupportedSourceLayoutsByAgent)) {
+			fmt.Fprintf(&b, "    %s: %d\n", agent, a.UnsupportedSourceLayoutsByAgent[agent])
+		}
+	}
+	if a.MalformedLinesTotal > 0 {
+		fmt.Fprintf(&b,
+			"  malformed lines: %d total\n", a.MalformedLinesTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.MalformedLinesByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.MalformedLinesByAgent[agent],
+			)
+		}
+	}
+	if a.UnknownSchemaSessionsTotal > 0 {
+		fmt.Fprintf(&b,
+			"  unrecognized schema sessions: %d total\n",
+			a.UnknownSchemaSessionsTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.UnknownSchemaSessionsByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.UnknownSchemaSessionsByAgent[agent],
+			)
+		}
+	}
+	if a.GenMetadataWithoutUsageTotal > 0 {
+		fmt.Fprintf(&b,
+			"  gen_metadata without usage: %d total\n",
+			a.GenMetadataWithoutUsageTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.GenMetadataWithoutUsageByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.GenMetadataWithoutUsageByAgent[agent],
+			)
+		}
+	}
+	if !a.Sanitize.IsZero() {
+		fmt.Fprintf(&b,
+			"  sanitized fields: %d total\n", a.Sanitize.Total(),
+		)
+		for _, line := range sanitizeBreakdownLines(a.Sanitize) {
+			b.WriteString("    " + line + "\n")
+		}
+	}
+	return b.String()
+}
+
+// sanitizeBreakdownLines returns the non-zero per-category sanitize counts
+// as "label: n" lines in a fixed, deterministic order.
+func sanitizeBreakdownLines(s sync.SanitizeStats) []string {
+	cats := []struct {
+		label string
+		count int
+	}{
+		{"control chars stripped", s.ControlCharsStripped},
+		{"model clamped", s.ModelClamped},
+		{"tokens clamped", s.TokensClamped},
+		{"role coerced", s.RoleCoerced},
+		{"timestamps blanked", s.TimestampsBlanked},
+	}
+	var out []string
+	for _, c := range cats {
+		if c.count > 0 {
+			out = append(out, fmt.Sprintf("%s: %d", c.label, c.count))
+		}
+	}
+	return out
+}
+
+// startupProgressDetail renders a one-line sync progress snapshot for
+// the startup state file: the counted progress line when available,
+// otherwise the bare resync step label.
+func startupProgressDetail(p sync.Progress) string {
+	if detail := formatSyncProgress(p); detail != "" {
+		return detail
+	}
+	return resyncProgressDisplayLabel(p)
+}
+
+func writeSyncProgress(w io.Writer, terminal bool, p sync.Progress) bool {
+	if !terminal {
+		return false
+	}
+	if detail := formatSyncProgress(p); detail != "" {
+		fmt.Fprintf(w, "\r  %s\x1b[K", detail)
+		return true
+	}
+	return false
+}
+
+func newSyncProgressPrinter(w io.Writer) sync.ProgressFunc {
+	terminal := isTerminalWriter(w)
+	return func(p sync.Progress) {
+		writeSyncProgress(w, terminal, p)
+	}
+}
+
+func formatSyncProgress(p sync.Progress) string {
+	if p.Detail != "" {
+		detail := p.Detail
+		if p.BytesDone > 0 || p.BytesTotal > 0 {
+			detail = fmt.Sprintf("%s: %s", detail, formatByteProgress(p))
+		}
+		if p.SessionsTotal > 0 {
+			detail = fmt.Sprintf(
+				"%s: %d/%d sessions (%.0f%%) · %d messages",
+				detail, p.SessionsDone, p.SessionsTotal,
+				p.Percent(), p.MessagesIndexed,
+			)
+		}
+		if p.Hint != "" {
+			detail += " - " + p.Hint
+		}
+		return detail
+	}
 	if p.SessionsTotal > 0 {
-		fmt.Printf(
-			"\r  %d/%d sessions (%.0f%%) · %d messages",
+		return fmt.Sprintf(
+			"%d/%d sessions (%.0f%%) · %d messages",
 			p.SessionsDone, p.SessionsTotal,
 			p.Percent(), p.MessagesIndexed,
 		)
 	}
+	return ""
+}
+
+func formatByteProgress(p sync.Progress) string {
+	if p.BytesTotal > 0 {
+		return fmt.Sprintf(
+			"%s/%s (%.0f%%)",
+			formatBytes(p.BytesDone), formatBytes(p.BytesTotal),
+			float64(p.BytesDone)/float64(p.BytesTotal)*100,
+		)
+	}
+	return formatBytes(p.BytesDone)
 }
 
 func startFileWatcher(
-	cfg config.Config, engine *sync.Engine,
-) (stopWatcher func(), unwatchedDirs []string) {
+	cfg config.Config, engine *sync.Engine, onChange sync.WatchCallback,
+	options sync.WatcherOptions,
+) (
+	stopWatcher func(), openDispatch func(), unwatchedDirs []string,
+	queueRetry func(sync.WatchBatch),
+) {
 	t := time.Now()
-	onChange := func(paths []string) {
-		engine.SyncPaths(paths)
-	}
-	watcher, err := sync.NewWatcher(watcherDebounce, onChange, cfg.WatchExcludePatterns)
+	roots, unwatchedDirs, symlinkGatedDirs, persistentDirAgents := collectWatchRoots(cfg)
+	watcher, err := sync.NewWatcherWithCallback(
+		watcherBatchDelay,
+		watcherSyncMinInterval,
+		onChange,
+		cfg.WatchExcludePatterns,
+		options,
+	)
 	if err != nil {
+		for _, root := range roots {
+			unwatchedDirs = appendUniqueStrings(unwatchedDirs, root.syncDirs()...)
+		}
+		if coverageErr := registerWatcherUnavailableObligations(
+			options, roots, unwatchedDirs, symlinkGatedDirs, persistentDirAgents,
+		); coverageErr != nil {
+			err = errors.Join(err, coverageErr)
+		}
 		log.Printf(
 			"warning: file watcher unavailable: %v"+
 				"; will poll every %s",
 			err, unwatchedPollInterval,
 		)
-		return func() {}, []string{"all"}
-	}
-
-	type watchRoot struct {
-		dir     string
-		root    string // actual path passed to WatchRecursive
-		shallow bool   // use shallow watch (root only)
-	}
-
-	var roots []watchRoot
-	for _, def := range parser.Registry {
-		if !def.FileBased {
-			continue
-		}
-		for _, d := range cfg.ResolveDirs(def.Type) {
-			if def.Type == parser.AgentOpenCode {
-				watchDirs := parser.ResolveOpenCodeWatchRoots(d)
-				if len(watchDirs) == 0 {
-					unwatchedDirs = append(unwatchedDirs, d)
-					continue
-				}
-				for _, watchDir := range watchDirs {
-					if _, err := os.Stat(watchDir); err == nil {
-						roots = append(
-							roots, watchRoot{d, watchDir, def.ShallowWatch},
-						)
-						continue
-					}
-					unwatchedDirs = append(unwatchedDirs, d)
-				}
-				continue
-			}
-			if len(def.WatchSubdirs) == 0 {
-				if _, err := os.Stat(d); err == nil {
-					roots = append(
-						roots, watchRoot{d, d, def.ShallowWatch},
-					)
-				}
-				continue
-			}
-			for _, sub := range def.WatchSubdirs {
-				watchDir := filepath.Join(d, sub)
-				if _, err := os.Stat(watchDir); err == nil {
-					roots = append(
-						roots, watchRoot{d, watchDir, def.ShallowWatch},
-					)
-				}
-			}
-		}
+		return func() {}, func() {}, []string{"all"}, func(sync.WatchBatch) {}
 	}
 
 	var totalWatched int
 	var shallowWatched int
-	remaining := recursiveWatchBudget
-	for _, r := range roots {
-		if r.shallow {
-			if watcher.WatchShallow(r.root) {
+	registeredRoots := make([]sync.WatchRoot, 0, len(roots))
+	for _, root := range roots {
+		registeredRoots = append(registeredRoots, root.registeredRoot())
+	}
+	results := watcher.RegisterRoots(registeredRoots, recursiveWatchBudget)
+	unwatchedDirs = accountRegisteredWatchRoots(unwatchedDirs, roots, results)
+	for i, r := range roots {
+		result := results[i]
+		if !r.exists {
+			continue
+		}
+		totalWatched += result.Watched
+		if !r.recursive {
+			if result.Err == nil {
 				shallowWatched++
-				totalWatched++
 			} else {
-				unwatchedDirs = append(unwatchedDirs, r.dir)
+				unwatchedDirs = appendUniqueStrings(unwatchedDirs, r.syncDirs()...)
 			}
 			continue
 		}
-		result := watcher.WatchRecursiveBudgeted(r.root, remaining)
-		totalWatched += result.Watched
-		remaining -= result.Watched
 		if result.Unwatched > 0 || result.BudgetExhausted ||
 			result.ResourceExhausted || result.Err != nil {
-			unwatchedDirs = append(unwatchedDirs, r.dir)
+			unwatchedDirs = appendUniqueStrings(unwatchedDirs, r.syncDirs()...)
 			log.Printf(
 				"Couldn't watch %d directories under %s, will poll every %s",
-				result.Unwatched, r.dir, unwatchedPollInterval,
+				result.Unwatched, r.path, unwatchedPollInterval,
 			)
 			if result.Err != nil {
-				log.Printf("watching %s: %v", r.dir, result.Err)
+				log.Printf("watching %s: %v", r.path, result.Err)
+			}
+		}
+	}
+	if options.OnPollingRequired != nil {
+		obligations := watchPollingObligations(roots, results, unwatchedDirs, persistentDirAgents)
+		obligations = append(obligations, symlinkPollingObligations(symlinkGatedDirs)...)
+		for _, obligation := range obligations {
+			if err := options.OnPollingRequired(obligation); err != nil {
+				log.Printf("register polling obligation %q: %v", obligation.Key, err)
 			}
 		}
 	}
@@ -545,19 +2060,1045 @@ func startFileWatcher(
 			len(unwatchedDirs), unwatchedPollInterval,
 		)
 	}
-	watcher.Start()
-	return watcher.Stop, unwatchedDirs
+	if err := watcher.StartCollecting(); err != nil {
+		log.Printf("warning: file watcher startup failed: %v", err)
+	}
+	return watcher.Stop, watcher.OpenDispatch, unwatchedDirs,
+		watcher.QueueRetryBatch
+}
+
+// watchPollingObligations builds the polling obligations for the watch plan.
+// persistentDirAgents maps each clean persistent-polling dir to the providers
+// that requested persistent polling for it (from collectWatchRoots); persistent
+// obligations carry scopes only for those requesters. Other agents that merely
+// share the configured dir are covered by their own watch results, and pulling
+// them into another provider's persistent poll would reconcile them
+// authoritatively — tombstoning sessions under a lifecycle-owned missing root.
+func watchPollingObligations(
+	roots []watchRoot,
+	results []sync.RecursiveWatchResult,
+	unwatchedDirs []string,
+	persistentDirAgents map[string][]parser.AgentType,
+) []sync.PollingObligation {
+	type draft struct {
+		probe  string
+		scopes []pollingScope
+	}
+	byKey := make(map[string]*draft)
+	represented := make(map[string]struct{})
+
+	addScope := func(key, probe string, scopes ...pollingScope) {
+		if key == "" {
+			return
+		}
+		probe = filepath.Clean(probe)
+		if _, ok := byKey[key]; !ok {
+			byKey[key] = &draft{probe: probe}
+		}
+		for _, scope := range scopes {
+			if scope.Root == "" {
+				continue
+			}
+			scope.Root = filepath.Clean(scope.Root)
+			if !slices.Contains(byKey[key].scopes, scope) {
+				byKey[key].scopes = append(byKey[key].scopes, scope)
+			}
+			represented[scope.Root] = struct{}{}
+		}
+	}
+
+	for i, root := range roots {
+		var result sync.RecursiveWatchResult
+		if i < len(results) {
+			result = results[i]
+		}
+		if !result.MissingRootLifecycleOwned {
+			// Pending dirs: keyed on the physical root path; derive agent from scopes.
+			addScope(root.path, root.path, root.pollingScopesForDirs(root.pendingPollingDirs)...)
+		}
+		for _, dir := range root.persistentPollingDirs {
+			cleanDir := filepath.Clean(dir)
+			agents := persistentDirAgents[cleanDir]
+			if len(agents) == 0 {
+				addScope(pollingObligationKey("persistent", cleanDir), dir,
+					pollingScope{Root: dir})
+			} else {
+				for _, agent := range agents {
+					addScope(pollingObligationKey("persistent", cleanDir), dir,
+						pollingScope{Agent: agent, Root: dir})
+				}
+			}
+		}
+		if i >= len(results) {
+			// No watcher constructed: gate sync scopes on the physical root path,
+			// one obligation per agent so releases are independent.
+			for _, scope := range root.scopes {
+				key := pollingObligationKey("nowatcher:"+string(scope.agent), root.path)
+				addScope(key, root.path, pollingScope{Agent: scope.agent, Root: scope.syncDir})
+			}
+			continue
+		}
+		if result.Unwatched > 0 || result.BudgetExhausted ||
+			result.ResourceExhausted || result.Err != nil {
+			for _, scope := range root.scopes {
+				key := pollingObligationKey("degraded:"+string(scope.agent), root.path)
+				addScope(key, root.path, pollingScope{Agent: scope.agent, Root: scope.syncDir})
+			}
+		}
+	}
+	for _, dir := range unwatchedDirs {
+		cleanDir := filepath.Clean(dir)
+		if _, ok := represented[cleanDir]; !ok {
+			agents := persistentDirAgents[cleanDir]
+			if len(agents) == 0 {
+				addScope(pollingObligationKey("persistent", cleanDir), cleanDir,
+					pollingScope{Root: dir})
+			} else {
+				for _, agent := range agents {
+					addScope(pollingObligationKey("persistent", cleanDir), cleanDir,
+						pollingScope{Agent: agent, Root: dir})
+				}
+			}
+		}
+	}
+
+	obligations := make([]sync.PollingObligation, 0, len(byKey))
+	for key, d := range byKey {
+		if len(d.scopes) == 0 {
+			continue
+		}
+		ps := make([]sync.PollingScope, 0, len(d.scopes))
+		for _, scope := range d.scopes {
+			ps = append(ps, sync.PollingScope{Agent: string(scope.Agent), Root: scope.Root})
+		}
+		slices.SortFunc(ps, func(a, b sync.PollingScope) int {
+			if a.Agent != b.Agent {
+				return strings.Compare(a.Agent, b.Agent)
+			}
+			return strings.Compare(a.Root, b.Root)
+		})
+		obligations = append(obligations, sync.PollingObligation{
+			Key: key, Scopes: ps, Probe: d.probe,
+		})
+	}
+	slices.SortFunc(obligations, func(a, b sync.PollingObligation) int {
+		return strings.Compare(a.Key, b.Key)
+	})
+	return obligations
+}
+
+// registerWatcherUnavailableObligations installs the polling obligations for
+// a daemon whose file watcher could not be constructed: the coverage-degraded
+// fallback poll over every sync dir plus the same probe gates the success
+// path registers, from watchPollingObligations (root-keyed gates on every
+// physical watch root and persistent dirs) and symlinkPollingObligations
+// (symlink target gates). Without the gates, the fallback would poll a
+// configured dir that still exists while the nested root or symlink target
+// holding every session is gone, and authoritative reconciliation would
+// tombstone every baselined session beneath it. watchPollingObligations gets
+// nil results because no watcher registered any roots: no per-root
+// registration outcome exists, no missing-root lifecycle can be natively
+// owned, and every root therefore gates its sync scopes on its own path.
+// The probe gates are registered before the ungated coverage fallback: the
+// poll coordinator's ticker is already live, so a tick landing between two
+// synchronous registrations polls whatever is installed at that instant, and
+// a fallback installed first would reconcile a scope whose gate has not
+// landed yet. Returns the coverage callback's error so the caller can join
+// it with the construction failure.
+func registerWatcherUnavailableObligations(
+	options sync.WatcherOptions,
+	roots []watchRoot,
+	unwatchedDirs []string,
+	symlinkGatedDirs map[string][]watchScope,
+	persistentDirAgents map[string][]parser.AgentType,
+) error {
+	obligations := watchPollingObligations(roots, nil, unwatchedDirs, persistentDirAgents)
+	obligations = append(obligations, symlinkPollingObligations(symlinkGatedDirs)...)
+	if options.OnPollingRequired != nil {
+		for _, obligation := range obligations {
+			if err := options.OnPollingRequired(obligation); err != nil {
+				log.Printf(
+					"register polling obligation %q: %v", obligation.Key, err,
+				)
+			}
+		}
+	}
+	if options.OnCoverageDegraded == nil {
+		return nil
+	}
+	// Exclude dirs already covered by probe-gated obligations so the empty-agent
+	// coverage-degraded fallback does not bypass per-agent probe gates. Only
+	// apply this exclusion when OnPollingRequired is set: the probe-gated
+	// obligations are only installed when OnPollingRequired is non-nil, so when
+	// it is nil the exclusion would silently drop every dir (all obligations have
+	// probes) and coverage-degraded would never fire — breaking archive-watch
+	// call sites that set only OnCoverageDegraded.
+	fallbackDirs := unwatchedDirs
+	if options.OnPollingRequired != nil {
+		probeGated := make(map[string]struct{})
+		for _, ob := range obligations {
+			if ob.Probe != "" {
+				for _, scope := range ob.Scopes {
+					probeGated[scope.Root] = struct{}{}
+				}
+			}
+		}
+		filtered := make([]string, 0, len(unwatchedDirs))
+		for _, dir := range unwatchedDirs {
+			if _, ok := probeGated[filepath.Clean(dir)]; !ok {
+				filtered = append(filtered, dir)
+			}
+		}
+		fallbackDirs = filtered
+	}
+	if len(fallbackDirs) == 0 {
+		return nil
+	}
+	return options.OnCoverageDegraded(fallbackDirs)
+}
+
+// symlinkPollingObligations gates persistent polling of dirs whose recursive
+// provider root is a symlink on the symlink target itself. The persistent
+// obligation's probe is the configured dir, which can still exist while the
+// symlink target holding every session is gone; polling the dir then would
+// read the broken link as an empty discovery and tombstone every baselined
+// session beneath it. The poll coordinator blocks a root when any obligation
+// referencing it has a missing probe, so this composes with the dir's own
+// persistent obligation.
+func symlinkPollingObligations(
+	symlinkGatedDirs map[string][]watchScope,
+) []sync.PollingObligation {
+	obligations := make([]sync.PollingObligation, 0, len(symlinkGatedDirs))
+	for symRoot, gatedScopes := range symlinkGatedDirs {
+		scopes := make([]sync.PollingScope, 0, len(gatedScopes))
+		for _, scope := range gatedScopes {
+			ps := sync.PollingScope{
+				Agent: string(scope.agent),
+				Root:  filepath.Clean(scope.syncDir),
+			}
+			if !slices.Contains(scopes, ps) {
+				scopes = append(scopes, ps)
+			}
+		}
+		slices.SortFunc(scopes, func(a, b sync.PollingScope) int {
+			if a.Agent != b.Agent {
+				return strings.Compare(a.Agent, b.Agent)
+			}
+			return strings.Compare(a.Root, b.Root)
+		})
+		obligations = append(obligations, sync.PollingObligation{
+			Key:    "symlink:" + filepath.Clean(symRoot),
+			Scopes: scopes,
+			Probe:  filepath.Clean(symRoot),
+		})
+	}
+	slices.SortFunc(obligations, func(a, b sync.PollingObligation) int {
+		return strings.Compare(a.Key, b.Key)
+	})
+	return obligations
+}
+
+func accountRegisteredWatchRoots(
+	unwatchedDirs []string,
+	roots []watchRoot,
+	results []sync.RecursiveWatchResult,
+) []string {
+	persistent := make(map[string]bool)
+	for _, root := range roots {
+		for _, dir := range root.persistentPollingDirs {
+			persistent[dir] = true
+		}
+	}
+	covered := make(map[string]bool)
+	seen := make(map[string]bool)
+	for i, root := range roots {
+		if root.exists {
+			continue
+		}
+		pollingDirs := root.pendingPollingDirs
+		if len(pollingDirs) == 0 {
+			// Preserve the helper's historical behavior for callers that construct
+			// watch roots directly without collection metadata.
+			pollingDirs = root.syncDirs()
+		}
+		owned := i < len(results) && results[i].MissingRootLifecycleOwned
+		for _, dir := range pollingDirs {
+			if !seen[dir] {
+				seen[dir] = true
+				covered[dir] = owned
+			} else {
+				covered[dir] = covered[dir] && owned
+			}
+		}
+	}
+	return slices.DeleteFunc(unwatchedDirs, func(dir string) bool {
+		return covered[dir] && !persistent[dir]
+	})
+}
+
+type watchSyncer = sync.WatchBatchSyncer
+
+// gapReconciliationRetryBatch classifies a failed worker-to-watcher gap
+// reconciliation the same way the watcher callback path does: scoped retry
+// roots when the error carries them, otherwise an authoritative full sync.
+// The daemon queues the batch on the watcher before opening dispatch so the
+// affected roots re-reconcile with backoff.
+func gapReconciliationRetryBatch(gapErr error) sync.WatchBatch {
+	var pathsSource interface{ ReconciliationRetryPaths() []string }
+	var rootsSource interface{ ReconciliationRetryRoots() []string }
+	var overflowSource interface{ ReconciliationRetryOverflow() bool }
+	var paths, roots []string
+	if errors.As(gapErr, &pathsSource) {
+		paths = deduplicateStrings(pathsSource.ReconciliationRetryPaths())
+	}
+	if errors.As(gapErr, &rootsSource) {
+		roots = deduplicateStrings(rootsSource.ReconciliationRetryRoots())
+	}
+	if errors.As(gapErr, &overflowSource) && overflowSource.ReconciliationRetryOverflow() {
+		return sync.WatchBatch{FullSync: true}
+	}
+	if len(paths) > 0 || len(roots) > 0 {
+		return sync.WatchBatch{Paths: paths, ReconcileRoots: roots}
+	}
+	return sync.WatchBatch{FullSync: true}
+}
+
+// syncWatchBatch applies one watcher batch to the engine. recoveryScope
+// supplies the probed availability snapshot used by a full recovery
+// (overflow or unscoped rename) and by directory-rename promotion, per
+// probeWatchRecoveryScope. Probing at call time keeps unavailable scopes (an
+// unmounted volume, a missing provider subtree) out of authoritative
+// reconciliation, which would otherwise read them as empty discoveries and
+// tombstone every baselined session beneath them.
+func syncWatchBatch(
+	ctx context.Context,
+	engine watchSyncer,
+	batch sync.WatchBatch,
+	recoveryScope func() watchRecoveryScope,
+) error {
+	var recovery *sync.WatchRecoveryScope
+	if batch.FullSync || len(batch.Renames) > 0 {
+		probed := recoveryScope()
+		deferred := make([]string, 0, len(probed.deferred))
+		for root := range probed.deferred {
+			deferred = append(deferred, root)
+		}
+		sort.Strings(deferred)
+		recovery = &sync.WatchRecoveryScope{
+			AvailableRoots: append([]string(nil), probed.available...),
+			DeferredRoots:  deferred,
+		}
+	}
+	return sync.ApplyWatchBatch(ctx, engine, batch, recovery)
+}
+
+func deduplicateStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+type watchScope struct {
+	agent   parser.AgentType
+	syncDir string
+}
+
+type watchRoot struct {
+	path                  string
+	recursive             bool
+	exists                bool
+	scopes                []watchScope
+	pendingPollingDirs    []string
+	persistentPollingDirs []string
+}
+
+func (r watchRoot) registeredRoot() sync.WatchRoot {
+	scopes := make([]sync.WatchScope, 0, len(r.scopes))
+	for _, scope := range r.scopes {
+		scopes = append(scopes, sync.WatchScope{
+			Agent:   string(scope.agent),
+			SyncDir: scope.syncDir,
+		})
+	}
+	return sync.WatchRoot{
+		Path:      r.path,
+		Recursive: r.recursive,
+		Exists:    r.exists,
+		Scopes:    scopes,
+	}
+}
+
+func (r watchRoot) syncDirs() []string {
+	dirs := make([]string, 0, len(r.scopes))
+	for _, scope := range r.scopes {
+		dirs = appendUniqueString(dirs, scope.syncDir)
+	}
+	return dirs
+}
+
+// pollingScopesForDirs resolves pollingScope values for the given configured
+// dirs by matching against the root's scopes. Each dir emits one scope per
+// matching agent; dirs not matched by any scope use an empty agent.
+func (r watchRoot) pollingScopesForDirs(dirs []string) []pollingScope {
+	agentsByDir := make(map[string][]parser.AgentType, len(r.scopes))
+	for _, scope := range r.scopes {
+		if scope.syncDir != "" {
+			cleanDir := filepath.Clean(scope.syncDir)
+			if !slices.Contains(agentsByDir[cleanDir], scope.agent) {
+				agentsByDir[cleanDir] = append(agentsByDir[cleanDir], scope.agent)
+			}
+		}
+	}
+	var scopes []pollingScope
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		agents := agentsByDir[filepath.Clean(dir)]
+		if len(agents) == 0 {
+			ps := pollingScope{Root: dir}
+			if !slices.Contains(scopes, ps) {
+				scopes = append(scopes, ps)
+			}
+		} else {
+			for _, agent := range agents {
+				ps := pollingScope{Agent: agent, Root: dir}
+				if !slices.Contains(scopes, ps) {
+					scopes = append(scopes, ps)
+				}
+			}
+		}
+	}
+	return scopes
+}
+
+// collectWatchRoots resolves the configured watch plan. symlinkGatedDirs maps
+// each recursive provider root skipped because it is a symlink to the
+// configured dirs whose reconciliation scope its target availability gates;
+// those roots never join the watcher plan or the returned roots.
+// persistentDirAgents maps each clean persistent-polling dir to the providers
+// that requested persistent polling for it, so obligation scopes can stay
+// limited to the owning providers rather than every agent sharing the dir.
+func collectWatchRoots(cfg config.Config) (
+	roots []watchRoot,
+	unwatchedDirs []string,
+	symlinkGatedDirs map[string][]watchScope,
+	persistentDirAgents map[string][]parser.AgentType,
+) {
+	rootIndexes := make(map[string]int)
+	persistentPollingDirs := make(map[string]struct{})
+	symlinkGatedDirs = make(map[string][]watchScope)
+	persistentDirAgents = make(map[string][]parser.AgentType)
+	addPersistent := func(agent parser.AgentType, dir string) {
+		persistentPollingDirs[dir] = struct{}{}
+		unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
+		cleanDir := filepath.Clean(dir)
+		if !slices.Contains(persistentDirAgents[cleanDir], agent) {
+			persistentDirAgents[cleanDir] = append(persistentDirAgents[cleanDir], agent)
+		}
+	}
+	addRoot := func(agent parser.AgentType, dir, path string, recursive, exists bool) {
+		path = filepath.Clean(path)
+		scope := watchScope{agent: agent, syncDir: dir}
+		if idx, ok := rootIndexes[path]; ok {
+			roots[idx].recursive = roots[idx].recursive || recursive
+			roots[idx].exists = roots[idx].exists || exists
+			if !slices.Contains(roots[idx].scopes, scope) {
+				roots[idx].scopes = append(roots[idx].scopes, scope)
+			}
+			return
+		}
+		rootIndexes[path] = len(roots)
+		roots = append(roots, watchRoot{
+			path:      path,
+			recursive: recursive,
+			exists:    exists,
+			scopes:    []watchScope{scope},
+		})
+	}
+	for _, factory := range cfg.LocalProviderFactories() {
+		def := factory.Definition()
+		for _, d := range cfg.ResolveDirs(def.Type) {
+			addAgentRoot := func(dir, root string, recursive, exists bool) {
+				addRoot(def.Type, dir, root, recursive, exists)
+			}
+			if providerWatched, polling := collectProviderWatchRoots(factory, d, addAgentRoot); providerWatched {
+				if polling.persistent {
+					addPersistent(def.Type, d)
+				}
+				for _, symRoot := range polling.symlinkRoots {
+					scope := watchScope{agent: def.Type, syncDir: d}
+					if !slices.Contains(symlinkGatedDirs[symRoot], scope) {
+						symlinkGatedDirs[symRoot] = append(symlinkGatedDirs[symRoot], scope)
+					}
+				}
+				for _, missing := range polling.missingRoots {
+					idx, ok := rootIndexes[filepath.Clean(missing)]
+					if !ok || idx < 0 || idx >= len(roots) {
+						continue
+					}
+					roots[idx].pendingPollingDirs = appendUniqueString(
+						roots[idx].pendingPollingDirs, d,
+					)
+					unwatchedDirs = appendUniqueString(unwatchedDirs, d)
+				}
+				continue
+			}
+			if !def.FileBased {
+				addPersistent(def.Type, d)
+				continue
+			}
+			fallbackUnwatched := collectLegacyWatchRoots(def, d, addAgentRoot)
+			for _, pollingDir := range fallbackUnwatched {
+				addPersistent(def.Type, pollingDir)
+			}
+		}
+	}
+	for dir := range persistentPollingDirs {
+		for i := range roots {
+			if slices.Contains(roots[i].syncDirs(), dir) {
+				roots[i].persistentPollingDirs = appendUniqueString(
+					roots[i].persistentPollingDirs, dir,
+				)
+				break
+			}
+		}
+	}
+	return roots, unwatchedDirs, symlinkGatedDirs, persistentDirAgents
+}
+
+type providerPollingReasons struct {
+	missingRoots []string
+	// symlinkRoots are recursive provider roots skipped from watching because
+	// the root itself is a symlink. They are served by persistent polling, and
+	// their target availability gates the configured dir's reconciliation
+	// scope: a broken symlink streams an empty discovery without error.
+	symlinkRoots []string
+	persistent   bool
+}
+
+func collectProviderWatchRoots(
+	factory parser.ProviderFactory,
+	dir string,
+	addRoot func(dir, root string, recursive, exists bool),
+) (bool, providerPollingReasons) {
+	def := factory.Definition()
+	provider := factory.NewProvider(parser.ProviderConfig{
+		Roots: []string{dir},
+	})
+	roots, err := parser.ResolveWatchRoots(context.Background(), provider)
+	if err != nil || len(roots) == 0 {
+		if err != nil && !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
+			log.Printf("%s provider watch plan: %v", def.Type, err)
+		}
+		return false, providerPollingReasons{}
+	}
+	planned := false
+	var missingRoots []string
+	var polling providerPollingReasons
+	for _, providerRoot := range roots {
+		root := filepath.Clean(providerRoot.Path)
+		if root == "" || root == "." {
+			continue
+		}
+		planned = true
+		if providerRoot.Recursive && isSymlinkPath(root) {
+			polling.persistent = true
+			polling.symlinkRoots = append(polling.symlinkRoots, root)
+			continue
+		}
+		_, err := os.Stat(root)
+		exists := err == nil
+		addRoot(dir, root, providerRoot.Recursive, exists)
+		if exists {
+			continue
+		}
+		missingRoots = append(missingRoots, root)
+	}
+	if !planned {
+		return false, providerPollingReasons{}
+	}
+	// Portable backends need polling for missing targets. Lifecycle-aware
+	// backends can claim each target after acquiring bounded ancestor coverage;
+	// their activation gate reconciles the target before opening native dispatch.
+	polling.missingRoots = append(polling.missingRoots, missingRoots...)
+	return true, polling
+}
+
+func isSymlinkPath(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || info == nil {
+		return false
+	}
+	return info.Mode()&os.ModeSymlink != 0
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if slices.Contains(values, value) {
+		return values
+	}
+	return append(values, value)
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	for _, value := range additions {
+		values = appendUniqueString(values, value)
+	}
+	return values
+}
+
+// pathCoveredByAnyWatchRootCreation reports whether path is covered by an
+// existing watch root strongly enough to observe creation of the missing root.
+// Recursive roots cover the whole subtree. Shallow roots only cover direct
+// children because fsnotify can report that immediate directory creation, after
+// which the next watcher setup can add the provider's deeper watch root.
+func pathCoveredByAnyWatchRootCreation(path string, roots []watchRoot) bool {
+	for _, root := range roots {
+		if !root.exists {
+			continue
+		}
+		if !root.recursive {
+			if filepath.Dir(path) == root.path {
+				return true
+			}
+			continue
+		}
+		if path == root.path ||
+			strings.HasPrefix(path, root.path+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func collectLegacyWatchRoots(
+	def parser.AgentDef,
+	dir string,
+	addRoot func(dir, root string, recursive, exists bool),
+) []string {
+	var unwatchedDirs []string
+	if def.ShallowWatchRootsFunc != nil {
+		for _, watchDir := range def.ShallowWatchRootsFunc(dir) {
+			if _, err := os.Stat(watchDir); err == nil {
+				addRoot(dir, watchDir, false, true)
+			}
+		}
+	}
+	if def.WatchRootsFunc != nil {
+		watchDirs := def.WatchRootsFunc(dir)
+		if len(watchDirs) == 0 {
+			return append(unwatchedDirs, dir)
+		}
+		for _, watchDir := range watchDirs {
+			if _, err := os.Stat(watchDir); err == nil {
+				addRoot(dir, watchDir, !def.ShallowWatch, true)
+				continue
+			}
+			unwatchedDirs = append(unwatchedDirs, dir)
+		}
+		return unwatchedDirs
+	}
+	if len(def.WatchSubdirs) == 0 {
+		if _, err := os.Stat(dir); err == nil {
+			addRoot(dir, dir, !def.ShallowWatch, true)
+		}
+		return unwatchedDirs
+	}
+	for _, sub := range def.WatchSubdirs {
+		watchDir := filepath.Join(dir, sub)
+		if _, err := os.Stat(watchDir); err == nil {
+			addRoot(dir, watchDir, !def.ShallowWatch, true)
+		}
+	}
+	return unwatchedDirs
 }
 
 func startPeriodicSync(
-	engine *sync.Engine, database *db.DB,
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
+	idleTracker *server.IdleTracker,
+	validRemotes bool,
+	emitter sync.Emitter,
 ) {
+	if validRemotes {
+		for _, rh := range cfg.RemoteHosts {
+			if rh.Interval > 0 {
+				go startRemoteHostSync(
+					ctx, cfg, database, engine, rh, emitter, idleTracker,
+				)
+			}
+		}
+	}
+
+	// The daily archive audit runs on its own cadence in a worker process; it
+	// must never run the archive-scale pass in the daemon. Its own loop keeps the
+	// scheduled reconcile below (Task 5) untouched.
+	go startArchiveAudit(ctx, cfg, engine, database, lock, idleTracker, emitter)
+
+	// Remote object roots are static config; resolve them once. The scheduled
+	// reconcile targets are re-probed each tick because disk availability
+	// changes.
+	remoteRoots := remoteSourceSyncRoots(cfg)
+
 	ticker := time.NewTicker(periodicSyncInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		log.Println("Running scheduled sync...")
-		engine.SyncAll(context.Background(), nil)
-		recomputePendingSessions(engine, database)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		log.Println("Running scheduled reconciliation...")
+		idleTracker.Do(func() {
+			runScheduledSyncPass(ctx, engine, scheduledReconcileTargets(cfg))
+			runRemoteSourceSyncPass(ctx, engine, remoteRoots)
+			recomputePendingSessions(engine, database)
+		})
+	}
+}
+
+// startArchiveAudit drives the daily archive audit with retry-and-backoff
+// scheduling. Each attempt runs entirely in a worker process (via
+// runWorkerWritePass) wrapped in idleTracker.Do; a failed attempt is retained
+// and retried with a growing delay rather than falling back in process.
+func startArchiveAudit(
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
+	idleTracker *server.IdleTracker,
+	emitter sync.Emitter,
+) {
+	runArchiveAuditLoop(
+		ctx,
+		func(ctx context.Context, delay time.Duration) bool {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-timer.C:
+				return true
+			}
+		},
+		func(ctx context.Context) bool {
+			return runArchiveAuditAttempt(ctx, idleTracker, func(ctx context.Context) error {
+				return runArchiveAudit(ctx, cfg, engine, database, lock, emitter)
+			})
+		},
+	)
+}
+
+// runArchiveAuditAttempt runs one audit attempt as idle-tracked work and reports
+// success. It logs the worker's actual error on failure so the terminal Error
+// string is visible in debug.log, but stays quiet once the context is cancelled
+// so shutdown does not emit a spurious failure line.
+func runArchiveAuditAttempt(
+	ctx context.Context,
+	idleTracker *server.IdleTracker,
+	audit func(context.Context) error,
+) bool {
+	ok := false
+	idleTracker.Do(func() {
+		if err := audit(ctx); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("archive audit attempt failed: %v", err)
+			}
+			return
+		}
+		ok = true
+	})
+	return ok
+}
+
+// runArchiveAuditLoop waits, runs one audit attempt, then reschedules from the
+// outcome: success returns to the daily interval; failure retries after a delay
+// that doubles each time and caps at archiveAuditInterval. wait blocks for the
+// delay and reports false when the context is done; audit reports whether the
+// attempt succeeded.
+func runArchiveAuditLoop(
+	ctx context.Context,
+	wait func(context.Context, time.Duration) bool,
+	audit func(context.Context) bool,
+) {
+	delay := archiveAuditInterval
+	retry := archiveAuditRetryInitial
+	for {
+		if !wait(ctx, delay) {
+			return
+		}
+		if audit(ctx) {
+			delay = archiveAuditInterval
+			retry = archiveAuditRetryInitial
+			continue
+		}
+		delay = retry
+		if ctx.Err() == nil {
+			log.Printf("archive audit failed; next attempt in %s", retry)
+		}
+		retry = min(retry*2, archiveAuditInterval)
+	}
+}
+
+// runArchiveAudit executes one audit attempt: a full authoritative
+// reconciliation in a worker process via runWorkerWritePass, never in the
+// daemon. It emits "sessions" whenever the terminal result reports committed
+// changes — synced or tombstoned — even when the pass also failed, because the
+// retry sees those rows as already synchronized and would never re-notify SSE
+// clients or the embedding scheduler. It returns an error on any failure —
+// spawn, pre-launch handoff, or a ran-and-failed worker — so the caller
+// retries with backoff; it never falls back to an in-process pass. The
+// daemon's in-memory skip cache is reloaded by runWorkerWritePass inside the
+// pass's own exclusive section, so no queued sync can re-persist stale
+// entries the audit worker removed.
+func runArchiveAudit(
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	lock *writeOwnerLock,
+	emitter sync.Emitter,
+) error {
+	result, err := runWorkerWritePass(
+		ctx, ctx, cfg, engine, database, lock, "audit", nil,
+	)
+	if workerResultHasSessionChanges(result) && emitter != nil {
+		emitter.Emit("sessions")
+	}
+	return err
+}
+
+// workerResultHasSessionChanges reports whether a worker pass changed rows
+// clients must refetch. Cwd-only reconciliations ride the serialized
+// SyncStats payload rather than the summary counters, so the audit emit
+// must consult it or a cwd-only pass would leave the UI stale.
+func workerResultHasSessionChanges(result workerResult) bool {
+	if result.Synced > 0 || result.Tombstoned > 0 {
+		return true
+	}
+	return result.Stats != nil && result.Stats.CwdUpdated > 0
+}
+
+// scheduledSyncEngine is the reconciliation surface the scheduled pass needs.
+// Native-watched providers already get event-driven sync plus degraded-coverage
+// polling, so the scheduled pass only reconciles the opted-in providers.
+type scheduledSyncEngine interface {
+	ReconcileProviderRoots(ctx context.Context, agent parser.AgentType, roots []string) error
+}
+
+// scheduledReconcileTarget pairs an opted-in provider with the configured roots
+// the scheduled pass must reconcile for it.
+type scheduledReconcileTarget struct {
+	Agent parser.AgentType
+	Roots []string
+}
+
+// scheduledReconcileTargets selects the configured roots for providers that
+// declare PeriodicReconcile. Every other provider is covered by the watcher and
+// the degraded-coverage poller, so the scheduled pass leaves them untouched.
+// A candidate scope overlapping a missing same-agent scope in either direction
+// is deferred with it: the engine expands a requested root to every configured
+// same-agent dir that is its ancestor or descendant, so reconciling the
+// present scope would read the missing one as an authoritative empty discovery
+// and tombstone every session beneath it.
+func scheduledReconcileTargets(cfg config.Config) []scheduledReconcileTarget {
+	roots, _, _, _ := collectWatchRoots(cfg)
+	deferred := make(map[parser.AgentType]map[string]struct{})
+	for _, root := range roots {
+		if root.exists {
+			continue
+		}
+		for _, scope := range root.scopes {
+			if deferred[scope.agent] == nil {
+				deferred[scope.agent] = make(map[string]struct{})
+			}
+			deferred[scope.agent][scope.syncDir] = struct{}{}
+		}
+	}
+	byAgent := make(map[parser.AgentType][]string)
+	for _, root := range roots {
+		if !root.exists {
+			continue
+		}
+		for _, scope := range root.scopes {
+			if overlapsDeferredScope(scope.syncDir, deferred[scope.agent]) {
+				continue
+			}
+			byAgent[scope.agent] = appendUniqueString(byAgent[scope.agent], scope.syncDir)
+		}
+	}
+	var targets []scheduledReconcileTarget
+	for _, def := range parser.Registry {
+		if !def.PeriodicReconcile {
+			continue
+		}
+		dirs := byAgent[def.Type]
+		if len(dirs) == 0 {
+			continue
+		}
+		targets = append(targets, scheduledReconcileTarget{Agent: def.Type, Roots: dirs})
+	}
+	return targets
+}
+
+// runScheduledSyncPass reconciles each opted-in provider within its own scope.
+// A failure for one provider is logged and does not block the others.
+func runScheduledSyncPass(
+	ctx context.Context, engine scheduledSyncEngine, targets []scheduledReconcileTarget,
+) {
+	started := time.Now()
+	log.Printf("scheduled reconciliation started: targets=%d", len(targets))
+	var firstErr error
+	failed := 0
+	for _, target := range targets {
+		if err := engine.ReconcileProviderRoots(ctx, target.Agent, target.Roots); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			failed++
+			log.Printf(
+				"scheduled reconciliation for %s failed: error_type=%T",
+				target.Agent, err,
+			)
+		}
+	}
+	log.Printf(
+		"scheduled reconciliation finished: targets=%d failed=%d duration=%s outcome=%s",
+		len(targets), failed, time.Since(started).Round(time.Millisecond),
+		syncLifecycleOutcome(ctx, firstErr),
+	)
+}
+
+func startRemoteHostSync(
+	ctx context.Context,
+	cfg config.Config,
+	database *db.DB,
+	engine *sync.Engine,
+	rh config.RemoteHost,
+	emitter sync.Emitter,
+	idleTracker *server.IdleTracker,
+) {
+	syncFn := remoteHostSyncFunc(
+		ctx, cfg, database, engine, rh,
+		func(
+			ctx context.Context,
+			cfg config.Config,
+			database *db.DB,
+			rh config.RemoteHost,
+			full bool,
+		) (remotesync.SyncStats, error) {
+			return runRemoteSyncTransportWithCleanup(
+				ctx, cfg, database, rh, full, false,
+			)
+		},
+	)
+	runRemoteHostSyncLoop(ctx, rh.Host, rh.Interval, syncFn, emitter, idleTracker, nil)
+}
+
+type remoteSyncExclusiveRunner interface {
+	RunExclusive(func() error) error
+}
+
+type remoteSyncRunner func(
+	context.Context,
+	config.Config,
+	*db.DB,
+	config.RemoteHost,
+	bool,
+) (remotesync.SyncStats, error)
+
+// remoteHostSyncFunc owns the HTTP cleanup registry around the engine lock.
+// Its injected transport must therefore run HTTP without acquiring that
+// registry recursively; SSH transports have no cleanup-registry ownership.
+func remoteHostSyncFunc(
+	ctx context.Context,
+	cfg config.Config,
+	database *db.DB,
+	runner remoteSyncExclusiveRunner,
+	rh config.RemoteHost,
+	runRemote remoteSyncRunner,
+) func() (int, error) {
+	return func() (int, error) {
+		if runner == nil {
+			return 0, fmt.Errorf("scheduled remote sync missing exclusive runner")
+		}
+		runExclusive := func() (remotesync.SyncStats, error) {
+			var stats remotesync.SyncStats
+			err := runner.RunExclusive(func() error {
+				var err error
+				stats, err = runRemote(
+					ctx, cfg, database, rh, database.NeedsResync(),
+				)
+				return err
+			})
+			return stats, err
+		}
+		var stats remotesync.SyncStats
+		var err error
+		if rh.Transport == config.RemoteTransportHTTP {
+			stats, err = httpRemoteCleanupRegistry.Run(runExclusive)
+		} else {
+			stats, err = runExclusive()
+		}
+		return stats.SessionsSynced, err
+	}
+}
+
+// runRemoteHostSyncLoop drives the per-host sync ticker. syncFn returns
+// the number of sessions synced so we only emit when data changed.
+// When done is non-nil, closing it stops the loop.
+func runRemoteHostSyncLoop(
+	ctx context.Context,
+	host string,
+	interval time.Duration,
+	syncFn func() (int, error),
+	emitter sync.Emitter,
+	idleTracker *server.IdleTracker,
+	done <-chan struct{},
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		log.Printf("Running scheduled remote sync for %s...", host)
+		finishWork, ok := idleTracker.BeginWork()
+		if !ok {
+			log.Printf("scheduled remote sync %s skipped: daemon is shutting down", host)
+			continue
+		}
+		var synced int
+		var err error
+		func() {
+			defer finishWork()
+			synced, err = syncFn()
+		}()
+		if err != nil {
+			log.Printf("scheduled remote sync %s: %v", host, err)
+			continue
+		}
+		if synced > 0 && emitter != nil {
+			emitter.Emit("sessions")
+		}
 	}
 }
 
@@ -585,14 +3126,5 @@ func recomputePendingSessions(
 		// deferred-recompute loop is best-effort, the next
 		// pass will retry any that failed.
 		_ = engine.RecomputeSignals(context.Background(), id)
-	}
-}
-
-func startUnwatchedPoll(engine *sync.Engine) {
-	ticker := time.NewTicker(unwatchedPollInterval)
-	defer ticker.Stop()
-	for range ticker.C {
-		log.Println("Polling unwatched directories...")
-		engine.SyncAll(context.Background(), nil)
 	}
 }

@@ -1,13 +1,16 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestDiscoverAndFindOpenHandsSessions(t *testing.T) {
@@ -25,22 +28,34 @@ func TestDiscoverAndFindOpenHandsSessions(t *testing.T) {
 		0o644,
 	))
 
-	files := DiscoverOpenHandsSessions(root)
-	require.Len(t, files, 1)
-	assert.Equal(t, sessionDir, files[0].Path)
-	assert.Equal(t, AgentOpenHands, files[0].Agent)
+	provider, ok := NewProvider(AgentOpenHands, ProviderConfig{
+		Roots: []string{root},
+	})
+	require.True(t, ok)
 
-	assert.Equal(
-		t, sessionDir,
-		FindOpenHandsSourceFile(root, sessionID),
-	)
-	assert.Equal(
-		t, sessionDir,
-		FindOpenHandsSourceFile(root, dirName),
-	)
+	sources, err := provider.Discover(context.Background())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, sessionDir, sources[0].DisplayPath)
+	assert.Equal(t, AgentOpenHands, sources[0].Provider)
+
+	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+		RawSessionID: sessionID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, sessionDir, found.DisplayPath)
+
+	found, ok, err = provider.FindSource(context.Background(), FindSourceRequest{
+		RawSessionID: dirName,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, sessionDir, found.DisplayPath)
 }
 
 func TestParseOpenHandsSession(t *testing.T) {
+
 	root := t.TempDir()
 	projectDir := filepath.Join(root, "demo-repo")
 	require.NoError(t, os.MkdirAll(projectDir, 0o755))
@@ -116,10 +131,27 @@ func TestParseOpenHandsSession(t *testing.T) {
 		))
 	}
 
-	sess, msgs, err := ParseOpenHandsSession(
-		sessionDir, "local",
-	)
+	provider, ok := NewProvider(AgentOpenHands, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "local",
+	})
+	require.True(t, ok)
+	source, found, err := provider.FindSource(context.Background(), FindSourceRequest{
+		StoredFilePath: sessionDir,
+	})
 	require.NoError(t, err)
+	require.True(t, found)
+	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	outcome, err := provider.Parse(context.Background(), ParseRequest{
+		Source:      source,
+		Fingerprint: fingerprint,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := &outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
 	require.NotNil(t, sess)
 	require.Len(t, msgs, 4)
 
@@ -160,4 +192,24 @@ func TestParseOpenHandsSession(t *testing.T) {
 	assert.True(t, msgs[3].HasThinking)
 	assert.Equal(t, "litellm_proxy/claude-sonnet-4-6", msgs[3].Model)
 	assert.Contains(t, msgs[3].Content, "The panic happens during startup.")
+}
+
+func TestParseOpenHandsObservationWithoutToolCallIsMarkedToolOutput(t *testing.T) {
+	event := gjson.Parse(`{
+		"id":"e9",
+		"source":"environment",
+		"observation":{
+			"content":[{"type":"text","text":"token=abc123"}],
+			"kind":"TerminalObservation"
+		},
+		"kind":"ObservationEvent"
+	}`)
+
+	msg, ok, _ := parseOpenHandsObservationEvent(event, 3, time.Time{})
+
+	require.True(t, ok)
+	assert.Equal(t, RoleUser, msg.Role)
+	assert.Equal(t, "token=abc123", msg.Content)
+	assert.Equal(t, SourceSubtypeToolResult, msg.SourceSubtype,
+		"an observation with no tool call to pair with is still tool output")
 }

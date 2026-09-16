@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const forgeSchema = `
@@ -39,21 +42,16 @@ func (s *ForgeSeeder) AddConversation(
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		conversationID, title, workspaceID, context, createdAt, updatedAt, metrics,
 	)
-	if err != nil {
-		s.t.Fatalf("add conversation: %v", err)
-	}
+	require.NoError(s.t, err, "add conversation")
 }
 
 func newForgeTestDB(t *testing.T) (string, *ForgeSeeder, *sql.DB) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), ".forge.db")
 	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		t.Fatalf("open test db: %v", err)
-	}
-	if _, err := db.Exec(forgeSchema); err != nil {
-		t.Fatalf("create schema: %v", err)
-	}
+	require.NoError(t, err, "open test db")
+	_, err = db.Exec(forgeSchema)
+	require.NoError(t, err, "create schema")
 	seeder := &ForgeSeeder{db: db, t: t}
 	return dbPath, seeder, db
 }
@@ -168,10 +166,8 @@ func TestParseForgeDB_StandardConversation(t *testing.T) {
 	defer db.Close()
 	seedForgeConversation(t, seeder)
 
-	sessions, err := ParseForgeDB(dbPath, "testmachine")
-	if err != nil {
-		t.Fatalf("ParseForgeDB: %v", err)
-	}
+	sessions, err := parseForgeAll(dbPath, "testmachine")
+	require.NoError(t, err, "ParseForgeDB")
 
 	assertEq(t, "sessions len", len(sessions), 1)
 	s := sessions[0]
@@ -179,7 +175,7 @@ func TestParseForgeDB_StandardConversation(t *testing.T) {
 	assertEq(t, "Agent", s.Session.Agent, AgentForge)
 	assertEq(t, "Machine", s.Session.Machine, "testmachine")
 	assertEq(t, "Project", s.Session.Project, "agentsview")
-	assertEq(t, "DisplayName", s.Session.DisplayName, "Add Forge Support")
+	assertEq(t, "SessionName", s.Session.SessionName, "Add Forge Support")
 	assertEq(t, "UserMessageCount", s.Session.UserMessageCount, 1)
 	assertEq(t, "FirstMessage", s.Session.FirstMessage, "Please add Forge support.")
 	assertEq(t, "Cwd", s.Session.Cwd, "/home/mj/dev/projects/agentsview")
@@ -204,13 +200,9 @@ func TestParseForgeSession_SingleConversation(t *testing.T) {
 	defer db.Close()
 	seedForgeConversation(t, seeder)
 
-	sess, msgs, err := ParseForgeSession(dbPath, "conv-001", "testmachine")
-	if err != nil {
-		t.Fatalf("ParseForgeSession: %v", err)
-	}
-	if sess == nil {
-		t.Fatal("expected non-nil session")
-	}
+	sess, msgs, err := parseForgeSession(t.Context(), dbPath, "conv-001", "testmachine", false)
+	require.NoError(t, err, "parseForgeSession")
+	require.NotNil(t, sess, "expected non-nil session")
 
 	assertEq(t, "ID", sess.ID, "forge:conv-001")
 	assertEq(t, "Agent", sess.Agent, AgentForge)
@@ -228,16 +220,12 @@ func TestListForgeSessionMeta(t *testing.T) {
 	seedForgeConversation(t, seeder)
 
 	metas, err := ListForgeSessionMeta(dbPath)
-	if err != nil {
-		t.Fatalf("ListForgeSessionMeta: %v", err)
-	}
+	require.NoError(t, err, "ListForgeSessionMeta")
 
 	assertEq(t, "metas len", len(metas), 1)
 	assertEq(t, "SessionID", metas[0].SessionID, "conv-001")
 	assertEq(t, "VirtualPath", metas[0].VirtualPath, dbPath+"#conv-001")
-	if metas[0].FileMtime == 0 {
-		t.Error("expected non-zero FileMtime")
-	}
+	assert.NotZero(t, metas[0].FileMtime, "expected non-zero FileMtime")
 }
 
 func TestCollectForgeToolCalls_TaskSubagentIDPrefixed(t *testing.T) {
@@ -278,16 +266,10 @@ func TestCollectForgeToolCalls_TaskSubagentIDPrefixed(t *testing.T) {
 		"2026-05-02 10:00:00", "2026-05-02 10:00:01", "",
 	)
 
-	sess, msgs, err := ParseForgeSession(dbPath, "parent-conv", "m")
-	if err != nil {
-		t.Fatalf("ParseForgeSession: %v", err)
-	}
-	if sess == nil {
-		t.Fatal("expected non-nil session")
-	}
-	if len(msgs) == 0 {
-		t.Fatal("expected messages")
-	}
+	sess, msgs, err := parseForgeSession(t.Context(), dbPath, "parent-conv", "m", false)
+	require.NoError(t, err, "parseForgeSession")
+	require.NotNil(t, sess, "expected non-nil session")
+	require.NotEmpty(t, msgs, "expected messages")
 	var taskCall *ParsedToolCall
 	for i := range msgs {
 		for j := range msgs[i].ToolCalls {
@@ -296,19 +278,17 @@ func TestCollectForgeToolCalls_TaskSubagentIDPrefixed(t *testing.T) {
 			}
 		}
 	}
-	if taskCall == nil {
-		t.Fatal("expected task tool call")
-	}
+	require.NotNil(t, taskCall, "expected task tool call")
 	assertEq(t, "SubagentSessionID", taskCall.SubagentSessionID, "forge:child-conv-001")
 }
 
-func TestFindForgeDBPath(t *testing.T) {
+func TestForgeDBPath(t *testing.T) {
 	dir := t.TempDir()
-	assertEq(t, "not found", FindForgeDBPath(dir), "")
+	assertEq(t, "not found", forgeDBPath(dir), "")
 
 	dbPath, _, db := newForgeTestDB(t)
 	defer db.Close()
-	assertEq(t, "found", FindForgeDBPath(filepath.Dir(dbPath)), dbPath)
+	assertEq(t, "found", forgeDBPath(filepath.Dir(dbPath)), dbPath)
 }
 
 // ---------------------------------------------------------------------------
@@ -361,21 +341,16 @@ func TestForgeTokenFallbacks(t *testing.T) {
 			"", // empty metrics → accumulateMessageTokenUsage fallback
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		s := sessions[0].Session
 		assertEq(t, "HasTotalOutputTokens", s.HasTotalOutputTokens, true)
 		assertEq(t, "TotalOutputTokens", s.TotalOutputTokens, 25) // 10+15
 		assertEq(t, "HasPeakContextTokens", s.HasPeakContextTokens, true)
-		if s.PeakContextTokens != 110 && s.PeakContextTokens != 70 {
-			// Peak is max(50+20=70, 80+30=110) = 110
-			t.Errorf("PeakContextTokens = %d, want 110", s.PeakContextTokens)
-		}
+		// Peak is max(50+20=70, 80+30=110) = 110
+		assert.Contains(t, []int{110, 70}, s.PeakContextTokens,
+			"PeakContextTokens = %d, want 110", s.PeakContextTokens)
 	})
 
 	// Case 2: metrics has only output_tokens (no input, no cached).
@@ -412,13 +387,9 @@ func TestForgeTokenFallbacks(t *testing.T) {
 			`{"output_tokens": 42}`,
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		s := sessions[0].Session
 		assertEq(t, "HasTotalOutputTokens", s.HasTotalOutputTokens, true)
 		assertEq(t, "TotalOutputTokens", s.TotalOutputTokens, 42)
@@ -455,17 +426,11 @@ func TestForgeTokenFallbacks(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		msgs := sessions[0].Messages
-		if len(msgs) == 0 {
-			t.Fatal("want at least 1 message")
-		}
+		require.NotEmpty(t, msgs, "want at least 1 message")
 		assertEq(t, "HasContextTokens", msgs[0].HasContextTokens, true)
 		assertEq(t, "ContextTokens", msgs[0].ContextTokens, 60) // only prompt, no cached
 	})
@@ -495,17 +460,11 @@ func TestForgeTokenFallbacks(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		msgs := sessions[0].Messages
-		if len(msgs) == 0 {
-			t.Fatal("want at least 1 message")
-		}
+		require.NotEmpty(t, msgs, "want at least 1 message")
 		m := msgs[0]
 		assertEq(t, "HasContextTokens", m.HasContextTokens, false)
 		assertEq(t, "HasOutputTokens", m.HasOutputTokens, false)
@@ -555,13 +514,9 @@ func TestForgeDegenerate(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		// Only the user message; empty assistant was skipped.
 		assertEq(t, "messages len", len(sessions[0].Messages), 1)
 		assertEq(t, "role", sessions[0].Messages[0].Role, RoleUser)
@@ -601,13 +556,9 @@ func TestForgeDegenerate(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		// Only the user message; tool result with empty call_id was skipped.
 		assertEq(t, "messages len", len(sessions[0].Messages), 1)
 	})
@@ -638,13 +589,9 @@ func TestForgeDegenerate(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		msgs := sessions[0].Messages
 		assertEq(t, "messages len", len(msgs), 1)
 		assertEq(t, "content", msgs[0].Content, "raw text fallback")
@@ -681,13 +628,9 @@ func TestForgeCwdEdgeCases(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		s := sessions[0].Session
 		assertEq(t, "Cwd", s.Cwd, "")
 		assertEq(t, "Project", s.Project, ExtractProjectFromCwd(""))
@@ -727,13 +670,9 @@ func TestForgeCwdEdgeCases(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		assertEq(t, "Cwd", sessions[0].Session.Cwd, "")
 	})
 
@@ -771,13 +710,9 @@ func TestForgeCwdEdgeCases(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		assertEq(t, "Cwd", sessions[0].Session.Cwd, "")
 	})
 
@@ -806,13 +741,9 @@ func TestForgeCwdEdgeCases(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		s := sessions[0].Session
 		assertEq(t, "Cwd", s.Cwd, "/home/mj/dev/projects/myapp")
 		assertEq(t, "Project", s.Project, "myapp")
@@ -839,11 +770,12 @@ func TestParseForgeTimestamp(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
 			got := parseForgeTimestamp(tc.input)
-			if tc.empty && !got.IsZero() {
-				t.Errorf("parseForgeTimestamp(%q) = %v, want zero", tc.input, got)
-			}
-			if !tc.empty && got.IsZero() {
-				t.Errorf("parseForgeTimestamp(%q) returned zero time", tc.input)
+			if tc.empty {
+				assert.True(t, got.IsZero(),
+					"parseForgeTimestamp(%q) = %v, want zero", tc.input, got)
+			} else {
+				assert.False(t, got.IsZero(),
+					"parseForgeTimestamp(%q) returned zero time", tc.input)
 			}
 		})
 	}
@@ -879,24 +811,16 @@ func TestForgeEndedAtFallback(t *testing.T) {
 		"",
 	)
 	// Override to NULL updated_at.
-	if _, err := db.Exec("UPDATE conversations SET updated_at = NULL WHERE conversation_id = 'ended-fallback'"); err != nil {
-		t.Fatalf("update: %v", err)
-	}
+	_, err := db.Exec("UPDATE conversations SET updated_at = NULL WHERE conversation_id = 'ended-fallback'")
+	require.NoError(t, err, "update")
 
-	sessions, err := ParseForgeDB(dbPath, "m")
-	if err != nil {
-		t.Fatalf("ParseForgeDB: %v", err)
-	}
-	if len(sessions) != 1 {
-		t.Fatalf("want 1 session, got %d", len(sessions))
-	}
+	sessions, err := parseForgeAll(dbPath, "m")
+	require.NoError(t, err, "ParseForgeDB")
+	require.Len(t, sessions, 1)
 	s := sessions[0].Session
-	if s.EndedAt.IsZero() {
-		t.Error("EndedAt is zero, want fallback to StartedAt")
-	}
-	if !s.StartedAt.Equal(s.EndedAt) {
-		t.Errorf("EndedAt = %v, want StartedAt = %v", s.EndedAt, s.StartedAt)
-	}
+	assert.False(t, s.EndedAt.IsZero(), "EndedAt is zero, want fallback to StartedAt")
+	assert.True(t, s.StartedAt.Equal(s.EndedAt),
+		"EndedAt = %v, want StartedAt = %v", s.EndedAt, s.StartedAt)
 }
 
 // ---------------------------------------------------------------------------
@@ -940,22 +864,13 @@ func TestForgeToolOutputText(t *testing.T) {
 			"",
 		)
 
-		sessions, err := ParseForgeDB(dbPath, "m")
-		if err != nil {
-			t.Fatalf("ParseForgeDB: %v", err)
-		}
-		if len(sessions) != 1 {
-			t.Fatalf("want 1 session, got %d", len(sessions))
-		}
+		sessions, err := parseForgeAll(dbPath, "m")
+		require.NoError(t, err, "ParseForgeDB")
+		require.Len(t, sessions, 1)
 		msgs := sessions[0].Messages
-		if len(msgs) < 2 {
-			t.Fatalf("want at least 2 messages, got %d", len(msgs))
-		}
+		require.GreaterOrEqual(t, len(msgs), 2, "want at least 2 messages")
 		// Second message is the tool result (role=user with ToolResults)
-		tr := msgs[1].ToolResults
-		if len(tr) == 0 {
-			t.Fatal("expected tool result")
-		}
+		require.NotEmpty(t, msgs[1].ToolResults, "expected tool result")
 	})
 }
 
@@ -1021,13 +936,9 @@ func TestForgeSkillToolName(t *testing.T) {
 				"",
 			)
 
-			sessions, err := ParseForgeDB(dbPath, "m")
-			if err != nil {
-				t.Fatalf("ParseForgeDB: %v", err)
-			}
-			if len(sessions) != 1 {
-				t.Fatalf("want 1 session, got %d", len(sessions))
-			}
+			sessions, err := parseForgeAll(dbPath, "m")
+			require.NoError(t, err, "ParseForgeDB")
+			require.Len(t, sessions, 1)
 			var skillCall *ParsedToolCall
 			for i := range sessions[0].Messages {
 				for j := range sessions[0].Messages[i].ToolCalls {
@@ -1036,9 +947,7 @@ func TestForgeSkillToolName(t *testing.T) {
 					}
 				}
 			}
-			if skillCall == nil {
-				t.Fatal("expected skill tool call")
-			}
+			require.NotNil(t, skillCall, "expected skill tool call")
 			assertEq(t, "SkillName", skillCall.SkillName, tc.wantSkill)
 		})
 	}
@@ -1085,18 +994,12 @@ func TestForgeReasoningNoText(t *testing.T) {
 		"",
 	)
 
-	sessions, err := ParseForgeDB(dbPath, "m")
-	if err != nil {
-		t.Fatalf("ParseForgeDB: %v", err)
-	}
-	if len(sessions) != 1 {
-		t.Fatalf("want 1 session, got %d", len(sessions))
-	}
+	sessions, err := parseForgeAll(dbPath, "m")
+	require.NoError(t, err, "ParseForgeDB")
+	require.Len(t, sessions, 1)
 	msgs := sessions[0].Messages
 	// User + assistant
-	if len(msgs) < 2 {
-		t.Fatalf("want at least 2 messages, got %d", len(msgs))
-	}
+	require.GreaterOrEqual(t, len(msgs), 2, "want at least 2 messages")
 	asst := msgs[1]
 	assertEq(t, "HasThinking", asst.HasThinking, false)
 }

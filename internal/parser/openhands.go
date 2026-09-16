@@ -1,13 +1,13 @@
 package parser
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -19,82 +19,6 @@ const (
 	openHandsActionEvent      = "ActionEvent"
 	openHandsObservationEvent = "ObservationEvent"
 )
-
-// DiscoverOpenHandsSessions finds OpenHands CLI conversation
-// directories under ~/.openhands/conversations.
-func DiscoverOpenHandsSessions(
-	conversationsDir string,
-) []DiscoveredFile {
-	entries, err := os.ReadDir(conversationsDir)
-	if err != nil {
-		return nil
-	}
-
-	var files []DiscoveredFile
-	for _, entry := range entries {
-		if !entry.IsDir() || !IsValidSessionID(entry.Name()) {
-			continue
-		}
-		sessionDir := filepath.Join(
-			conversationsDir, entry.Name(),
-		)
-		if !isOpenHandsSessionDir(sessionDir) {
-			continue
-		}
-		files = append(files, DiscoveredFile{
-			Path:  sessionDir,
-			Agent: AgentOpenHands,
-		})
-	}
-
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Path < files[j].Path
-	})
-	return files
-}
-
-// FindOpenHandsSourceFile locates an OpenHands conversation
-// directory by its raw session ID.
-func FindOpenHandsSourceFile(
-	conversationsDir, rawID string,
-) string {
-	if conversationsDir == "" || !IsValidSessionID(rawID) {
-		return ""
-	}
-
-	candidates := []string{rawID}
-	stripped := strings.ReplaceAll(rawID, "-", "")
-	if stripped != rawID {
-		candidates = append(candidates, stripped)
-	}
-
-	for _, cand := range candidates {
-		sessionDir := filepath.Join(conversationsDir, cand)
-		if isOpenHandsSessionDir(sessionDir) {
-			return sessionDir
-		}
-	}
-
-	entries, err := os.ReadDir(conversationsDir)
-	if err != nil {
-		return ""
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		sessionDir := filepath.Join(
-			conversationsDir, entry.Name(),
-		)
-		if !isOpenHandsSessionDir(sessionDir) {
-			continue
-		}
-		if normalizeOpenHandsSessionID(entry.Name()) == normalizeOpenHandsSessionID(rawID) {
-			return sessionDir
-		}
-	}
-	return ""
-}
 
 // OpenHandsSnapshot computes synthetic file metadata for an
 // OpenHands conversation directory by hashing the relevant
@@ -184,9 +108,10 @@ func OpenHandsSnapshot(path string) (FileInfo, error) {
 	}, nil
 }
 
-// ParseOpenHandsSession parses a single OpenHands CLI
-// conversation directory into a session and messages.
-func ParseOpenHandsSession(
+// parseSession parses a single OpenHands CLI conversation
+// directory into a session and messages.
+func (p *openHandsProvider) parseSession(
+	ctx context.Context,
 	path, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	sessionDir, err := normalizeOpenHandsSessionPath(path)
@@ -316,7 +241,7 @@ func ParseOpenHandsSession(
 
 	project := ""
 	if cwd != "" {
-		project = ExtractProjectFromCwd(cwd)
+		project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
 	}
 	if project == "" {
 		project = "openhands"
@@ -351,7 +276,7 @@ func parseOpenHandsMessageEvent(
 	}
 
 	content, _, _, _, toolCalls, toolResults :=
-		ExtractTextContent(llmMessage.Get("content"))
+		ExtractTextContent(context.Background(), llmMessage.Get("content"))
 	content, hasThinking := openHandsAppendThinking(
 		content, ev,
 	)
@@ -402,12 +327,10 @@ func parseOpenHandsActionEvent(
 	}
 
 	content := openHandsText(ev.Get("thought"))
-	content = joinOpenHandsParts(
-		content,
-		formatOpenHandsAction(
-			toolName, action, ev.Get("summary").Str,
-		),
+	rendering := formatOpenHandsAction(
+		toolName, action, ev.Get("summary").Str,
 	)
+	content = joinOpenHandsParts(content, rendering)
 	content, hasThinking := openHandsAppendThinking(
 		content, ev,
 	)
@@ -430,6 +353,7 @@ func parseOpenHandsActionEvent(
 			ToolName:  toolName,
 			Category:  openHandsToolCategory(toolName, action),
 			InputJSON: inputJSON,
+			Rendering: strings.TrimSpace(rendering),
 		}},
 	}
 	return msg, true, openHandsActionCwd(toolName, action)
@@ -458,6 +382,7 @@ func parseOpenHandsObservationEvent(
 			Ordinal:       ordinal,
 			Role:          RoleUser,
 			Content:       display,
+			SourceSubtype: SourceSubtypeToolResult,
 			Timestamp:     ts,
 			ContentLength: len(display),
 		}, true, workingDir
@@ -506,7 +431,7 @@ func openHandsBaseStateCwd(base gjson.Result) string {
 }
 
 func openHandsText(content gjson.Result) string {
-	text, _, _, _, _, _ := ExtractTextContent(content)
+	text, _, _, _, _, _ := ExtractTextContent(context.Background(), content)
 	return strings.TrimSpace(text)
 }
 

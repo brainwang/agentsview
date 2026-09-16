@@ -9,6 +9,7 @@
 # Frontend
 node_modules/
 frontend/dist/
+frontend/src/lib/paraglide/
 frontend/test-results/
 test-results/
 frontend/playwright-report/
@@ -19,6 +20,7 @@ internal/web/dist/*
 
 # Test/build artifacts
 /dist/
+/.sqlite-include/
 *.out
 coverage.out
 *.test
@@ -42,17 +44,32 @@ __pycache__/
 
 # Build caches
 .gocache
+# Per-checkout golangci-lint cache isolates sibling worktrees.
+/.golangci-cache/
 .cache
 .gomodcache/
 .gopath/
+
+# Docs build and hydrated assets
+docs/.venv/
+docs/.zensical-build.*
+docs/zensical-public-docs.*
+docs/site/
+docs/assets/static/
+docs/assets/generated/
+docs/.gitignore
+docs/.vercel/
+docs/.env*.local
+.vercel
+.env*.local
 
 # SSH test key (extracted from Docker container)
 testdata/ssh/test_key
 
 # Local data
-data/
-sessions/
-html/
+/data/
+/sessions/
+/html/
 .superset/
 .github/hooks/
 .superpowers/
@@ -60,3 +77,12 @@ html/
 
 # Visual verification scratch — per-task screenshot/HTML capture dirs.
 .test-data*/
+
+# Antigravity CLI session dir created when AGY runs inside this repo
+.antigravitycli/
+
+# graphify knowledge-graph output (local analysis)
+graphify-out/
+.kata.local.toml
+# roborev snapshots
+/.roborev/

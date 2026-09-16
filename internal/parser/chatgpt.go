@@ -4,7 +4,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -51,13 +52,13 @@ type chatGPTAuthor struct {
 }
 
 type chatGPTContent struct {
-	ContentType string            `json:"content_type"`
-	Parts       []json.RawMessage `json:"parts"`
-	Text        string            `json:"text"`
-	Language    string            `json:"language"`
-	Thoughts    []chatGPTThought  `json:"thoughts"`
-	Title       string            `json:"title"`
-	URL         string            `json:"url"`
+	ContentType string           `json:"content_type"`
+	Parts       []jsontext.Value `json:"parts"`
+	Text        string           `json:"text"`
+	Language    string           `json:"language"`
+	Thoughts    []chatGPTThought `json:"thoughts"`
+	Title       string           `json:"title"`
+	URL         string           `json:"url"`
 }
 
 type chatGPTThought struct {
@@ -68,9 +69,24 @@ type chatGPTMeta struct {
 	ModelSlug string `json:"model_slug"`
 }
 
+// ChatGPTExportParser is implemented by the ChatGPT import-only provider to
+// stream a ChatGPT data export. ChatGPT sessions are never discovered or
+// synced from disk; they only enter the archive through a one-shot import, so
+// this entry point lives on the provider rather than the Discover/Parse path.
+// Callers obtain it via NewProvider(AgentChatGPT, ...) and a type assertion.
+type ChatGPTExportParser interface {
+	// ParseChatGPTExport reads all conversations-*.json files from dir and
+	// calls onConversation for each non-empty conversation.
+	ParseChatGPTExport(
+		dir string,
+		assets AssetResolver,
+		onConversation func(ParseResult) error,
+	) error
+}
+
 // ParseChatGPTExport reads all conversations-*.json files from dir
 // and calls onConversation for each non-empty conversation.
-func ParseChatGPTExport(
+func (p *chatGPTImportOnlyProvider) ParseChatGPTExport(
 	dir string,
 	assets AssetResolver,
 	onConversation func(ParseResult) error,
@@ -192,7 +208,7 @@ func convertChatGPTConversation(
 		Machine:          "local",
 		Agent:            AgentChatGPT,
 		FirstMessage:     firstMsg,
-		DisplayName:      conv.Title,
+		SessionName:      conv.Title,
 		StartedAt:        unixFloatToTime(conv.CreateTime),
 		EndedAt:          unixFloatToTime(conv.UpdateTime),
 		MessageCount:     len(msgs),
@@ -418,7 +434,7 @@ func assembleContent(
 // assembleTextParts joins Parts from text/multimodal_text
 // content. Each part is either a JSON string or an object.
 func assembleTextParts(
-	parts []json.RawMessage,
+	parts []jsontext.Value,
 	assets AssetResolver,
 ) string {
 	var out []string
@@ -453,7 +469,7 @@ func assembleTextParts(
 
 // assembleFallbackParts tries to join parts as strings for
 // unknown content types.
-func assembleFallbackParts(parts []json.RawMessage) string {
+func assembleFallbackParts(parts []jsontext.Value) string {
 	var out []string
 	for _, raw := range parts {
 		var s string

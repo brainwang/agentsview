@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // triggerCalls names the qualified function calls that read
@@ -22,6 +24,7 @@ import (
 // same enclosing body.
 var triggerCalls = map[string]struct{}{
 	"db.Open":               {},
+	"db.OpenReadOnly":       {},
 	"postgres.Open":         {},
 	"postgres.NewStore":     {},
 	"postgres.New":          {},
@@ -30,6 +33,11 @@ var triggerCalls = map[string]struct{}{
 
 const wiringHelper = "applyClassifierConfig"
 
+var inheritedWiringFuncs = map[string]struct{}{
+	"runPGPushTarget":   {},
+	"runPGStatusTarget": {},
+}
+
 // TestEveryStoreOpenPathIsWired enforces the rule documented
 // in the design spec: every code path in cmd/agentsview that
 // opens or initializes a store must first call
@@ -37,9 +45,7 @@ const wiringHelper = "applyClassifierConfig"
 // db package singleton.
 func TestEveryStoreOpenPathIsWired(t *testing.T) {
 	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("listing cmd/agentsview: %v", err)
-	}
+	require.NoError(t, err, "listing cmd/agentsview")
 
 	fset := token.NewFileSet()
 	var violations []string
@@ -53,9 +59,7 @@ func TestEveryStoreOpenPathIsWired(t *testing.T) {
 			fset, filepath.Join(".", name), nil,
 			parser.ParseComments,
 		)
-		if err != nil {
-			t.Fatalf("parsing %s: %v", name, err)
-		}
+		require.NoError(t, err, "parsing %s", name)
 		violations = append(
 			violations, scanFile(fset, f)...,
 		)
@@ -83,6 +87,9 @@ func scanFile(
 		switch fn := n.(type) {
 		case *ast.FuncDecl:
 			if fn.Body == nil {
+				return true
+			}
+			if _, ok := inheritedWiringFuncs[fn.Name.Name]; ok {
 				return true
 			}
 			if v := checkBody(

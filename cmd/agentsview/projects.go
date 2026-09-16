@@ -2,14 +2,23 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 )
+
+var projectsHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 func runProjects(jsonOutput bool) {
 	appCfg, err := config.LoadMinimal()
@@ -17,26 +26,71 @@ func runProjects(jsonOutput bool) {
 		log.Fatalf("loading config: %v", err)
 	}
 
-	applyClassifierConfig(appCfg)
-	database, err := db.Open(appCfg.DBPath)
-	if err != nil {
-		fatal("opening database: %v", err)
-	}
-	defer database.Close()
-
 	ctx := context.Background()
-	projects, err := database.GetProjects(ctx, false, false)
+	tr, err := ensureTransport(&appCfg, transportIntentRead, 0)
+	if err != nil {
+		fatal("resolving transport: %v", err)
+	}
+	if tr.Mode != transportHTTP {
+		fatal("resolving transport: expected daemon transport")
+	}
+	projects, err := fetchHTTPProjects(
+		ctx, tr, appCfg.AuthToken, false, false,
+	)
 	if err != nil {
 		fatal("listing projects: %v", err)
 	}
 
+	writeProjects(projects, jsonOutput)
+}
+
+func fetchHTTPProjects(
+	ctx context.Context,
+	tr transport,
+	authToken string,
+	excludeOneShot bool,
+	excludeAutomated bool,
+) ([]db.ProjectInfo, error) {
+	q := url.Values{}
+	q.Set("include_one_shot", strconv.FormatBool(!excludeOneShot))
+	q.Set("include_automated", strconv.FormatBool(!excludeAutomated))
+	endpoint := strings.TrimSuffix(tr.URL, "/") +
+		"/api/v1/projects?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	resp, err := projectsHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf(
+			"projects: HTTP %d: %s",
+			resp.StatusCode, strings.TrimSpace(string(body)),
+		)
+	}
+	var out struct {
+		Projects []db.ProjectInfo `json:"projects"`
+	}
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
+		return nil, err
+	}
+	return out.Projects, nil
+}
+
+func writeProjects(projects []db.ProjectInfo, jsonOutput bool) {
 	if jsonOutput {
 		if projects == nil {
 			projects = []db.ProjectInfo{}
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(projects); err != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if err := json.MarshalEncode(enc, projects); err != nil {
 			fatal("encoding json: %v", err)
 		}
 		return

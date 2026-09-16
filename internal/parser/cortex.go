@@ -1,11 +1,11 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -60,9 +60,9 @@ type cortexContentBlock struct {
 
 // cortexToolUse is the payload for a tool_use content block.
 type cortexToolUse struct {
-	ToolUseID string          `json:"tool_use_id"`
-	Name      string          `json:"name"`
-	Input     json.RawMessage `json:"input"`
+	ToolUseID string         `json:"tool_use_id"`
+	Name      string         `json:"name"`
+	Input     jsontext.Value `json:"input"`
 }
 
 // cortexToolResult is the payload for a tool_result content block.
@@ -123,7 +123,8 @@ func hasRealUserContent(msg cortexMessage) bool {
 // into ParsedMessage entries. It skips:
 //   - the entire first user turn (it contains only system reminders),
 //     unless the message has actual user text
-//   - user messages that consist solely of tool_result blocks
+//
+// Tool-result-only user rows are retained and marked as tool results.
 //
 // Returns messages and the first real user prompt string.
 func parseCortexMessages(
@@ -197,8 +198,8 @@ func parseCortexMessages(
 			}
 		}
 
-		// User messages that only contain tool results are responses
-		// to prior tool calls — include them but with empty content.
+		// Keep tool-result-only rows so their results can be attached to
+		// prior calls; skip user rows with no text or tool content.
 		if role == RoleUser &&
 			text == "" &&
 			len(toolCalls) == 0 &&
@@ -216,15 +217,21 @@ func parseCortexMessages(
 		// Build the content for display: use text if available,
 		// otherwise synthesize from tool calls.
 		content := text
+		sourceSubtype := ""
 		if content == "" && len(toolCalls) > 0 {
 			var labels []string
-			for _, tc := range toolCalls {
-				labels = append(labels, formatCortexToolHeader(tc))
+			for i, tc := range toolCalls {
+				label := formatCortexToolHeader(tc)
+				toolCalls[i].Rendering = label
+				labels = append(labels, label)
 			}
 			content = strings.Join(labels, "\n")
 		}
 
 		if content == "" && len(toolResults) > 0 {
+			if role == RoleUser {
+				sourceSubtype = SourceSubtypeToolResult
+			}
 			content = fmt.Sprintf("[%d tool result(s)]", len(toolResults))
 		}
 
@@ -235,6 +242,7 @@ func parseCortexMessages(
 		msgs = append(msgs, ParsedMessage{
 			Ordinal:       ordinal,
 			Role:          role,
+			SourceSubtype: sourceSubtype,
 			Content:       content,
 			Timestamp:     ts,
 			HasToolUse:    hasToolUse,
@@ -263,7 +271,7 @@ func cortexToolDetail(name, inputJSON string) string {
 	if !strings.HasPrefix(strings.TrimSpace(inputJSON), "{") {
 		return name
 	}
-	input := make(map[string]json.RawMessage)
+	input := make(map[string]jsontext.Value)
 	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
 		return name
 	}
@@ -335,11 +343,11 @@ func parseCortexTimestamps(_ string) map[string]time.Time {
 	return make(map[string]time.Time)
 }
 
-// ParseCortexSession parses a Cortex session from its .json metadata
-// file. If the file contains an embedded "history" array, it is used
-// directly. If no history is embedded (the split-file format), the
-// companion .history.jsonl file is read instead.
-func ParseCortexSession(
+// parseSession parses a Cortex session from its .json metadata file. If the
+// file contains an embedded "history" array, it is used directly. If no history
+// is embedded (the split-file format), the companion .history.jsonl file is
+// read instead.
+func (p *cortexProvider) parseSession(
 	path, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
@@ -419,7 +427,7 @@ func ParseCortexSession(
 
 	userCount := 0
 	for _, m := range msgs {
-		if m.Role == RoleUser {
+		if m.Role == RoleUser && m.SourceSubtype != SourceSubtypeToolResult {
 			userCount++
 		}
 	}
@@ -434,7 +442,7 @@ func ParseCortexSession(
 		Agent:            AgentCortex,
 		Cwd:              meta.WorkingDirectory,
 		FirstMessage:     firstMessage,
-		DisplayName:      displayName,
+		SessionName:      displayName,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
 		MessageCount:     len(msgs),
@@ -512,58 +520,15 @@ func IsCortexSessionFile(name string) bool {
 	return IsValidSessionID(stem)
 }
 
-// DiscoverCortexSessions finds all primary session metadata files
-// in the Cortex conversations directory (~/.snowflake/cortex/conversations).
-// Backup files (*.back.*.json) are silently skipped. Both embedded-history
-// sessions (<uuid>.json with a "history" key) and split sessions
-// (<uuid>.json + <uuid>.history.jsonl) are returned as a single entry
-// pointing to the .json metadata file.
-func DiscoverCortexSessions(
-	conversationsDir string,
-) []DiscoveredFile {
-	if conversationsDir == "" {
-		return nil
-	}
-
-	entries, err := os.ReadDir(conversationsDir)
-	if err != nil {
-		return nil
-	}
-
-	var files []DiscoveredFile
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !IsCortexSessionFile(name) {
-			continue
-		}
-		files = append(files, DiscoveredFile{
-			Path:  filepath.Join(conversationsDir, name),
-			Agent: AgentCortex,
-		})
-	}
-
-	return files
+// CortexToolUseRendering returns the header Cortex inlines into assistant
+// text for a tool call, which folds the call's main argument into the label.
+func CortexToolUseRendering(category, name, inputJSON string) string {
+	return formatCortexToolHeader(ParsedToolCall{
+		Category: category, ToolName: name, InputJSON: inputJSON,
+	})
 }
 
-// FindCortexSourceFile locates a Cortex session file by UUID. Accepts
-// both the raw UUID and the prefixed "cortex:<uuid>" form. Returns the
-// path to the .json metadata file if found, otherwise "".
-func FindCortexSourceFile(
-	conversationsDir, sessionID string,
-) string {
-	// Strip "cortex:" prefix before validation — callers may
-	// pass the full prefixed ID.
-	sessionID = strings.TrimPrefix(sessionID, "cortex:")
-	if conversationsDir == "" || !IsValidSessionID(sessionID) {
-		return ""
-	}
-
-	candidate := filepath.Join(conversationsDir, sessionID+".json")
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate
-	}
-	return ""
+// CortexRedactedToolUseRendering is the same header without the argument.
+func CortexRedactedToolUseRendering(category, name string) string {
+	return formatToolHeader(category, name)
 }

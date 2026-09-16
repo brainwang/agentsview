@@ -4,18 +4,16 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/parser"
-	"github.com/wesm/agentsview/internal/server"
-	"github.com/wesm/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // Exit codes for the token-use subcommand.
@@ -45,12 +43,11 @@ const (
 //     in SQL; suffix matches come back in most-recent order. If
 //     multiple suffix matches exist without an exact row, the
 //     most recent wins and an ambiguity warning is emitted.
-//  3. Canonical disk probe: when input begins with a registered
-//     agent prefix, strip the prefix and call that agent's
-//     FindSourceFunc so a truly canonical-but-unsynced ID on disk
-//     still resolves.
-//  4. Raw disk probe: call every file-based agent's FindSourceFunc
-//     with the raw input; the first hit yields "<prefix><input>".
+//  3. Canonical provider probe: when input begins with a registered
+//     agent prefix, strip the prefix and ask that agent's source lookup
+//     so a truly canonical-but-unsynced ID still resolves.
+//  4. Raw provider probe: ask every file-backed agent plus Devin for a
+//     raw-ID source lookup; the first hit yields "<prefix><input>".
 //  5. No match anywhere: returned unchanged with known=false.
 //
 // known reports whether resolution found evidence for the ID.
@@ -89,11 +86,11 @@ func resolveRawSessionID(
 
 	// Canonical disk probe: if the input starts with a known
 	// agent prefix, trust that interpretation first and strip
-	// before calling FindSourceFunc (which rejects IDs with
+	// before resolving the source (which rejects IDs with
 	// colons via IsValidSessionID).
 	for _, def := range parser.Registry {
-		if def.IDPrefix == "" || !def.FileBased ||
-			def.FindSourceFunc == nil {
+		if def.IDPrefix == "" ||
+			!agentHasDiskSourceLookup(def) {
 			continue
 		}
 		if !strings.HasPrefix(input, def.IDPrefix) {
@@ -101,7 +98,7 @@ func resolveRawSessionID(
 		}
 		bareID := strings.TrimPrefix(input, def.IDPrefix)
 		for _, dir := range agentDirs[def.Type] {
-			if def.FindSourceFunc(dir, bareID) != "" {
+			if findAgentSourceFile(def, dir, bareID) != "" {
 				return input, true
 			}
 		}
@@ -113,11 +110,11 @@ func resolveRawSessionID(
 	// colon-bearing raw IDs (Kimi, OpenClaw, Kiro IDE) may
 	// match.
 	for _, def := range parser.Registry {
-		if !def.FileBased || def.FindSourceFunc == nil {
+		if !agentHasDiskSourceLookup(def) {
 			continue
 		}
 		for _, dir := range agentDirs[def.Type] {
-			if def.FindSourceFunc(dir, input) != "" {
+			if findAgentSourceFile(def, dir, input) != "" {
 				return def.IDPrefix + input, true
 			}
 		}
@@ -126,31 +123,79 @@ func resolveRawSessionID(
 	return input, false
 }
 
-// tokenUseExitCode classifies a session record into an exit code:
-// 0 when token metrics are present, 2 when the session is not in
-// the DB, and 3 when the session exists but has no token data
-// yet (e.g. the parser hasn't ingested it or the agent never
-// emitted usage metadata).
-func tokenUseExitCode(sess *db.Session) int {
-	if sess == nil {
+// agentHasDiskSourceLookup reports whether a provider-authoritative session
+// source can be located by raw ID through the provider facade's FindSource path.
+func agentHasDiskSourceLookup(def parser.AgentDef) bool {
+	if parser.ProviderMigrationModes()[def.Type] !=
+		parser.ProviderMigrationProviderAuthoritative {
+		return false
+	}
+	factory, ok := parser.ProviderFactoryByType(def.Type)
+	if !ok {
+		return false
+	}
+	return factory.Capabilities().Source.FindSource ==
+		parser.CapabilitySupported
+}
+
+// findAgentSourceFile resolves a raw agent session ID to an on-disk source path
+// under dir via the provider's FindSource (RawSessionID lookup). Returns ""
+// when no source resolves or the agent has no on-disk lookup.
+func findAgentSourceFile(def parser.AgentDef, dir, rawID string) string {
+	factory, ok := parser.ProviderFactoryByType(def.Type)
+	if !ok {
+		return ""
+	}
+	provider := factory.NewProvider(parser.ProviderConfig{Roots: []string{dir}})
+	source, found, err := provider.FindSource(
+		context.Background(),
+		parser.FindSourceRequest{RawSessionID: rawID},
+	)
+	if err != nil || !found {
+		return ""
+	}
+	if path, ok := providerSourcePath(source); ok {
+		return path
+	}
+	return ""
+}
+
+// providerSourcePath extracts the on-disk path a provider SourceRef points to,
+// preferring the display path and falling back to the fingerprint key or key.
+func providerSourcePath(source parser.SourceRef) (string, bool) {
+	for _, candidate := range []string{
+		source.DisplayPath,
+		source.FingerprintKey,
+		source.Key,
+	} {
+		if candidate != "" {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// usageExitCode classifies a SessionUsage into an exit code: 2 when
+// the session is not in the DB, 0 when token data OR cost is present,
+// 3 when the session exists but has neither. Cost-only sessions
+// (e.g. Hermes) return 0 so callers do not discard useful cost.
+func usageExitCode(u *db.SessionUsage) int {
+	if u == nil {
 		return tokenUseExitNotFound
 	}
-	if sess.HasTotalOutputTokens || sess.HasPeakContextTokens {
+	if u.HasTokenData || u.HasCost {
 		return tokenUseExitOK
 	}
 	return tokenUseExitNoTokenData
 }
 
-// tokenUseOutput is the JSON structure written to stdout.
-// This format is experimental and may change.
-type tokenUseOutput struct {
-	SessionID         string `json:"session_id"`
-	Agent             string `json:"agent"`
-	Project           string `json:"project"`
-	TotalOutputTokens int    `json:"total_output_tokens"`
-	PeakContextTokens int    `json:"peak_context_tokens"`
-	HasTokenData      bool   `json:"has_token_data"`
-	ServerRunning     bool   `json:"server_running"`
+// sessionUsageOutput is the JSON shape emitted by `session usage`
+// and the deprecated `token-use`. It is a strict superset of the
+// historical token-use output (same fields, plus cost). The shape
+// is experimental and may change.
+type sessionUsageOutput struct {
+	db.SessionUsage
+	ServerRunning bool `json:"server_running"`
 }
 
 // startupWaitTimeout is how long CLI subcommands wait for a
@@ -164,179 +209,48 @@ func runTokenUse(args []string) {
 			"usage: agentsview token-use <session-id>")
 		os.Exit(tokenUseExitErr)
 	}
+	fmt.Fprintln(os.Stderr,
+		"note: 'token-use' is deprecated; use 'session usage <id>' instead")
 
-	code, err := tokenUse(args[0])
+	out, code, err := sessionUsageData(args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(tokenUseExitErr)
 	}
+	if out != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if encErr := json.MarshalEncode(enc, out); encErr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", encErr)
+			os.Exit(tokenUseExitErr)
+		}
+	}
 	os.Exit(code)
 }
 
-func tokenUse(sessionID string) (int, error) {
+func sessionUsageData(sessionID string) (*sessionUsageOutput, int, error) {
 	appCfg, err := config.LoadMinimal()
 	if err != nil {
-		return tokenUseExitErr, fmt.Errorf("loading config: %w", err)
+		return nil, tokenUseExitErr, fmt.Errorf("loading config: %w", err)
 	}
 
 	if err := os.MkdirAll(appCfg.DataDir, 0o755); err != nil {
-		return tokenUseExitErr,
+		return nil, tokenUseExitErr,
 			fmt.Errorf("creating data dir: %w", err)
 	}
 
-	serverActive := server.IsLocalServerActive(appCfg.DataDir)
-
-	// If a server is actively starting up (startup lock
-	// present), wait for it to finish so we read fresh data
-	// rather than returning stale results or "not found".
-	// We only wait when the startup lock is the reason
-	// IsLocalServerActive returned true — if a state file has a
-	// live PID but the TCP probe is transiently failing,
-	// the server is running and we should just read the DB.
-	if serverActive &&
-		server.FindRunningServer(appCfg.DataDir) == nil {
-		if server.IsStartupLocked(appCfg.DataDir) {
-			fmt.Fprintf(os.Stderr,
-				"server is starting up, waiting...\n")
-			if !server.WaitForStartup(
-				appCfg.DataDir, startupWaitTimeout,
-			) {
-				if server.IsStartupLocked(appCfg.DataDir) {
-					// Lock still live after timeout:
-					// the server is active (still
-					// syncing, or state file write
-					// failed). Don't compete — read
-					// the DB as-is.
-					fmt.Fprintf(os.Stderr,
-						"server still starting after "+
-							"%s, reading DB as-is\n",
-						startupWaitTimeout,
-					)
-				} else {
-					// Lock cleared but no running
-					// server. Re-check in case of
-					// transient TCP failure.
-					serverActive = server.IsLocalServerActive(
-						appCfg.DataDir,
-					)
-				}
-			}
-		} else if !server.IsLocalServerActive(appCfg.DataDir) {
-			// The server that was alive at the first check
-			// has since exited. Fall back to on-demand sync.
-			serverActive = false
-		}
-	}
-
-	applyClassifierConfig(appCfg)
-	database, err := db.Open(appCfg.DBPath)
-	if err != nil {
-		return tokenUseExitErr,
-			fmt.Errorf("opening database: %w", err)
-	}
-	defer database.Close()
-
-	if appCfg.CursorSecret != "" {
-		secret, decErr := base64.StdEncoding.DecodeString(
-			appCfg.CursorSecret,
-		)
-		if decErr != nil {
-			return tokenUseExitErr, fmt.Errorf(
-				"invalid cursor secret: %w", decErr,
-			)
-		}
-		database.SetCursorSecret(secret)
-	}
-
 	ctx := context.Background()
-	resolvedID, known := resolveRawSessionID(
-		ctx, database, appCfg.AgentDirs, sessionID,
+	backend, cleanup, err := resolveArchiveQueryBackendWithConfig(
+		ctx,
+		appCfg,
+		archiveQueryPolicy{
+			AutoStart:            true,
+			ReadOnlyDaemon:       archiveQueryUseReadOnlyDaemon,
+			DirectReadOnlyAction: "refresh session usage directly",
+		},
 	)
-
-	// If no server is managing the DB, do an on-demand sync
-	// for this session so the data is fresh. Re-check right
-	// before syncing to close the TOCTOU window where a
-	// server could have started since our initial probe.
-	// If the re-check detects a starting server, wait for
-	// it rather than reading potentially stale data.
-	if !serverActive {
-		serverActive = server.IsLocalServerActive(appCfg.DataDir)
-		if serverActive &&
-			server.FindRunningServer(appCfg.DataDir) == nil &&
-			server.IsStartupLocked(appCfg.DataDir) {
-			fmt.Fprintf(os.Stderr,
-				"server is starting up, waiting...\n")
-			if server.WaitForStartup(
-				appCfg.DataDir, startupWaitTimeout,
-			) {
-				// Server is ready; read DB below.
-			} else if !server.IsStartupLocked(
-				appCfg.DataDir,
-			) {
-				// Lock cleared, no running server
-				// via TCP. Re-check: a live state
-				// file (transient probe failure)
-				// still means the server is active.
-				serverActive = server.IsLocalServerActive(
-					appCfg.DataDir,
-				)
-			}
-			// Lock still live after timeout: server is
-			// active but slow. Read DB as-is.
-		}
-	}
-	// Skip sync entirely when we have no evidence of the
-	// session (known=false) — SyncSingleSession would just
-	// log a misleading "source file not found" warning.
-	if !serverActive && known {
-		engine := sync.NewEngine(database, sync.EngineConfig{
-			AgentDirs:               appCfg.AgentDirs,
-			Machine:                 "local",
-			BlockedResultCategories: appCfg.ResultContentBlockedCategories,
-		})
-		if syncErr := engine.SyncSingleSession(
-			resolvedID,
-		); syncErr != nil {
-			// Not fatal: session may already be in the DB
-			// from a previous sync, or may not exist at all.
-			fmt.Fprintf(os.Stderr,
-				"warning: sync failed: %v\n", syncErr)
-		}
-	}
-
-	sess, err := database.GetSession(ctx, resolvedID)
 	if err != nil {
-		return tokenUseExitErr,
-			fmt.Errorf("querying session: %w", err)
+		return nil, tokenUseExitErr, err
 	}
-	if sess == nil {
-		fmt.Fprintf(os.Stderr,
-			"session not found: %s\n", sessionID)
-		return tokenUseExitNotFound, nil
-	}
-
-	agent := sess.Agent
-	if agent == "" {
-		if def, ok := parser.AgentByPrefix(sess.ID); ok {
-			agent = string(def.Type)
-		}
-	}
-
-	out := tokenUseOutput{
-		SessionID:         sess.ID,
-		Agent:             agent,
-		Project:           sess.Project,
-		TotalOutputTokens: sess.TotalOutputTokens,
-		PeakContextTokens: sess.PeakContextTokens,
-		HasTokenData: sess.HasTotalOutputTokens ||
-			sess.HasPeakContextTokens,
-		ServerRunning: serverActive,
-	}
-
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(out); err != nil {
-		return tokenUseExitErr, err
-	}
-	return tokenUseExitCode(sess), nil
+	defer closeArchiveQueryBackend(cleanup)
+	return backend.SessionUsage(ctx, sessionUsageQuery{SessionID: sessionID})
 }

@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,7 +10,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
+	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 type sessionSpec struct {
@@ -49,6 +53,7 @@ var specs = []sessionSpec{
 
 func main() {
 	out := flag.String("out", "", "output database path")
+	duckDBOut := flag.String("duckdb-out", "", "optional output DuckDB mirror path")
 	flag.Parse()
 	if *out == "" {
 		fmt.Fprintln(os.Stderr, "usage: testfixture -out <path>")
@@ -70,17 +75,17 @@ func main() {
 	if err := database.UpsertModelPricing([]db.ModelPricing{
 		{
 			ModelPattern:         "claude-sonnet-4-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         money.Money{Microdollars: 3_000_000},
+			OutputPerMTok:        money.Money{Microdollars: 15_000_000},
+			CacheCreationPerMTok: money.Money{Microdollars: 3_750_000},
+			CacheReadPerMTok:     money.Money{Microdollars: 300_000},
 		},
 		{
 			ModelPattern:         "claude-opus-4-20250514",
-			InputPerMTok:         15.0,
-			OutputPerMTok:        75.0,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.50,
+			InputPerMTok:         money.Money{Microdollars: 15_000_000},
+			OutputPerMTok:        money.Money{Microdollars: 75_000_000},
+			CacheCreationPerMTok: money.Money{Microdollars: 18_750_000},
+			CacheReadPerMTok:     money.Money{Microdollars: 1_500_000},
 		},
 	}); err != nil {
 		log.Fatalf("seeding model pricing: %v", err)
@@ -109,7 +114,117 @@ func main() {
 		log.Fatalf("creating duration showcase: %v", err)
 	}
 
+	if err := createRecentEditsFixture(
+		database, base.Add(96*time.Hour),
+	); err != nil {
+		log.Fatalf("creating recent-edits fixture: %v", err)
+	}
+
+	if err := createProjectReclassificationFixture(
+		database, base.Add(120*time.Hour),
+	); err != nil {
+		log.Fatalf("creating project-reclassification fixture: %v", err)
+	}
+
 	fmt.Printf("Fixture DB written to %s\n", *out)
+	if *duckDBOut != "" {
+		if err := writeDuckDBMirror(database, *duckDBOut); err != nil {
+			log.Fatalf("writing DuckDB mirror: %v", err)
+		}
+		fmt.Printf("Fixture DuckDB mirror written to %s\n", *duckDBOut)
+	}
+}
+
+func createProjectReclassificationFixture(
+	database *db.DB, start time.Time,
+) error {
+	const (
+		machine      = "remote-example-host"
+		project      = "wrong_branch_label"
+		worktreeRoot = "/srv/worktrees/github.com/example-org/sample-service/example-worktree"
+		model        = "claude-sonnet-4-20250514"
+	)
+	cwds := []struct {
+		suffix string
+		cwd    string
+	}{
+		{suffix: "root", cwd: worktreeRoot},
+		{suffix: "nested", cwd: worktreeRoot + "/cmd/server"},
+	}
+	ctx := context.Background()
+	for index, item := range cwds {
+		sessionID := "test-session-project-reclassification-" + item.suffix
+		startedAt := start.Add(time.Duration(index) * time.Hour)
+		endedAt := startedAt.Add(12 * time.Minute)
+		firstMessage := "Inspect the sample service worktree."
+		session := db.Session{
+			ID:               sessionID,
+			Project:          project,
+			Machine:          machine,
+			Agent:            "claude",
+			StartedAt:        new(startedAt.Format(time.RFC3339Nano)),
+			EndedAt:          new(endedAt.Format(time.RFC3339Nano)),
+			MessageCount:     2,
+			UserMessageCount: 1,
+			FirstMessage:     new(firstMessage),
+			Cwd:              item.cwd,
+		}
+		if err := database.UpsertSession(session); err != nil {
+			return fmt.Errorf(
+				"upserting project-reclassification session: %w", err,
+			)
+		}
+		if err := database.InsertMessages(generateMessages(
+			sessionID, session.MessageCount, startedAt, model,
+		)); err != nil {
+			return fmt.Errorf(
+				"inserting project-reclassification messages: %w", err,
+			)
+		}
+		if err := database.UpsertProjectIdentityObservation(
+			ctx,
+			export.ProjectIdentityObservation{
+				SessionID:            sessionID,
+				Project:              project,
+				Machine:              machine,
+				RootPath:             worktreeRoot,
+				RepositoryPath:       "/srv/worktrees/github.com/example-org/sample-service",
+				WorktreeName:         "example-worktree",
+				WorktreeRootPath:     worktreeRoot,
+				WorktreeRelationship: export.WorktreeLinked,
+				CheckoutState:        export.CheckoutBranch,
+				GitBranch:            "example-worktree",
+				ObservedAt:           startedAt,
+			},
+		); err != nil {
+			return fmt.Errorf(
+				"upserting project-reclassification identity: %w", err,
+			)
+		}
+		fmt.Printf(
+			"  %s: %d messages (project reclassification)\n",
+			sessionID, session.MessageCount,
+		)
+	}
+	return nil
+}
+
+func writeDuckDBMirror(database *db.DB, path string) error {
+	if err := os.Remove(path); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing existing DuckDB mirror: %w", err)
+	}
+	ctx := context.Background()
+	result, err := duckdbsync.Push(
+		ctx, path, database, "test-machine", duckdbsync.SyncOptions{}, true, nil,
+	)
+	if err != nil {
+		return err
+	}
+	if result.Errors > 0 {
+		return fmt.Errorf("DuckDB push had %d session error(s)", result.Errors)
+	}
+	return nil
 }
 
 func createSessionFixture(
@@ -206,7 +321,7 @@ func generateMessages(
 			outputTok := 200 + (i*89)%800
 			cacheCr := 50 + (i*31)%200
 			cacheRd := 1000 + (i*53)%4000
-			msg.TokenUsage = json.RawMessage(
+			msg.TokenUsage = jsontext.Value(
 				fmt.Sprintf(
 					`{"input_tokens":%d,`+
 						`"output_tokens":%d,`+
@@ -290,7 +405,7 @@ func generateMixedContentMessages(
 			outputTok := 150 + (i*67)%600
 			cacheCr := 30 + (i*23)%150
 			cacheRd := 800 + (i*41)%3000
-			msg.TokenUsage = json.RawMessage(
+			msg.TokenUsage = jsontext.Value(
 				fmt.Sprintf(
 					`{"input_tokens":%d,`+
 						`"output_tokens":%d,`+
@@ -300,6 +415,19 @@ func generateMixedContentMessages(
 					cacheCr, cacheRd,
 				),
 			)
+		}
+		if i == 3 {
+			const resultContent = "# Fixture output\n\n**safe** <script>alert(\"xss\")</script>"
+			msg.ToolCalls = []db.ToolCall{
+				{
+					ToolName:            "Read",
+					Category:            "Read",
+					ToolUseID:           "tu_mixed_read",
+					InputJSON:           `{"file_path":"/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte"}`,
+					ResultContentLength: len(resultContent),
+					ResultContent:       resultContent,
+				},
+			}
 		}
 		msgs = append(msgs, msg)
 	}
@@ -415,6 +543,7 @@ func createDurationShowcaseFixture(
 		Project:          project,
 		Machine:          "test-machine",
 		Agent:            "claude",
+		Cwd:              "/workspace/مشروع/.worktrees/שלוםfeaturewithalongcheckoutnamefortooltipwrappingwithoutbreakopportunities",
 		StartedAt:        new(t0.Format(time.RFC3339Nano)),
 		EndedAt:          new(endParent.Format(time.RFC3339Nano)),
 		MessageCount:     len(parentMessages),
@@ -470,12 +599,12 @@ func buildDurationShowcaseMessages(
 		bashSlowID = "tu_bash_slow"
 	)
 
-	tokenUsage := func(seed int) json.RawMessage {
+	tokenUsage := func(seed int) jsontext.Value {
 		input := 600 + seed*150
 		output := 220 + seed*80
 		cacheCr := 60 + seed*15
 		cacheRd := 1100 + seed*40
-		return json.RawMessage(fmt.Sprintf(
+		return jsontext.Value(fmt.Sprintf(
 			`{"input_tokens":%d,`+
 				`"output_tokens":%d,`+
 				`"cache_creation_input_tokens":%d,`+
@@ -628,12 +757,12 @@ func buildDurationSubagentMessages(
 ) []db.Message {
 	const model = "claude-sonnet-4-20250514"
 
-	tokenUsage := func(seed int) json.RawMessage {
+	tokenUsage := func(seed int) jsontext.Value {
 		input := 350 + seed*90
 		output := 180 + seed*55
 		cacheCr := 40 + seed*12
 		cacheRd := 700 + seed*30
-		return json.RawMessage(fmt.Sprintf(
+		return jsontext.Value(fmt.Sprintf(
 			`{"input_tokens":%d,`+
 				`"output_tokens":%d,`+
 				`"cache_creation_input_tokens":%d,`+
@@ -737,4 +866,99 @@ func buildDurationSubagentMessages(
 			TokenUsage:    tokenUsage(3),
 		},
 	}
+}
+
+// createRecentEditsFixture seeds one session that carries a real
+// Edit tool call with FilePath set. The feed at GET /api/v1/recent-edits
+// filters on category IN ('Edit','Write') AND file_path IS NOT NULL, so
+// FilePath must be set directly on the ToolCall — InputJSON alone does
+// not propagate to the file_path column.
+func createRecentEditsFixture(
+	database *db.DB, start time.Time,
+) error {
+	const (
+		sessionID = "test-session-recent-edits"
+		project   = "project-edits"
+		model     = "claude-sonnet-4-20250514"
+		editPath  = "/src/server/handler.go"
+	)
+
+	endedAt := start.Add(5 * time.Minute)
+	firstMsg := "Add request logging to the HTTP handler."
+
+	sess := db.Session{
+		ID:               sessionID,
+		Project:          project,
+		Machine:          "test-machine",
+		Agent:            "claude",
+		StartedAt:        new(start.Format(time.RFC3339Nano)),
+		EndedAt:          new(endedAt.Format(time.RFC3339Nano)),
+		MessageCount:     3,
+		UserMessageCount: 1,
+		FirstMessage:     new(firstMsg),
+	}
+	if err := database.UpsertSession(sess); err != nil {
+		return fmt.Errorf("upserting recent-edits session: %w", err)
+	}
+
+	msgs := []db.Message{
+		{
+			SessionID:     sessionID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       firstMsg,
+			Timestamp:     start.Format(time.RFC3339Nano),
+			ContentLength: len(firstMsg),
+		},
+		{
+			SessionID:  sessionID,
+			Ordinal:    1,
+			Role:       "assistant",
+			HasToolUse: true,
+			Content:    "[Edit /src/server/handler.go]",
+			Timestamp: start.Add(1 * time.Minute).
+				Format(time.RFC3339Nano),
+			ContentLength: 29,
+			Model:         model,
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":800,` +
+					`"output_tokens":320,` +
+					`"cache_creation_input_tokens":80,` +
+					`"cache_read_input_tokens":1500}`,
+			),
+			ToolCalls: []db.ToolCall{
+				{
+					ToolName:  "Edit",
+					Category:  "Edit",
+					ToolUseID: "tu_edit_handler",
+					// FilePath must be set directly; InputJSON
+					// alone is not propagated to the DB column.
+					FilePath: editPath,
+					InputJSON: `{"file_path":"` + editPath + `",` +
+						`"old_string":"func handler(",` +
+						`"new_string":"func handler(// + logging\n"}`,
+					ResultContentLength: 0,
+				},
+			},
+		},
+		{
+			SessionID: sessionID,
+			Ordinal:   2,
+			Role:      "user",
+			Content:   "[tool_result]",
+			Timestamp: start.Add(2 * time.Minute).
+				Format(time.RFC3339Nano),
+			ContentLength: 13,
+		},
+	}
+	if err := database.InsertMessages(msgs); err != nil {
+		return fmt.Errorf(
+			"inserting recent-edits messages: %w", err,
+		)
+	}
+	fmt.Printf(
+		"  %s: %d messages (recent-edits fixture)\n",
+		sessionID, len(msgs),
+	)
+	return nil
 }

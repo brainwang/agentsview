@@ -2,6 +2,9 @@ package signals
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestComputeHealthScore(t *testing.T) {
@@ -316,6 +319,36 @@ func TestComputeHealthScore(t *testing.T) {
 				"compactions": 15,
 			},
 		},
+		{
+			name: "heuristic penalties are conservative and capped",
+			input: ScoreInput{
+				Outcome:           "completed",
+				OutcomeConfidence: "high",
+				HasToolCalls:      true,
+				Heuristics: HeuristicSignals{
+					ShortPromptCount:            10,
+					UnstructuredStart:           true,
+					MissingSuccessCriteriaCount: 2,
+					MissingVerificationCount:    2,
+					DuplicatePromptCount:        10,
+					NoCodeContextCount:          1,
+					RunawayToolLoopCount:        3,
+				},
+			},
+			wantScore: new(85),
+			wantGrade: "B",
+			wantBasis: []string{
+				"outcome", "tool_health", "prompt_quality",
+				"context_quality", "workflow_quality",
+			},
+			wantPenalties: map[string]int{
+				"constraintless_first_prompt":  1,
+				"missing_success_criteria":     1,
+				"stuck_repeated_prompts":       4,
+				"code_task_without_context":    4,
+				"repeated_failing_tool_cycles": 5,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -324,47 +357,22 @@ func TestComputeHealthScore(t *testing.T) {
 
 			// Check score.
 			if tt.wantScore == nil {
-				if got.Score != nil {
-					t.Errorf(
-						"Score = %d, want nil",
-						*got.Score,
-					)
-				}
+				assert.Nil(t, got.Score)
 			} else {
-				if got.Score == nil {
-					t.Fatal("Score = nil, want", *tt.wantScore)
-				}
-				if *got.Score != *tt.wantScore {
-					t.Errorf(
-						"Score = %d, want %d",
-						*got.Score, *tt.wantScore,
-					)
-				}
+				require.NotNil(t, got.Score)
+				assert.Equal(t, *tt.wantScore, *got.Score)
 			}
 
 			// Check grade.
-			if got.Grade != tt.wantGrade {
-				t.Errorf(
-					"Grade = %q, want %q",
-					got.Grade, tt.wantGrade,
-				)
-			}
+			assert.Equal(t, tt.wantGrade, got.Grade)
 
 			// Check basis.
-			if !slicesEqual(got.Basis, tt.wantBasis) {
-				t.Errorf(
-					"Basis = %v, want %v",
-					got.Basis, tt.wantBasis,
-				)
-			}
+			assert.True(t, slicesEqual(got.Basis, tt.wantBasis),
+				"Basis = %v, want %v", got.Basis, tt.wantBasis)
 
 			// Check penalties.
-			if !mapsEqual(got.Penalties, tt.wantPenalties) {
-				t.Errorf(
-					"Penalties = %v, want %v",
-					got.Penalties, tt.wantPenalties,
-				)
-			}
+			assert.True(t, mapsEqual(got.Penalties, tt.wantPenalties),
+				"Penalties = %v, want %v", got.Penalties, tt.wantPenalties)
 		})
 	}
 }
@@ -439,26 +447,13 @@ func TestComputeHealthScore_MidTaskCompactionPenalty(t *testing.T) {
 				MidTaskCompactionCount: tc.midTaskCount,
 			})
 			if tc.wantPenaltyKey == "" {
-				if _, ok := res.Penalties["mid_task_compactions"]; ok {
-					t.Errorf("unexpected mid-task penalty: %v",
-						res.Penalties)
-				}
+				_, ok := res.Penalties["mid_task_compactions"]
+				assert.False(t, ok, "unexpected mid-task penalty: %v", res.Penalties)
 				return
 			}
 			got, ok := res.Penalties[tc.wantPenaltyKey]
-			if !ok {
-				t.Fatalf(
-					"missing penalty %q in %v",
-					tc.wantPenaltyKey, res.Penalties,
-				)
-			}
-			if got != tc.wantPenaltyValue {
-				t.Errorf(
-					"penalty[%q] = %d, want %d",
-					tc.wantPenaltyKey, got,
-					tc.wantPenaltyValue,
-				)
-			}
+			require.True(t, ok, "missing penalty %q in %v", tc.wantPenaltyKey, res.Penalties)
+			assert.Equal(t, tc.wantPenaltyValue, got)
 		})
 	}
 }

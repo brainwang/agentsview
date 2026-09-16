@@ -1,30 +1,50 @@
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-} from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import { insights } from "./insights.svelte.js";
-import * as api from "../api/client.js";
-import { ApiError } from "../api/client.js";
-import type { Insight } from "../api/types.js";
+import type { Insight, Session } from "../api/types.js";
 
-vi.mock("../api/client.js", async (importOriginal) => {
-  const orig =
-    await importOriginal<typeof import("../api/client.js")>();
+const api = vi.hoisted(() => {
+  class MockApiError extends Error {
+    constructor(
+      public readonly status: number,
+      message: string,
+    ) {
+      super(message);
+      this.name = "ApiError";
+    }
+  }
   return {
-    ...orig,
     listInsights: vi.fn(),
-    getInsight: vi.fn(),
     deleteInsight: vi.fn(),
     generateInsight: vi.fn(),
+    ApiError: MockApiError,
   };
 });
 
-function makeInsight(
-  overrides: Partial<Insight> = {},
-): Insight {
+const ApiError = api.ApiError;
+
+const runtimeMocks = vi.hoisted(() => ({
+  callGenerated: vi.fn((request: () => Promise<unknown>, _signal?: AbortSignal) => request()),
+}));
+
+vi.mock("../api/client.js", () => ({
+  generateInsight: api.generateInsight,
+}));
+
+vi.mock("../api/runtime.js", () => ({
+  ApiError: api.ApiError,
+  callGenerated: runtimeMocks.callGenerated,
+  isAbortError: vi.fn(() => false),
+}));
+
+vi.mock("../api/generated/index", () => ({
+  ApiError: api.ApiError,
+  InsightsService: {
+    getApiV1Insights: vi.fn(() => api.listInsights()),
+    deleteApiV1InsightsById: vi.fn(({ id }) => api.deleteInsight(id)),
+  },
+}));
+
+function makeInsight(overrides: Partial<Insight> = {}): Insight {
   return {
     id: 1,
     type: "daily_activity",
@@ -40,6 +60,25 @@ function makeInsight(
   };
 }
 
+function makeSession(overrides: Partial<Session> = {}): Session {
+  return {
+    id: "run:session-1",
+    project: "proj-a",
+    machine: "local",
+    agent: "claude",
+    first_message: "hello",
+    started_at: "2026-07-05T14:30:00Z",
+    ended_at: "2026-07-05T14:45:00Z",
+    message_count: 2,
+    user_message_count: 1,
+    total_output_tokens: 0,
+    peak_context_tokens: 0,
+    is_automated: false,
+    created_at: "2026-07-05T14:30:00Z",
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   insights.items = [];
@@ -47,10 +86,55 @@ beforeEach(() => {
   insights.selectedTaskId = null;
   insights.loading = false;
   insights.tasks = [];
+  insights.setDateFrom("2025-01-15");
+  insights.setDateTo("2025-01-15");
+  insights.setType("daily_activity");
+  insights.setCannedKind("prompt_maturity_review");
+  insights.setProject("");
+  insights.setAgent("claude");
+  insights.setSessionAgent("");
+  insights.setAutomatedScope("human");
   insights.promptText = "";
+  runtimeMocks.callGenerated.mockReset();
+  runtimeMocks.callGenerated.mockImplementation(
+    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
+  );
 });
 
 describe("load", () => {
+  it("aborts an obsolete list read without aborting generation", async () => {
+    const signals: AbortSignal[] = [];
+    runtimeMocks.callGenerated.mockImplementation((request, signal) => {
+      signals.push(signal as AbortSignal);
+      return request();
+    });
+    vi.mocked(api.listInsights)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({ insights: [] });
+
+    void insights.load();
+    await Promise.resolve();
+    await insights.load();
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(api.generateInsight).not.toHaveBeenCalled();
+  });
+
+  it("aborts the list read on page teardown", async () => {
+    const signals: AbortSignal[] = [];
+    runtimeMocks.callGenerated.mockImplementation((request, signal) => {
+      signals.push(signal as AbortSignal);
+      return request();
+    });
+    vi.mocked(api.listInsights).mockImplementationOnce(() => new Promise(() => {}));
+
+    void insights.load();
+    await Promise.resolve();
+    insights.cancelInFlightReads();
+
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
   it("fetches insights and updates state", async () => {
     const s1 = makeInsight({ id: 1 });
     const s2 = makeInsight({ id: 2, project: "my-app" });
@@ -134,9 +218,7 @@ describe("date range mode switching", () => {
       abort: vi.fn(),
       done: Promise.resolve(makeInsight({ id: 1 })),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
 
@@ -159,9 +241,7 @@ describe("date range mode switching", () => {
       abort: vi.fn(),
       done: Promise.resolve(makeInsight({ id: 1 })),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
 
@@ -219,15 +299,69 @@ describe("selectedItem", () => {
 });
 
 describe("generate (multi-task)", () => {
+  it("starts independent report and session tasks without crypto.randomUUID", () => {
+    // Non-localhost HTTP origins do not expose crypto.randomUUID.
+    vi.stubGlobal("crypto", {});
+    const abortReport = vi.fn();
+    const abortSession = vi.fn();
+    vi.mocked(api.generateInsight)
+      .mockReturnValueOnce({ abort: abortReport, done: new Promise(() => {}) })
+      .mockReturnValueOnce({ abort: abortSession, done: new Promise(() => {}) });
+
+    try {
+      insights.setType("llm_canned");
+      insights.generate();
+      insights.generateForSession(makeSession());
+
+      expect(api.generateInsight).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ type: "llm_canned", llm_opt_in: true }),
+        expect.any(Function),
+        expect.any(Function),
+      );
+      expect(api.generateInsight).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ type: "agent_analysis", session_id: "run:session-1" }),
+        expect.any(Function),
+        expect.any(Function),
+      );
+      expect(insights.tasks).toHaveLength(2);
+      insights.cancelTask(insights.tasks[0]!.clientId);
+      expect(abortReport).toHaveBeenCalledOnce();
+      expect(abortSession).not.toHaveBeenCalled();
+      insights.cancelTask(insights.tasks[1]!.clientId);
+      expect(abortSession).toHaveBeenCalledOnce();
+    } finally {
+      api.generateInsight.mockReset();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("includes the browser timezone so summaries align with the dashboard", () => {
+    const mockHandle = {
+      abort: vi.fn(),
+      done: Promise.resolve(makeInsight({ id: 1 })),
+    };
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
+
+    insights.generate();
+
+    expect(api.generateInsight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      }),
+      expect.any(Function),
+      expect.any(Function),
+    );
+  });
+
   it("adds task to tasks[] and prepends result on completion", async () => {
     const newInsight = makeInsight({ id: 10 });
     const mockHandle = {
       abort: vi.fn(),
       done: Promise.resolve(newInsight),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
 
@@ -240,6 +374,99 @@ describe("generate (multi-task)", () => {
     expect(insights.tasks).toHaveLength(0);
     expect(insights.items[0]).toEqual(newInsight);
     expect(insights.selectedId).toBe(10);
+  });
+
+  it("moves cached result to top without duplicating the id", async () => {
+    const existing = makeInsight({ id: 10, content: "old" });
+    const cached = makeInsight({
+      id: 10,
+      content: "cached",
+      cache_status: "hit",
+    });
+    insights.items = [makeInsight({ id: 1 }), existing, makeInsight({ id: 2 })];
+    vi.mocked(api.generateInsight).mockReturnValueOnce({
+      abort: vi.fn(),
+      done: Promise.resolve(cached),
+    });
+
+    insights.generate();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(insights.items.map((s) => s.id)).toEqual([10, 1, 2]);
+    expect(insights.items[0]).toEqual(cached);
+    expect(insights.selectedId).toBe(10);
+  });
+
+  it("sends canned insight fields when generating recommendations", async () => {
+    insights.setType("llm_canned");
+    insights.setCannedKind("tool_reliability_review");
+    insights.promptText = "Focus on retries";
+    vi.mocked(api.generateInsight).mockReturnValueOnce({
+      abort: vi.fn(),
+      done: Promise.resolve(makeInsight({ id: 30 })),
+    });
+
+    insights.generate();
+
+    expect(api.generateInsight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "llm_canned",
+        kind: "tool_reliability_review",
+        llm_opt_in: true,
+        prompt: "Focus on retries",
+        automated_scope: "human",
+      }),
+      expect.any(Function),
+      expect.any(Function),
+    );
+  });
+
+  it("generates agent analysis for a single session", () => {
+    vi.mocked(api.generateInsight).mockReturnValueOnce({
+      abort: vi.fn(),
+      done: Promise.resolve(makeInsight({ id: 32 })),
+    });
+
+    insights.generateForSession(makeSession());
+
+    expect(api.generateInsight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "agent_analysis",
+        date_from: "2026-07-05",
+        date_to: "2026-07-05",
+        project: "proj-a",
+        session_id: "run:session-1",
+      }),
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(insights.selectedTaskId).toBe(insights.tasks[0]?.clientId);
+  });
+
+  it("sends only visible session scope for canned recommendations", async () => {
+    insights.setType("llm_canned");
+    insights.setCannedKind("prompt_maturity_review");
+    insights.setSessionAgent("codex");
+    insights.setAutomatedScope("all");
+    vi.mocked(api.generateInsight).mockReturnValueOnce({
+      abort: vi.fn(),
+      done: Promise.resolve(makeInsight({ id: 31 })),
+    });
+
+    insights.generate();
+
+    expect(api.generateInsight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "llm_canned",
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        automated_scope: "all",
+        filters: {
+          agent: "codex",
+        },
+      }),
+      expect.any(Function),
+      expect.any(Function),
+    );
   });
 
   it("supports multiple concurrent tasks", async () => {
@@ -285,9 +512,7 @@ describe("generate (multi-task)", () => {
       abort: vi.fn(),
       done: Promise.reject(new Error("CLI not found")),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     await new Promise((r) => setTimeout(r, 0));
@@ -295,32 +520,89 @@ describe("generate (multi-task)", () => {
     expect(insights.tasks).toHaveLength(1);
     expect(insights.tasks[0]!.status).toBe("error");
     expect(insights.tasks[0]!.error).toBe("CLI not found");
-    expect(insights.selectedTaskId).toBe(
-      insights.tasks[0]!.clientId,
-    );
+    expect(insights.selectedTaskId).toBe(insights.tasks[0]!.clientId);
     expect(insights.selectedId).toBeNull();
+  });
+
+  it("retries a failed task with its original request", async () => {
+    const retriedInsight = makeInsight({ id: 77 });
+    vi.mocked(api.generateInsight)
+      .mockReturnValueOnce({
+        abort: vi.fn(),
+        done: Promise.reject(new Error("validation failed")),
+      })
+      .mockReturnValueOnce({
+        abort: vi.fn(),
+        done: Promise.resolve(retriedInsight),
+      });
+
+    insights.setType("llm_canned");
+    insights.setCannedKind("model_cost_review");
+    insights.setDateFrom("2025-01-01");
+    insights.setDateTo("2025-01-31");
+    insights.setProject("middleman");
+    insights.setAgent("codex");
+    insights.setSessionAgent("codex");
+    insights.setAutomatedScope("automated");
+    insights.promptText = "Focus on cache misses";
+
+    insights.generate();
+    await new Promise((r) => setTimeout(r, 0));
+
+    const failedTask = insights.tasks[0]!;
+    expect(failedTask.status).toBe("error");
+
+    insights.promptText = "A different current focus";
+    insights.setSessionAgent("claude");
+    insights.retryTask(failedTask.clientId);
+
+    expect(insights.tasks).toHaveLength(1);
+    expect(insights.tasks[0]!.clientId).toBe(failedTask.clientId);
+    expect(insights.tasks[0]!.status).toBe("generating");
+    expect(api.generateInsight).toHaveBeenLastCalledWith(
+      {
+        type: "llm_canned",
+        date_from: "2025-01-01",
+        date_to: "2025-01-31",
+        project: "middleman",
+        prompt: "Focus on cache misses",
+        agent: "codex",
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        kind: "model_cost_review",
+        llm_opt_in: true,
+        automated_scope: "automated",
+        filters: {
+          agent: "codex",
+        },
+      },
+      expect.any(Function),
+      expect.any(Function),
+    );
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(insights.tasks).toHaveLength(0);
+    expect(insights.items[0]).toEqual(retriedInsight);
   });
 
   it("captures streaming logs per task", async () => {
     let doneResolve!: (s: Insight) => void;
-    vi.mocked(api.generateInsight).mockImplementationOnce(
-      (_req, _onStatus, onLog) => {
-        onLog?.({ stream: "stdout", line: "{\"type\":\"system\"}" });
-        onLog?.({ stream: "stderr", line: "rate limit warning" });
-        return {
-          abort: vi.fn(),
-          done: new Promise<Insight>((resolve) => {
-            doneResolve = resolve;
-          }),
-        };
-      },
-    );
+    vi.mocked(api.generateInsight).mockImplementationOnce((_req, _onStatus, onLog) => {
+      onLog?.({ stream: "stdout", line: '{"type":"system"}' });
+      onLog?.({ stream: "stderr", line: "rate limit warning" });
+      return {
+        abort: vi.fn(),
+        done: new Promise<Insight>((resolve) => {
+          doneResolve = resolve;
+        }),
+      };
+    });
 
     insights.generate();
 
     expect(insights.tasks).toHaveLength(1);
     expect(insights.tasks[0]!.logs).toEqual([
-      { stream: "stdout", line: "{\"type\":\"system\"}" },
+      { stream: "stdout", line: '{"type":"system"}' },
       { stream: "stderr", line: "rate limit warning" },
     ]);
 
@@ -331,22 +613,20 @@ describe("generate (multi-task)", () => {
 
   it("caps logs to the most recent 200 lines", async () => {
     let doneResolve!: (s: Insight) => void;
-    vi.mocked(api.generateInsight).mockImplementationOnce(
-      (_req, _onStatus, onLog) => {
-        for (let i = 0; i < 250; i++) {
-          onLog?.({
-            stream: "stdout",
-            line: `line-${i}`,
-          });
-        }
-        return {
-          abort: vi.fn(),
-          done: new Promise<Insight>((resolve) => {
-            doneResolve = resolve;
-          }),
-        };
-      },
-    );
+    vi.mocked(api.generateInsight).mockImplementationOnce((_req, _onStatus, onLog) => {
+      for (let i = 0; i < 250; i++) {
+        onLog?.({
+          stream: "stdout",
+          line: `line-${i}`,
+        });
+      }
+      return {
+        abort: vi.fn(),
+        done: new Promise<Insight>((resolve) => {
+          doneResolve = resolve;
+        }),
+      };
+    });
 
     insights.generate();
     expect(insights.tasks).toHaveLength(1);
@@ -368,9 +648,7 @@ describe("generate (multi-task)", () => {
         resolveDone = resolve;
       }),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
     vi.mocked(api.listInsights).mockResolvedValue({
       insights: [newInsight],
     });
@@ -389,17 +667,12 @@ describe("generate (multi-task)", () => {
   });
 
   it("removes task on abort without error", async () => {
-    const abortError = new DOMException(
-      "Aborted",
-      "AbortError",
-    );
+    const abortError = new DOMException("Aborted", "AbortError");
     const mockHandle = {
       abort: vi.fn(),
       done: Promise.reject(abortError),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     await new Promise((r) => setTimeout(r, 0));
@@ -418,9 +691,7 @@ describe("cancelTask", () => {
         rejectDone = reject;
       }),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     const clientId = insights.tasks[0]!.clientId;
@@ -428,9 +699,7 @@ describe("cancelTask", () => {
     insights.cancelTask(clientId);
     expect(abortFn).toHaveBeenCalled();
 
-    rejectDone(
-      new DOMException("Aborted", "AbortError"),
-    );
+    rejectDone(new DOMException("Aborted", "AbortError"));
     await new Promise((r) => setTimeout(r, 0));
 
     expect(insights.tasks).toHaveLength(0);
@@ -443,9 +712,7 @@ describe("dismissTask", () => {
       abort: vi.fn(),
       done: Promise.reject(new Error("fail")),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     await new Promise((r) => setTimeout(r, 0));
@@ -464,9 +731,7 @@ describe("deleteItem", () => {
     const s = makeInsight({ id: 5 });
     insights.items = [s];
     insights.selectedId = 5;
-    vi.mocked(api.deleteInsight).mockResolvedValueOnce(
-      undefined,
-    );
+    vi.mocked(api.deleteInsight).mockResolvedValueOnce(undefined);
 
     await insights.deleteItem(5);
 
@@ -480,9 +745,7 @@ describe("deleteItem", () => {
     const s2 = makeInsight({ id: 2 });
     insights.items = [s1, s2];
     insights.selectedId = 1;
-    vi.mocked(api.deleteInsight).mockResolvedValueOnce(
-      undefined,
-    );
+    vi.mocked(api.deleteInsight).mockResolvedValueOnce(undefined);
 
     await insights.deleteItem(2);
 
@@ -494,9 +757,7 @@ describe("deleteItem", () => {
     const s = makeInsight({ id: 5 });
     insights.items = [s];
     insights.selectedId = 5;
-    vi.mocked(api.deleteInsight).mockRejectedValueOnce(
-      new ApiError(500, "internal error"),
-    );
+    vi.mocked(api.deleteInsight).mockRejectedValueOnce(new ApiError(500, "internal error"));
 
     await insights.deleteItem(5);
 
@@ -508,9 +769,7 @@ describe("deleteItem", () => {
     const s = makeInsight({ id: 5 });
     insights.items = [s];
     insights.selectedId = 5;
-    vi.mocked(api.deleteInsight).mockRejectedValueOnce(
-      new ApiError(404, "not found"),
-    );
+    vi.mocked(api.deleteInsight).mockRejectedValueOnce(new ApiError(404, "not found"));
 
     await insights.deleteItem(5);
 
@@ -559,10 +818,7 @@ describe("cancelAll", () => {
     expect(abort1).toHaveBeenCalled();
     expect(abort2).toHaveBeenCalled();
 
-    const abortErr = new DOMException(
-      "Aborted",
-      "AbortError",
-    );
+    const abortErr = new DOMException("Aborted", "AbortError");
     reject1(abortErr);
     reject2(abortErr);
     await new Promise((r) => setTimeout(r, 0));
@@ -574,9 +830,7 @@ describe("cancelAll", () => {
 describe("load error handling", () => {
   it("clears items on API error", async () => {
     insights.items = [makeInsight({ id: 1 })];
-    vi.mocked(api.listInsights).mockRejectedValueOnce(
-      new Error("network error"),
-    );
+    vi.mocked(api.listInsights).mockRejectedValueOnce(new Error("network error"));
 
     await insights.load();
 

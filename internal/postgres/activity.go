@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db"
 )
 
 // GetSessionActivity returns time-bucketed message counts for a
@@ -25,7 +25,7 @@ func (s *Store) GetSessionActivity(
 
 	// 2. Visible-message filter (same as SQLite).
 	visFilter := "m.is_system = FALSE AND " +
-		db.SystemPrefixSQL("m.content", "m.role")
+		db.PostgresSystemPrefixSQL("m.content", "m.role")
 
 	// 3. Get min/max timestamps from visible messages.
 	// PG stores timestamp as TIMESTAMPTZ, so scan into *time.Time.
@@ -64,7 +64,7 @@ func (s *Store) GetSessionActivity(
 		SELECT
 			floor((EXTRACT(EPOCH FROM m.timestamp) - $1) / $2)::bigint
 				AS bucket,
-			SUM(CASE WHEN m.role = 'user'
+			SUM(CASE WHEN m.role = 'user' AND COALESCE(m.source_subtype, '') <> 'tool_result'
 				THEN 1 ELSE 0 END)::int,
 			SUM(CASE WHEN m.role = 'assistant'
 				THEN 1 ELSE 0 END)::int,

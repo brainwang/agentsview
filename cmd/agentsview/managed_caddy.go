@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -12,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wesm/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/config"
 )
 
 const managedCaddyStartGrace = 300 * time.Millisecond
@@ -20,17 +21,95 @@ const managedCaddyStartGrace = 300 * time.Millisecond
 type managedCaddy struct {
 	cancel context.CancelFunc
 	errCh  chan error
+	guard  caddyGuard
+	pid    int
 }
 
+// Pid returns the managed Caddy process id, or 0 when no Caddy is running.
+// `serve stop` records it so it can terminate an orphaned Caddy if the server
+// is force-killed before it can stop Caddy itself.
+func (m *managedCaddy) Pid() int {
+	if m == nil {
+		return 0
+	}
+	return m.pid
+}
+
+// caddyGuard ties the managed Caddy child to the server's lifetime. On Windows
+// it holds a job-object handle whose closure -- when the server exits for any
+// reason, including the uncatchable kill `serve stop` issues there -- tears
+// down Caddy with it. On other platforms it is a no-op: `serve stop` shuts the
+// server down with SIGTERM, so the server's own cleanup stops Caddy.
+type caddyGuard interface{ Close() error }
+
+type noopCaddyGuard struct{}
+
+func (noopCaddyGuard) Close() error { return nil }
+
 func browserURL(cfg config.Config) string {
+	return browserURLWithPlatform(cfg, runningInWSL, interfaceIPv4)
+}
+
+func browserURLWithPlatform(
+	cfg config.Config,
+	isWSL func() bool,
+	ifaceIPv4 func(string) (string, bool),
+) string {
 	if cfg.PublicURL != "" {
 		return cfg.PublicURL
 	}
 	host := cfg.Host
 	if host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
+		if isWSL != nil && isWSL() {
+			if ip, ok := ifaceIPv4("eth0"); ok {
+				host = ip
+			} else {
+				host = "127.0.0.1"
+			}
+		} else {
+			host = "127.0.0.1"
+		}
 	}
 	return fmt.Sprintf("http://%s:%d", host, cfg.Port)
+}
+
+func runningInWSL() bool {
+	if os.Getenv("WSL_DISTRO_NAME") != "" {
+		return true
+	}
+	if _, err := os.Stat("/proc/sys/fs/binfmt_misc/WSLInterop"); err == nil {
+		return true
+	}
+	return false
+}
+
+func interfaceIPv4(name string) (string, bool) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil || iface == nil {
+		return "", false
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", false
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		default:
+			continue
+		}
+		if ip == nil || ip.IsLoopback() {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String(), true
+		}
+	}
+	return "", false
 }
 
 func rewriteConfiguredPublicURLPort(
@@ -84,6 +163,20 @@ func rewriteConfiguredPublicURLPort(
 }
 
 func validateServeConfig(cfg config.Config) error {
+	// A persistent non-loopback bind from config.toml exposes the
+	// API on every restart, so it must not silently ship without
+	// authentication. An explicit --host flag stays exempt: it is
+	// a deliberate, per-invocation choice and existing behavior.
+	if !cfg.HostExplicit && !isLoopbackHost(cfg.Host) &&
+		!cfg.RequireAuth {
+		return fmt.Errorf(
+			"host = %q in config.toml exposes the API beyond this "+
+				"machine; set require_auth = true in config.toml to "+
+				"serve it with bearer-token authentication, or use "+
+				"the --host flag for a one-off unauthenticated bind",
+			cfg.Host,
+		)
+	}
 	if cfg.Proxy.Mode == "" {
 		return nil
 	}
@@ -205,6 +298,7 @@ func startManagedCaddy(
 	parent context.Context,
 	cfg config.Config,
 	mode string,
+	onStarted func(int),
 ) (*managedCaddy, error) {
 	configPath, content, err := prepareManagedCaddyConfig(
 		cfg,
@@ -253,6 +347,20 @@ func startManagedCaddy(
 		cancel()
 		return nil, fmt.Errorf("starting managed caddy: %w", err)
 	}
+	if onStarted != nil {
+		onStarted(cmd.Process.Pid)
+	}
+
+	// Bind Caddy's lifetime to this server process so it cannot outlive a
+	// `serve stop` that kills the server without a graceful shutdown (Windows).
+	// Best-effort: a failure leaves the prior behavior, so log and continue.
+	guard, gErr := newCaddyGuard(cmd)
+	if gErr != nil {
+		log.Printf("warning: could not confine managed caddy: %v", gErr)
+	}
+	if guard == nil {
+		guard = noopCaddyGuard{}
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -262,6 +370,7 @@ func startManagedCaddy(
 	select {
 	case err := <-errCh:
 		cancel()
+		_ = guard.Close()
 		if err == nil {
 			return nil, fmt.Errorf("managed caddy exited immediately")
 		}
@@ -269,20 +378,28 @@ func startManagedCaddy(
 	case <-time.After(managedCaddyStartGrace):
 	case <-parent.Done():
 		cancel()
+		_ = guard.Close()
 		return nil, parent.Err()
 	}
 
 	return &managedCaddy{
 		cancel: cancel,
 		errCh:  errCh,
+		guard:  guard,
+		pid:    cmd.Process.Pid,
 	}, nil
 }
 
 func (m *managedCaddy) Stop() {
-	if m == nil || m.cancel == nil {
+	if m == nil {
 		return
 	}
-	m.cancel()
+	if m.cancel != nil {
+		m.cancel()
+	}
+	if m.guard != nil {
+		_ = m.guard.Close()
+	}
 }
 
 func (m *managedCaddy) Err() <-chan error {

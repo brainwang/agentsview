@@ -1,12 +1,28 @@
+import { SettingsUpdateRequestZoomLevel as ZoomLevel } from "../api/generated/models/settingsUpdateRequestZoomLevel.js";
+import {
+  getHighContrast,
+  initTheme,
+  isDark,
+  MEDIA,
+  setHighContrast,
+  setThemeMode,
+} from "@kenn-io/kit-ui";
 import {
   SIDEBAR_WIDTH_DEFAULT,
   SIDEBAR_WIDTH_KEY,
+  VITALS_WIDTH_DEFAULT,
+  VITALS_WIDTH_KEY,
   clampStoredSidebarWidth,
+  clampStoredVitalsWidth,
 } from "../components/layout/sidebar-width.js";
 
 type Theme = "light" | "dark";
-export type MessageLayout = "default" | "compact" | "stream";
+export type MessageLayout = "default" | "compact" | "stream" | "skim";
 export type TranscriptMode = "normal" | "focused";
+export type PublishTarget =
+  | { kind: "session"; id: string }
+  | { kind: "insight"; id: number }
+  | null;
 type ModalType =
   | "about"
   | "commandPalette"
@@ -18,12 +34,7 @@ type ModalType =
   | null;
 
 /** Block types that can be toggled visible/hidden. */
-export type BlockType =
-  | "user"
-  | "assistant"
-  | "thinking"
-  | "tool"
-  | "code";
+export type BlockType = "user" | "assistant" | "thinking" | "tool" | "code" | "system";
 
 export const ALL_BLOCK_TYPES: BlockType[] = [
   "user",
@@ -31,86 +42,153 @@ export const ALL_BLOCK_TYPES: BlockType[] = [
   "thinking",
   "tool",
   "code",
+  "system",
 ];
 
 const BLOCK_FILTER_KEY = "agentsview-block-filters";
 const TRANSCRIPT_MODE_KEY = "agentsview-transcript-mode";
+const UNKNOWN_XML_PREFORMATTED_KEY = "agentsview-unknown-xml-preformatted";
 const VITALS_KEY = "agentsview-session-vitals";
+const VITALS_CALLS_EXPANDED_KEY = "agentsview-session-vitals-calls-expanded";
 const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
+const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
 
-function readBlockFilters(): Set<BlockType> {
+/** Resolves the visible block types from a stored filter payload. */
+export function parseBlockFilters(raw: string | null): Set<BlockType> {
+  const hidden = parseHiddenBlocks(raw);
+  return new Set(ALL_BLOCK_TYPES.filter((type) => !hidden.has(type)));
+}
+
+/** Serializes the visible block types for storage. */
+export function serializeBlockFilters(visible: Set<BlockType>): string {
+  return JSON.stringify({
+    hidden: ALL_BLOCK_TYPES.filter((type) => !visible.has(type)),
+  });
+}
+
+function parseHiddenBlocks(raw: string | null): Set<BlockType> {
+  if (!raw) return new Set();
   try {
-    const raw = localStorage?.getItem(BLOCK_FILTER_KEY);
-    if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) {
-        return new Set(
-          arr.filter((t: string) =>
-            ALL_BLOCK_TYPES.includes(t as BlockType),
-          ) as BlockType[],
-        );
-      }
+    const parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.hidden)) {
+      return new Set(knownBlockTypes(parsed.hidden));
     }
   } catch {
     // ignore
   }
-  return new Set(ALL_BLOCK_TYPES);
+  return new Set();
+}
+
+function knownBlockTypes(values: unknown[]): BlockType[] {
+  return values.filter((value): value is BlockType => ALL_BLOCK_TYPES.includes(value as BlockType));
+}
+
+function readBlockFilters(): Set<BlockType> {
+  try {
+    return parseBlockFilters(localStorage?.getItem(BLOCK_FILTER_KEY) ?? null);
+  } catch {
+    return new Set(ALL_BLOCK_TYPES);
+  }
 }
 
 const LAYOUT_KEY = "agentsview-message-layout";
 const ZOOM_KEY = "agentsview-zoom-level";
-const VALID_TRANSCRIPT_MODES: TranscriptMode[] = [
-  "normal",
-  "focused",
-];
+const VALID_TRANSCRIPT_MODES: TranscriptMode[] = ["normal", "focused"];
 
 const IS_DESKTOP =
-  typeof window !== "undefined" &&
-  new URLSearchParams(window.location.search).has(
-    "desktop",
-  );
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).has("desktop");
 
-const ZOOM_STEPS = [
-  67, 75, 80, 90, 100, 110, 125, 150, 175, 200,
-];
+export const ZOOM_STEPS = Object.values(ZoomLevel);
+
+function isZoomLevel(level: number): level is ZoomLevel {
+  return ZOOM_STEPS.some((step) => step === level);
+}
 const ZOOM_DEFAULT = 100;
+const FONT_SCALE_KEY = "agentsview-font-scale";
+const HIGH_CONTRAST_KEY = "agentsview-high-contrast";
+const LEGACY_FONT_SCALE_STEPS = [90, 100, 110, 120, 130];
+let zoomRequest = 0;
+let nativeZoomQueue = Promise.resolve();
+let confirmedNativeZoom = 1;
 
-function readStoredZoom(): number {
-  if (!IS_DESKTOP) return ZOOM_DEFAULT;
+type DesktopTauriWebviewWindow = {
+  setZoom(scaleFactor: number): Promise<void>;
+};
+
+type DesktopTauriBridge = {
+  webviewWindow?: {
+    getCurrentWebviewWindow?: () => DesktopTauriWebviewWindow;
+  };
+};
+
+function currentDesktopWebviewWindow(): DesktopTauriWebviewWindow | undefined {
+  if (!IS_DESKTOP || typeof window === "undefined") return;
+  const tauri = (window as Window & { __TAURI__?: DesktopTauriBridge }).__TAURI__;
+  return tauri?.webviewWindow?.getCurrentWebviewWindow?.();
+}
+
+function syncDesktopZoom(scaleFactor: number): Promise<void> | undefined {
+  const webview = currentDesktopWebviewWindow();
+  if (!webview) return;
+  nativeZoomQueue = nativeZoomQueue
+    .catch(() => {})
+    .then(async () => {
+      await webview.setZoom(scaleFactor);
+      confirmedNativeZoom = scaleFactor;
+    });
+  return nativeZoomQueue;
+}
+
+function setCssZoom(factor: number): void {
+  document.documentElement.style.setProperty("zoom", String(factor));
+  document.documentElement.style.setProperty("--agentsview-zoom-compensation", String(1 / factor));
+}
+
+function readStoredZoom(): ZoomLevel | undefined {
   try {
-    const raw = localStorage?.getItem(ZOOM_KEY);
-    if (raw) {
-      const val = Number(raw);
-      if (ZOOM_STEPS.includes(val)) return val;
-    }
+    const zoom = Number(localStorage?.getItem(ZOOM_KEY));
+    if (isZoomLevel(zoom) && zoom !== ZOOM_DEFAULT) return zoom;
+    // Prefer a saved text size over the old store's automatic 100%.
+    const legacy = Number(localStorage?.getItem(FONT_SCALE_KEY));
+    if (isZoomLevel(legacy) && LEGACY_FONT_SCALE_STEPS.includes(legacy)) return legacy;
+    if (isZoomLevel(zoom)) return zoom;
   } catch {
     // ignore
   }
-  return ZOOM_DEFAULT;
+  return undefined;
 }
-const VALID_LAYOUTS: MessageLayout[] = [
-  "default",
-  "compact",
-  "stream",
-];
-function readStoredTheme(): Theme | null {
-  if (
-    typeof localStorage !== "undefined" &&
-    localStorage != null &&
-    typeof localStorage.getItem === "function"
-  ) {
-    return localStorage.getItem("theme") as Theme;
+
+const VALID_LAYOUTS: MessageLayout[] = ["default", "compact", "stream", "skim"];
+// Theme state lives in kit-ui's theme store (mode/high-contrast persistence,
+// root class management, and OS-preference tracking in "system" mode). Reuse
+// the app's historical "theme" storage key — its stored "light"/"dark" values
+// are valid kit-ui modes — and migrate the legacy high-contrast key to the
+// derived key kit-ui persists under.
+function migrateHighContrastKey(): void {
+  try {
+    if (
+      typeof localStorage === "undefined" ||
+      localStorage == null ||
+      typeof localStorage.getItem !== "function"
+    ) {
+      return;
+    }
+    const legacy = localStorage.getItem(HIGH_CONTRAST_KEY);
+    if (legacy !== null && localStorage.getItem("theme-high-contrast") === null) {
+      localStorage.setItem("theme-high-contrast", legacy);
+    }
+  } catch {
+    // Storage blocked — kit-ui falls back to in-memory state.
   }
-  return null;
 }
+
+migrateHighContrastKey();
+initTheme({ storageKey: "theme" });
 
 function readStoredLayout(): MessageLayout {
   try {
     const raw = localStorage?.getItem(LAYOUT_KEY);
-    if (
-      raw &&
-      VALID_LAYOUTS.includes(raw as MessageLayout)
-    ) {
+    if (raw && VALID_LAYOUTS.includes(raw as MessageLayout)) {
       return raw as MessageLayout;
     }
   } catch {
@@ -122,10 +200,7 @@ function readStoredLayout(): MessageLayout {
 function readStoredTranscriptMode(): TranscriptMode {
   try {
     const raw = localStorage?.getItem(TRANSCRIPT_MODE_KEY);
-    if (
-      raw &&
-      VALID_TRANSCRIPT_MODES.includes(raw as TranscriptMode)
-    ) {
+    if (raw && VALID_TRANSCRIPT_MODES.includes(raw as TranscriptMode)) {
       return raw as TranscriptMode;
     }
   } catch {
@@ -136,11 +211,17 @@ function readStoredTranscriptMode(): TranscriptMode {
 
 function readStoredSidebarWidth(): number {
   try {
-    return clampStoredSidebarWidth(
-      localStorage?.getItem(SIDEBAR_WIDTH_KEY),
-    );
+    return clampStoredSidebarWidth(localStorage?.getItem(SIDEBAR_WIDTH_KEY));
   } catch {
     return SIDEBAR_WIDTH_DEFAULT;
+  }
+}
+
+function readStoredVitalsWidth(): number {
+  try {
+    return clampStoredVitalsWidth(localStorage?.getItem(VITALS_WIDTH_KEY));
+  } catch {
+    return VITALS_WIDTH_DEFAULT;
   }
 }
 
@@ -155,55 +236,135 @@ function readStoredBool(key: string, fallback: boolean): boolean {
   return fallback;
 }
 class UIStore {
-  theme: Theme = $state(readStoredTheme() || "light");
+  /** Resolved appearance from kit-ui's theme store; in "system" mode this
+   * tracks the OS preference. Assigning pins an explicit mode. */
+  get theme(): Theme {
+    return isDark() ? "dark" : "light";
+  }
+
+  set theme(value: Theme) {
+    setThemeMode(value);
+  }
+
+  get highContrast(): boolean {
+    return getHighContrast();
+  }
+
+  set highContrast(value: boolean) {
+    setHighContrast(value);
+  }
+
   sortNewestFirst: boolean = $state(false);
   messageLayout: MessageLayout = $state(readStoredLayout());
-  transcriptMode: TranscriptMode = $state(
-    readStoredTranscriptMode(),
-  );
+  transcriptMode: TranscriptMode = $state(readStoredTranscriptMode());
   sidebarWidth: number = $state(readStoredSidebarWidth());
+  vitalsWidth: number = $state(readStoredVitalsWidth());
   activeModal: ModalType = $state(null);
+  /** Whether the next gist publish should be secret instead of public. */
+  publishSecret: boolean = $state(false);
+  publishTarget: PublishTarget = $state(null);
   selectedOrdinal: number | null = $state(null);
   pendingScrollOrdinal: number | null = $state(null);
   pendingScrollSession: string | null = $state(null);
 
-  zoomLevel: number = $state(readStoredZoom());
+  private localZoomLevel = readStoredZoom();
+  zoomLevel: ZoomLevel = $state(this.localZoomLevel ?? ZOOM_DEFAULT);
+  renderUnknownXmlBlocksAsPreformatted: boolean = $state(
+    readStoredBool(UNKNOWN_XML_PREFORMATTED_KEY, false),
+  );
 
   sidebarOpen: boolean = $state(true);
   isMobileViewport: boolean = $state(false);
-  vitalsOpen: boolean = $state(
-    readStoredBool(VITALS_KEY, false),
-  );
-  signalPanelOpen: boolean = $state(
-    readStoredBool(SIGNAL_PANEL_KEY, false),
-  );
+  vitalsOpen: boolean = $state(readStoredBool(VITALS_KEY, false));
+  vitalsCallsExpanded: boolean = $state(readStoredBool(VITALS_CALLS_EXPANDED_KEY, true));
+  signalPanelOpen: boolean = $state(readStoredBool(SIGNAL_PANEL_KEY, false));
+  followLatest: boolean = $state(readStoredBool(FOLLOW_LATEST_KEY, false));
+  followLatestRequest: number = $state(0);
 
   /** Set of block types currently visible. */
   visibleBlocks: Set<BlockType> = $state(readBlockFilters());
 
   constructor() {
+    if (this.localZoomLevel !== undefined) this.persistZoomPreference();
     $effect.root(() => {
+      // Theme and high-contrast classes/persistence are owned by kit-ui's
+      // theme store (initTheme above); no effects needed here.
       $effect(() => {
-        const root = document.documentElement;
-        if (this.theme === "dark") {
-          root.classList.add("dark");
+        try {
+          localStorage?.setItem(LAYOUT_KEY, this.messageLayout);
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(TRANSCRIPT_MODE_KEY, this.transcriptMode);
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(SIDEBAR_WIDTH_KEY, String(this.sidebarWidth));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(VITALS_WIDTH_KEY, String(this.vitalsWidth));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        const factor = this.zoomLevel / 100;
+        const request = ++zoomRequest;
+        const nativeZoom = syncDesktopZoom(factor);
+        if (nativeZoom) {
+          document.documentElement.style.setProperty("zoom", "1");
+          document.documentElement.style.setProperty("--agentsview-zoom-compensation", "1");
+          void nativeZoom.then(
+            () => {
+              if (request === zoomRequest) {
+                confirmedNativeZoom = factor;
+                setCssZoom(1);
+              }
+            },
+            () => {
+              if (request !== zoomRequest) return;
+              const reset = syncDesktopZoom(1);
+              if (!reset) {
+                setCssZoom(factor / confirmedNativeZoom);
+                return;
+              }
+              void reset.then(
+                () => {
+                  if (request === zoomRequest) {
+                    confirmedNativeZoom = 1;
+                    setCssZoom(factor);
+                  }
+                },
+                () => {
+                  if (request === zoomRequest) setCssZoom(factor / confirmedNativeZoom);
+                },
+              );
+            },
+          );
         } else {
-          root.classList.remove("dark");
-        }
-        if (
-          typeof localStorage !== "undefined" &&
-          localStorage != null &&
-          typeof localStorage.setItem === "function"
-        ) {
-          localStorage.setItem("theme", this.theme);
+          setCssZoom(factor);
         }
       });
 
       $effect(() => {
         try {
           localStorage?.setItem(
-            LAYOUT_KEY,
-            this.messageLayout,
+            UNKNOWN_XML_PREFORMATTED_KEY,
+            String(this.renderUnknownXmlBlocksAsPreformatted),
           );
         } catch {
           // ignore
@@ -212,10 +373,7 @@ class UIStore {
 
       $effect(() => {
         try {
-          localStorage?.setItem(
-            TRANSCRIPT_MODE_KEY,
-            this.transcriptMode,
-          );
+          localStorage?.setItem(VITALS_KEY, String(this.vitalsOpen));
         } catch {
           // ignore
         }
@@ -223,27 +381,7 @@ class UIStore {
 
       $effect(() => {
         try {
-          localStorage?.setItem(
-            SIDEBAR_WIDTH_KEY,
-            String(this.sidebarWidth),
-          );
-        } catch {
-          // ignore
-        }
-      });
-
-      $effect(() => {
-        if (!IS_DESKTOP) return;
-        // "zoom" is non-standard but supported in WebKit/Chromium
-        (
-          document.documentElement.style as unknown as
-            Record<string, string>
-        ).zoom = String(this.zoomLevel / 100);
-        try {
-          localStorage?.setItem(
-            ZOOM_KEY,
-            String(this.zoomLevel),
-          );
+          localStorage?.setItem(VITALS_CALLS_EXPANDED_KEY, String(this.vitalsCallsExpanded));
         } catch {
           // ignore
         }
@@ -251,10 +389,7 @@ class UIStore {
 
       $effect(() => {
         try {
-          localStorage?.setItem(
-            VITALS_KEY,
-            String(this.vitalsOpen),
-          );
+          localStorage?.setItem(SIGNAL_PANEL_KEY, String(this.signalPanelOpen));
         } catch {
           // ignore
         }
@@ -262,23 +397,28 @@ class UIStore {
 
       $effect(() => {
         try {
-          localStorage?.setItem(
-            SIGNAL_PANEL_KEY,
-            String(this.signalPanelOpen),
-          );
+          localStorage?.setItem(FOLLOW_LATEST_KEY, String(this.followLatest));
         } catch {
           // ignore
         }
       });
 
-      // Initialize sidebar based on viewport width
+      $effect(() => {
+        if (this.activeModal !== "publish") {
+          this.publishTarget = null;
+        }
+      });
+
+      // Initialize sidebar based on viewport width. MEDIA.medium is the same
+      // 760px query the component CSS uses, so the store and stylesheets
+      // agree on where mobile layout starts.
       if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
-        const mq = window.matchMedia("(min-width: 768px)");
-        this.sidebarOpen = mq.matches;
-        this.isMobileViewport = !mq.matches;
+        const mq = window.matchMedia(MEDIA.medium);
+        this.sidebarOpen = !mq.matches;
+        this.isMobileViewport = mq.matches;
         const onChange = (e: MediaQueryListEvent) => {
-          this.sidebarOpen = e.matches;
-          this.isMobileViewport = !e.matches;
+          this.sidebarOpen = !e.matches;
+          this.isMobileViewport = e.matches;
         };
         if (mq.addEventListener) {
           mq.addEventListener("change", onChange);
@@ -347,10 +487,7 @@ class UIStore {
 
   private persistBlockFilters() {
     try {
-      localStorage?.setItem(
-        BLOCK_FILTER_KEY,
-        JSON.stringify([...this.visibleBlocks]),
-      );
+      localStorage?.setItem(BLOCK_FILTER_KEY, serializeBlockFilters(this.visibleBlocks));
     } catch {
       // ignore
     }
@@ -362,8 +499,7 @@ class UIStore {
 
   cycleLayout() {
     const idx = VALID_LAYOUTS.indexOf(this.messageLayout);
-    this.messageLayout =
-      VALID_LAYOUTS[(idx + 1) % VALID_LAYOUTS.length]!;
+    this.messageLayout = VALID_LAYOUTS[(idx + 1) % VALID_LAYOUTS.length]!;
   }
 
   setLayout(layout: MessageLayout) {
@@ -374,8 +510,24 @@ class UIStore {
     this.transcriptMode = mode;
   }
 
+  toggleUnknownXmlBlocksAsPreformatted() {
+    this.renderUnknownXmlBlocksAsPreformatted = !this.renderUnknownXmlBlocksAsPreformatted;
+  }
+
   setSidebarWidth(width: number) {
     this.sidebarWidth = clampStoredSidebarWidth(width);
+  }
+
+  setVitalsWidth(width: number) {
+    this.vitalsWidth = clampStoredVitalsWidth(width);
+  }
+
+  setPublishTarget(target: Exclude<PublishTarget, null>) {
+    this.publishTarget = target;
+  }
+
+  clearPublishTarget() {
+    this.publishTarget = null;
   }
 
   selectOrdinal(ordinal: number) {
@@ -393,27 +545,67 @@ class UIStore {
   }
 
   scrollToOrdinal(ordinal: number, sessionId?: string) {
+    this.followLatest = false;
     this.selectedOrdinal = ordinal;
     this.pendingScrollOrdinal = ordinal;
     this.pendingScrollSession = sessionId ?? null;
   }
 
+  setFollowLatest(enabled: boolean) {
+    this.followLatest = enabled;
+    if (enabled) {
+      this.followLatestRequest += 1;
+      this.selectedOrdinal = null;
+      this.pendingScrollOrdinal = null;
+      this.pendingScrollSession = null;
+    }
+  }
+
+  toggleFollowLatest() {
+    this.setFollowLatest(!this.followLatest);
+  }
+
   zoomIn() {
     const idx = ZOOM_STEPS.indexOf(this.zoomLevel);
     if (idx < ZOOM_STEPS.length - 1) {
-      this.zoomLevel = ZOOM_STEPS[idx + 1]!;
+      this.setZoomLevel(ZOOM_STEPS[idx + 1]!);
     }
   }
 
   zoomOut() {
     const idx = ZOOM_STEPS.indexOf(this.zoomLevel);
     if (idx > 0) {
-      this.zoomLevel = ZOOM_STEPS[idx - 1]!;
+      this.setZoomLevel(ZOOM_STEPS[idx - 1]!);
     }
   }
 
   resetZoom() {
-    this.zoomLevel = ZOOM_DEFAULT;
+    this.setZoomLevel(ZOOM_DEFAULT);
+  }
+
+  setZoomLevel(level: number) {
+    if (!isZoomLevel(level)) return;
+    this.localZoomLevel = level;
+    this.zoomLevel = level;
+    this.persistZoomPreference();
+  }
+
+  applyZoomDefault(level?: number) {
+    this.zoomLevel =
+      this.localZoomLevel ?? (level !== undefined && isZoomLevel(level) ? level : ZOOM_DEFAULT);
+  }
+
+  private persistZoomPreference() {
+    try {
+      localStorage?.setItem(ZOOM_KEY, String(this.zoomLevel));
+      localStorage?.removeItem(FONT_SCALE_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  toggleHighContrast() {
+    this.highContrast = !this.highContrast;
   }
 
   toggleSidebar() {
@@ -426,6 +618,14 @@ class UIStore {
 
   toggleVitals() {
     this.vitalsOpen = !this.vitalsOpen;
+  }
+
+  closeVitals() {
+    this.vitalsOpen = false;
+  }
+
+  toggleVitalsCalls() {
+    this.vitalsCallsExpanded = !this.vitalsCallsExpanded;
   }
 
   toggleSignalPanel() {

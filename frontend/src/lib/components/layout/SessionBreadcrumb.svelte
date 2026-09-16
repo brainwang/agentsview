@@ -1,30 +1,64 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import {
+    ChartColumnIcon,
+    CheckIcon,
+    ChevronDownIcon,
+    CirclePlayIcon,
+    CodeIcon,
+    CopyIcon,
+    EllipsisVerticalIcon,
+    FileTextIcon,
+    FolderIcon,
+    LightbulbIcon,
+    LinkIcon,
+    SearchIcon,
+    SquareTerminalIcon,
+    TriangleAlertIcon,
+  } from "../../icons.js";
+  import { onDestroy, onMount } from "svelte";
   import type { Session } from "../../api/types.js";
   import {
-    resumeSession,
-    openSession,
-    getSessionDirectory,
-    listOpeners,
+    OpenersService,
+    SessionsService,
     type Opener,
-  } from "../../api/client.js";
+    type ResumeRequest,
+    type ResumeResponse,
+  } from "../../api/generated/index";
+  import {
+    callGenerated,
+    isAbortError,
+  } from "../../api/runtime.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
-  import { agentColor, agentLabel } from "../../utils/agents.js";
-  import { formatTokenUsage } from "../../utils/format.js";
+  import {
+    agentColor,
+    agentForeground,
+    agentLabel,
+    entrypointBadge,
+  } from "../../utils/agents.js";
+  import { formatCost, formatTokenUsage } from "../../utils/format.js";
+  import type { Money } from "../../money.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
   import { getGradeStyle, getGradeLabel } from "../../utils/grade.js";
   import SignalPanel from "../content/SignalPanel.svelte";
+  import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SidebarToggleButton from "./SidebarToggleButton.svelte";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
+  import { insights } from "../../stores/insights.svelte.js";
   import {
     supportsResume,
     buildResumeCommand,
     formatResumeResponseCommand,
   } from "../../utils/resume.js";
+  import { codexDesktopLink } from "../../utils/codex.js";
+  import { claudeCodeLink } from "../../utils/claude.js";
+  import { LatestRead } from "../../utils/latest-read.js";
 
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
+  import { formatModelEffort } from "../../utils/model.js";
   import { ui } from "../../stores/ui.svelte.js";
+  import { m } from "../../i18n/index.js";
 
   interface Props {
     session: Session | undefined;
@@ -42,37 +76,254 @@
   let showOpenMenu = $state(false);
   let openers: Opener[] = $state([]);
   let openFeedback = $state("");
+  let openFeedbackKind = $state<"success" | "error">("success");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let sessionDir = $state<string | null>(null);
+  const openersRead = new LatestRead();
+  const directoryRead = new LatestRead();
+  const costRead = new LatestRead();
+  const breakdownRead = new LatestRead();
+
+  interface SessionDirectoryResponse {
+    path: string;
+  }
+
+  interface SessionUsageBreakdownEntry {
+    ordinal: number;
+    message_ordinal?: number;
+    source: string;
+    label: string;
+    timestamp: string;
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+    cost: Money;
+    has_cost: boolean;
+  }
 
   onMount(() => {
-    listOpeners()
-      .then((res) => { openers = res.openers; })
-      .catch(() => {});
+    const signal = openersRead.begin();
+    callGenerated((options) => OpenersService.getApiV1Openers(options), signal)
+      .then((res) => {
+        if (!openersRead.isCurrent(signal)) return;
+        openers = res.openers;
+      })
+      .catch((e) => {
+        if (!isAbortError(e)) openers = [];
+      })
+      .finally(() => openersRead.finish(signal));
+    return () => openersRead.cancel();
   });
 
   let resolvedSessionDirId: string | null = null;
+  let pendingSessionDirId: string | null = null;
   $effect(() => {
     if (!session) {
+      directoryRead.cancel();
       sessionDir = null;
       resolvedSessionDirId = null;
+      pendingSessionDirId = null;
       return;
     }
     const id = session.id;
-    if (id === resolvedSessionDirId) return;
+    if (id === resolvedSessionDirId || id === pendingSessionDirId) return;
+    const signal = directoryRead.begin();
+    pendingSessionDirId = id;
     sessionDir = null;
-    getSessionDirectory(id)
+    callGenerated(
+      (options) => SessionsService.getApiV1SessionsByIdDirectory({ id }, options),
+      signal,
+    )
       .then(({ path }) => {
-        if (session?.id === id) {
-          sessionDir = path || null;
+        if (session?.id === id && directoryRead.isCurrent(signal)) {
+          sessionDir = (path as SessionDirectoryResponse["path"]) || null;
           resolvedSessionDirId = id;
         }
       })
-      .catch(() => {
+      .catch((e) => {
+        if (isAbortError(e)) return;
         // Don't cache the ID on failure so the next
         // session refresh retries the lookup.
+      })
+      .finally(() => {
+        if (
+          directoryRead.finish(signal) &&
+          pendingSessionDirId === id
+        ) {
+          pendingSessionDirId = null;
+        }
       });
   });
+
+  let sessionCost = $state<Money | null>(null);
+  let sessionCostIsRollup = $state(false);
+  let sessionRollupSubagentCount = $state(0);
+  let sessionUsageBreakdownCount = $state(0);
+  let sessionUsageBreakdown = $state<SessionUsageBreakdownEntry[]>([]);
+  // Key of the last successful usage fetch. Cost depends on more
+  // than output tokens (input/cache tokens and explicit usage-event
+  // costs), so the key includes every cost-affecting field present
+  // in API session responses. A resync that changes none of these
+  // (e.g. a cost-only usage event) keeps a stale cost until the
+  // next keyed field moves; closing that would need a freshness
+  // marker in the session API.
+  let costFetchKey: string | null = null;
+  let costSessionId: string | null = null;
+  let breakdownFetchKey: string | null = null;
+
+  function childUsageFetchKey(parentId: string): string {
+    return Array.from(sessions.childSessions.values())
+      .filter((child) => child.parent_session_id === parentId)
+      .map((child) =>
+        [
+          child.id,
+          child.relationship_type ?? "",
+          child.transcript_revision ?? "",
+          child.message_count ?? 0,
+          child.total_output_tokens ?? 0,
+          child.peak_context_tokens ?? 0,
+          child.ended_at ?? "",
+        ].join("\t")
+      )
+      .sort()
+      .join("\n");
+  }
+
+  function usageFetchKey(s: Session): string {
+    return [
+      s.id,
+      s.transcript_revision ?? "",
+      s.total_output_tokens ?? 0,
+      s.peak_context_tokens ?? 0,
+      s.has_total_output_tokens ?? "",
+      s.has_peak_context_tokens ?? "",
+      s.message_count ?? 0,
+      s.ended_at ?? "",
+      sessions.activeSessionUsageVersion,
+      childUsageFetchKey(s.id),
+    ].join("\n");
+  }
+
+  function resetUsageBreakdown() {
+    breakdownRead.cancel();
+    sessionUsageBreakdownCount = 0;
+    sessionUsageBreakdown = [];
+    usageBreakdownOpen = false;
+    usageBreakdownLoading = false;
+    breakdownFetchKey = null;
+  }
+
+  $effect(() => {
+    if (!session) {
+      costRead.cancel();
+      sessionCost = null;
+      sessionCostIsRollup = false;
+      sessionRollupSubagentCount = 0;
+      resetUsageBreakdown();
+      costFetchKey = null;
+      costSessionId = null;
+      return;
+    }
+    const id = session.id;
+    const key = usageFetchKey(session);
+    if (id !== costSessionId) {
+      // Entering a different session invalidates both the displayed
+      // cost and the fetch cache; the cached key must never satisfy
+      // the early return below while another session's request is
+      // still in flight.
+      sessionCost = null;
+      sessionCostIsRollup = false;
+      sessionRollupSubagentCount = 0;
+      resetUsageBreakdown();
+      costFetchKey = null;
+    }
+    if (key === costFetchKey) return;
+    const signal = costRead.begin();
+    costSessionId = id;
+    callGenerated(
+      (options) => SessionsService.getApiV1SessionsByIdUsage({ id }, { rollup: true }, options),
+      signal,
+    )
+      .then((res) => {
+        if (!costRead.isCurrent(signal)) return;
+        costFetchKey = key;
+        sessionRollupSubagentCount = res.rollup_subagent_count ?? 0;
+        sessionCostIsRollup =
+          sessionRollupSubagentCount > 0 && res.has_rollup_cost === true;
+        sessionCost = sessionCostIsRollup
+          ? (res.rollup_cost ?? null)
+          : res.has_cost
+            ? res.cost
+            : null;
+        sessionUsageBreakdownCount = res.breakdown_count ?? 0;
+      })
+      .catch((e) => {
+        if (isAbortError(e) || !costRead.isCurrent(signal)) return;
+        sessionUsageBreakdownCount = 0;
+        // Leave the fetch key unset so the next
+        // session refresh retries the lookup.
+      })
+      .finally(() => costRead.finish(signal));
+  });
+
+  // Breakdown rows are fetched only when the menu opens; large
+  // sessions can have thousands of entries and the count-only
+  // /usage fetch above happens automatically on every session.
+  $effect(() => {
+    if (!usageBreakdownOpen || !session) {
+      breakdownRead.cancel();
+      usageBreakdownLoading = false;
+      return;
+    }
+    const id = session.id;
+    const key = usageFetchKey(session);
+    if (key === breakdownFetchKey) return;
+    const signal = breakdownRead.begin();
+    usageBreakdownLoading = true;
+    callGenerated(
+      (options) =>
+        SessionsService.getApiV1SessionsByIdUsage({ id }, { breakdown: true }, options),
+      signal,
+    )
+      .then((res) => {
+        if (!breakdownRead.isCurrent(signal)) return;
+        breakdownFetchKey = key;
+        usageBreakdownLoading = false;
+        sessionUsageBreakdown = Array.isArray(res.breakdown) ? res.breakdown : [];
+      })
+      .catch((e) => {
+        if (isAbortError(e) || !breakdownRead.isCurrent(signal)) return;
+        usageBreakdownLoading = false;
+        sessionUsageBreakdown = [];
+        // Leave the fetch key unset so reopening retries.
+      })
+      .finally(() => breakdownRead.finish(signal));
+  });
+
+  onDestroy(() => {
+    openersRead.cancel();
+    directoryRead.cancel();
+    costRead.cancel();
+    breakdownRead.cancel();
+  });
+
+  let sessionCostLabel = $derived(
+    sessionCost !== null ? formatCost(sessionCost) : null,
+  );
+  let sessionCostTitle = $derived(
+        sessionCostIsRollup
+      ? m.session_breadcrumb_total_cost_title({
+          count: sessionRollupSubagentCount,
+          countLabel: sessionRollupSubagentCount.toLocaleString(),
+        })
+      : m.session_breadcrumb_estimated_session_cost(),
+  );
+  // Menu rows render only while open, so the collapsed dropdown
+  // stays DOM-free.
+  let usageBreakdownOpen = $state(false);
+  let usageBreakdownLoading = $state(false);
 
   let sessionContextTokens = $derived(session?.peak_context_tokens ?? 0);
   let sessionOutputTokens = $derived(session?.total_output_tokens ?? 0);
@@ -97,10 +348,15 @@
       : null,
   );
 
-  let mainModel = $derived(
+  let mainModelInfo = $derived(
     messagesStore.sessionId === session?.id
-      ? messagesStore.mainModel
-      : "",
+      ? messagesStore.mainModelInfo
+      : { model: "", reasoningEffort: "" },
+  );
+  let mainModel = $derived(formatModelEffort(mainModelInfo));
+
+  let resumeModel = $derived(
+    session ? messagesStore.resumeModelFor(session.id) : "",
   );
 
   const gradeStyle = $derived(
@@ -116,6 +372,30 @@
   function sessionDisplayId(id: string): string {
     const idx = id.indexOf(":");
     return idx >= 0 ? id.slice(idx + 1) : id;
+  }
+
+  function formatTokenCount(value: number): string {
+    return Math.max(0, value).toLocaleString();
+  }
+
+  function formatBreakdownContext(entry: SessionUsageBreakdownEntry): string {
+    const context =
+      entry.input_tokens +
+      entry.cache_creation_input_tokens +
+      entry.cache_read_input_tokens;
+    return formatTokenCount(context);
+  }
+
+  function formatBreakdownTitle(entry: SessionUsageBreakdownEntry): string {
+    const parts = [
+      entry.model || entry.source,
+      `${formatBreakdownContext(entry)} ctx`,
+      `${formatTokenCount(entry.output_tokens)} out`,
+    ];
+    if (entry.has_cost) {
+      parts.push(formatCost(entry.cost));
+    }
+    return parts.filter(Boolean).join(" · ");
   }
 
   async function copySessionId(
@@ -148,6 +428,12 @@
     }, 1500);
   }
 
+  function handleAgentAnalysis() {
+    if (!session) return;
+    insights.generateForSession(session);
+    router.navigate("recall", { tab: "generated" });
+  }
+
   function toggleMenu() {
     menuOpen = !menuOpen;
   }
@@ -160,7 +446,8 @@
     if (!session) return;
     renameValue =
       session.display_name
-      ?? normalizeMessagePreview(session.first_message);
+      ?? normalizeMessagePreview(session.first_message)
+      ?? "";
     renaming = true;
     closeMenu();
     requestAnimationFrame(() => renameInput?.select());
@@ -191,8 +478,9 @@
     }
   }
 
-  function showFeedback(msg: string) {
+  function showFeedback(msg: string, kind: "success" | "error" = "success") {
     openFeedback = msg;
+    openFeedbackKind = kind;
     clearTimeout(feedbackTimer);
     feedbackTimer = setTimeout(() => { openFeedback = ""; }, 2000);
   }
@@ -201,29 +489,44 @@
     if (!session) return;
     showOpenMenu = false;
     try {
-      const resp = await resumeSession(session.id, {
-        opener_id: opener.id,
-      });
+      const resp = await SessionsService.postApiV1SessionsByIdResume(
+        { id: session.id },
+        { opener_id: opener.id } satisfies ResumeRequest,
+      );
       if (resp.launched) {
-        showFeedback(`Resumed in ${resp.terminal ?? opener.name}`);
+        showFeedback(m.session_breadcrumb_resumed_in({
+          target: resp.terminal ?? opener.name,
+        }));
         return;
       }
       // Launch failed — fall back to clipboard copy.
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok ? "Command copied!" : "Failed");
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
       // Fall back to local command build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok ? "Command copied!" : "Failed");
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback("Not supported");
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
@@ -231,43 +534,68 @@
     if (!session) return;
     showOpenMenu = false;
     try {
-      const resp = await resumeSession(session.id, { command_only: true });
+      const resp = await SessionsService.postApiV1SessionsByIdResume(
+        { id: session.id },
+        { command_only: true } satisfies ResumeRequest,
+      );
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok ? "Command copied!" : "Failed");
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
       // Fall back to local build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok ? "Command copied!" : "Failed");
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback("Not supported");
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
   async function handleCopyFilePath() {
     showOpenMenu = false;
     if (!sessionDir) {
-      showFeedback("No path available");
+      showFeedback(m.session_breadcrumb_no_path_available(), "error");
       return;
     }
     const ok = await copyToClipboard(sessionDir);
-    showFeedback(ok ? "Path copied!" : "Failed");
+    showFeedback(
+      ok
+        ? m.session_breadcrumb_path_copied()
+        : m.session_breadcrumb_failed(),
+      ok ? "success" : "error",
+    );
   }
 
   async function handleOpenIn(opener: Opener) {
     if (!session) return;
     showOpenMenu = false;
     try {
-      await openSession(session.id, opener.id);
-      showFeedback(`Opened in ${opener.name}`);
+      await SessionsService.postApiV1SessionsByIdOpen(
+        { id: session.id },
+        { opener_id: opener.id },
+      );
+      showFeedback(m.session_breadcrumb_opened_in({
+        target: opener.name,
+      }));
     } catch {
-      showFeedback("Failed to open");
+      showFeedback(m.session_breadcrumb_failed_to_open(), "error");
     }
   }
 
@@ -275,28 +603,42 @@
     if (!session) return;
     showOpenMenu = false;
     try {
-      const resp = await resumeSession(session.id, {});
+      const resp = await SessionsService.postApiV1SessionsByIdResume({ id: session.id }, {});
       if (resp.launched) {
         showFeedback(
-          `Resumed in ${resp.terminal ?? "terminal"}`,
+          m.session_breadcrumb_resumed_in({
+            target: resp.terminal ?? "terminal",
+          }),
         );
         return;
       }
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok ? "Command copied!" : "Failed");
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
       // Fall back to local command build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok ? "Command copied!" : "Failed");
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback("Not supported");
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
@@ -305,11 +647,22 @@
     !session?.id.includes("~"),
   );
 
-  const canResume = $derived(
+  const canLaunch = $derived(
     session
       ? supportsResume(session.agent) && isLocal
       : false,
   );
+
+  const codexLink = $derived(
+    session ? codexDesktopLink(session.agent, session.id) : null,
+  );
+
+  const claudeLink = $derived(
+    session?.agent === "claude" && isLocal
+      ? claudeCodeLink(sessionDir)
+      : null,
+  );
+  const canCopyCommand = $derived(session ? supportsResume(session.agent) : false);
 
   const terminalOpeners = $derived(
     openers.filter((o) => o.kind === "terminal"),
@@ -330,7 +683,8 @@
   );
 
   const showDropdown = $derived(
-    canResume ||
+    canCopyCommand ||
+    codexLink !== null ||
     (isLocal && (
       editorOpeners.length > 0 ||
       fileOpeners.length > 0 ||
@@ -388,8 +742,25 @@
 
 
 <div class="session-breadcrumb">
-  <button class="breadcrumb-link" onclick={onBack}>
-    Sessions
+  {#if !ui.isMobileViewport && !ui.sidebarOpen}
+    <div
+      class="sidebar-controls"
+      data-sidebar-focus-region="content"
+    >
+      <SidebarToggleButton placement="content" />
+      <SessionFilterControl
+        showDisplay={false}
+        showStarred={false}
+        align="left"
+      />
+    </div>
+  {/if}
+  <button
+    class="breadcrumb-link"
+    onclick={onBack}
+    title={m.session_breadcrumb_back_to_sessions()}
+  >
+    {m.session_breadcrumb_sessions()}
   </button>
   <span class="breadcrumb-sep">/</span>
   {#if renaming}
@@ -406,7 +777,7 @@
     />
   {:else}
     <span class="breadcrumb-current">
-      {session?.display_name || session?.project || ""}
+      {session?.display_name ?? session?.project ?? ""}
     </span>
   {/if}
   {#if session}
@@ -414,7 +785,36 @@
       <span
         class="agent-badge"
         style:background={agentColor(session.agent)}
-      >{agentLabel(session.agent)}</span>
+        style:color={agentForeground(session.agent)}
+      >{agentLabel(session.agent, session.agent_label)}</span>
+      {#if entrypointBadge(session.entrypoint)}
+        <span class="agent-badge entrypoint-badge">{entrypointBadge(session.entrypoint)}</span>
+      {/if}
+      {#if session.agent === "antigravity-cli" && session.transcript_fidelity === "summary"}
+        <a
+          class="summary-badge"
+          href="https://github.com/kenn-io/agentsview#antigravity-cli-high-resolution-transcripts"
+          target="_blank"
+          rel="noopener noreferrer"
+          title={m.session_breadcrumb_summary_mode_tooltip()}
+        >{m.session_breadcrumb_summary_mode()}</a>
+      {/if}
+      {#if session.parser_malformed_lines}
+        <span
+          class="malformed-badge"
+          title={m.session_breadcrumb_malformed_lines_tooltip({
+            count: session.parser_malformed_lines,
+          })}
+        >{m.session_breadcrumb_malformed_lines({
+          count: session.parser_malformed_lines,
+        })}</span>
+      {/if}
+      {#if (session.agent === "antigravity" || session.agent === "antigravity-cli") && session.decode_confidence === "low"}
+        <span
+          class="decode-badge"
+          title={m.session_breadcrumb_antigravity_decode_confidence_low_tooltip()}
+        >{m.session_breadcrumb_antigravity_decode_confidence_low()}</span>
+      {/if}
       {#if session.started_at}
         <span class="session-time">
           {new Date(session.started_at).toLocaleDateString(
@@ -433,7 +833,7 @@
         style:color={gradeStyle.text}
         style:border-color={gradeStyle.border}
         onclick={() => ui.toggleSignalPanel()}
-        title="Session health"
+        title={m.session_breadcrumb_session_health()}
       >
         {getGradeLabel(session.health_grade)}
       </button>
@@ -441,26 +841,33 @@
         <span class="open-group">
           <button
             class="resume-btn"
-            class:has-feedback={openFeedback !== ""}
+            class:has-feedback-success={openFeedback !== "" && openFeedbackKind === "success"}
+            class:has-feedback-error={openFeedback !== "" && openFeedbackKind === "error"}
             onclick={(e) => { e.stopPropagation(); showOpenMenu = !showOpenMenu; }}
-            title={canResume ? "Resume session in terminal" : "Session actions"}
-            aria-label={canResume ? "Resume session" : "Session actions"}
+            title={canLaunch
+              ? m.session_breadcrumb_resume_session_in_terminal()
+              : m.session_breadcrumb_session_actions()}
+            aria-label={canLaunch
+              ? m.session_breadcrumb_resume_session()
+              : m.session_breadcrumb_session_actions()}
           >
             {#if openFeedback}
-              <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-              </svg>
+              {#if openFeedbackKind === "error"}
+                <TriangleAlertIcon size="11" strokeWidth="2.2" aria-hidden="true" />
+              {:else}
+                <CheckIcon size="11" strokeWidth="2.4" aria-hidden="true" />
+              {/if}
               {openFeedback}
             {:else}
-              {canResume ? "Resume" : "Open"}
-              <svg width="8" height="8" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                <path d="M4.427 7.427l3.396 3.396a.25.25 0 00.354 0l3.396-3.396A.25.25 0 0011.396 7H4.604a.25.25 0 00-.177.427z"/>
-              </svg>
+              {canLaunch
+                ? m.session_breadcrumb_resume()
+                : m.session_breadcrumb_open()}
+              <ChevronDownIcon size="8" strokeWidth="2.6" aria-hidden="true" />
             {/if}
           </button>
           {#if showOpenMenu}
             <div class="open-menu">
-              {#if canResume}
+              {#if canLaunch}
                 {#each terminalOpeners as opener, i (opener.id)}
                   <button
                     class="open-menu-item"
@@ -472,45 +879,65 @@
                 {/each}
                 <button class="open-menu-item" onclick={handleResumeDefault}>
                   <span class="open-menu-num">
-                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v3.585a.746.746 0 010 .83v3.585a.747.747 0 010 .83v3.67A1.75 1.75 0 0114.25 16H1.75A1.75 1.75 0 010 14.25V1.75zM1.5 6.5v3h13v-3h-13zm0 4.5v3.25c0 .138.112.25.25.25h12.5a.25.25 0 00.25-.25V11h-13zm13-5.5v-3.25a.25.25 0 00-.25-.25H1.75a.25.25 0 00-.25.25V5.5h13z"/>
-                    </svg>
+                    <SquareTerminalIcon size="10" strokeWidth="2" aria-hidden="true" />
                   </span>
-                  <span class="open-menu-name">Default terminal</span>
+                  <span class="open-menu-name">{m.session_breadcrumb_default_terminal()}</span>
                 </button>
-                <div class="open-menu-divider"></div>
+                {#if codexLink}
+                  <div class="open-menu-divider"></div>
+                  <a
+                    class="open-menu-item"
+                    data-testid="codex-desktop-link"
+                    href={codexLink}
+                    title={m.session_breadcrumb_open_in_codex_desktop()}
+                  >
+                    <span class="open-menu-num">
+                      <CirclePlayIcon size="10" strokeWidth="2" aria-hidden="true" />
+                    </span>
+                    <span class="open-menu-name">{m.session_breadcrumb_open_in_codex_desktop()}</span>
+                  </a>
+                {/if}
+                {#if claudeLink}
+                  <div class="open-menu-divider"></div>
+                  <a
+                    class="open-menu-item"
+                    data-testid="claude-code-link"
+                    href={claudeLink}
+                    title={m.session_breadcrumb_open_in_claude_code()}
+                  >
+                    <span class="open-menu-num">
+                      <CirclePlayIcon size="10" strokeWidth="2" aria-hidden="true" />
+                    </span>
+                    <span class="open-menu-name">{m.session_breadcrumb_open_in_claude_code()}</span>
+                  </a>
+                {/if}
+              {/if}
+              {#if canCopyCommand}
+                {#if canLaunch}<div class="open-menu-divider"></div>{/if}
                 <button class="open-menu-item" onclick={handleCopyResumeCommand}>
                   <span class="open-menu-num">
-                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25v-7.5z"/>
-                      <path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25v-7.5zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25h-7.5z"/>
-                    </svg>
+                    <CopyIcon size="10" strokeWidth="2" aria-hidden="true" />
                   </span>
-                  <span class="open-menu-name">Copy command</span>
+                  <span class="open-menu-name">{m.session_breadcrumb_copy_command()}</span>
                 </button>
               {/if}
               {#if isLocal}
               <button class="open-menu-item" onclick={handleCopyFilePath}>
                 <span class="open-menu-num">
-                  <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                    <path fill-rule="evenodd" d="M3.75 1.5a.25.25 0 00-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 00.25-.25V6H9.75A1.75 1.75 0 018 4.25V1.5H3.75zm5.75.56v2.19c0 .138.112.25.25.25h2.19L9.5 2.06zM2 1.75C2 .784 2.784 0 3.75 0h5.086c.464 0 .909.184 1.237.513l3.414 3.414c.329.328.513.773.513 1.237v9.086A1.75 1.75 0 0112.25 16h-8.5A1.75 1.75 0 012 14.25V1.75z"/>
-                  </svg>
+                  <FileTextIcon size="10" strokeWidth="2" aria-hidden="true" />
                 </span>
-                <span class="open-menu-name">Copy directory path</span>
+                <span class="open-menu-name">{m.session_breadcrumb_copy_directory_path()}</span>
               </button>
               {#if editorOpeners.length > 0 || fileOpeners.length > 0}
                 <div class="open-menu-divider"></div>
-                <div class="open-menu-section">Open in</div>
+                <div class="open-menu-section">{m.session_breadcrumb_open_in()}</div>
                 {#each editorOpeners as opener (opener.id)}
                   <button
                     class="open-menu-item"
                     onclick={() => handleOpenIn(opener)}
                   >
                     <span class="open-menu-num">
-                      <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                        <path d="M4.708 5.578L2.061 8.224l2.647 2.646-.708.708L.94 8.578V7.87L4 4.87l.708.708zm7.292 0l2.647 2.646-2.647 2.646.708.708L15.768 8.578V7.87L12.708 4.87 12 5.578z"/>
-                        <path d="M5.708 13.578L9.258 2.578l.984.344-3.55 11-.984-.344z"/>
-                      </svg>
+                      <CodeIcon size="10" strokeWidth="2" aria-hidden="true" />
                     </span>
                     <span class="open-menu-name">{opener.name}</span>
                   </button>
@@ -521,25 +948,21 @@
                     onclick={() => handleOpenIn(opener)}
                   >
                     <span class="open-menu-num">
-                      <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                        <path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/>
-                      </svg>
+                      <FolderIcon size="10" strokeWidth="2" aria-hidden="true" />
                     </span>
                     <span class="open-menu-name">{opener.name}</span>
                   </button>
                 {/each}
               {/if}
               {/if}
-              {#if canResume && claudeDesktopOpener}
+              {#if canLaunch && claudeDesktopOpener}
                 <div class="open-menu-divider"></div>
                 <button
                   class="open-menu-item"
                   onclick={() => handleResumeIn(claudeDesktopOpener)}
                 >
                   <span class="open-menu-num">
-                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M8 0a8 8 0 100 16A8 8 0 008 0zm3.5 8.9l-5 3a.75.75 0 01-1.125-.65v-6a.75.75 0 011.125-.65l5 3a.75.75 0 010 1.3z"/>
-                    </svg>
+                    <CirclePlayIcon size="10" strokeWidth="2" aria-hidden="true" />
                   </span>
                   <span class="open-menu-name">Claude Desktop</span>
                 </button>
@@ -552,11 +975,12 @@
         {@const rawId = sessionDisplayId(session.id)}
         <button
           class="session-id"
-          title={rawId}
+          title={m.session_breadcrumb_copy_session_id_value({ id: rawId })}
           onclick={() => copySessionId(rawId, session.id)}
+          aria-label={m.session_breadcrumb_copy_session_id()}
         >
           {copiedSessionId === session.id
-            ? "Copied!"
+            ? m.session_breadcrumb_copied()
             : rawId.slice(0, 8)}
         </button>
       {/if}
@@ -571,66 +995,121 @@
           {sessionTokenSummary}
         </span>
       {/if}
-      {#if mainModel}
-        <span class="model-badge" title={mainModel}>{mainModel}</span>
+      {#if sessionUsageBreakdownCount > 0}
+        <details class="usage-breakdown" bind:open={usageBreakdownOpen}>
+          <summary
+            class="usage-breakdown-trigger"
+            title={m.session_breadcrumb_usage_breakdown_title()}
+          >
+            {m.session_breadcrumb_usage_breakdown_steps({
+              count: sessionUsageBreakdownCount,
+              countLabel: sessionUsageBreakdownCount.toLocaleString(),
+            })}
+          </summary>
+          {#if usageBreakdownOpen}
+            <div class="usage-breakdown-menu">
+              {#if usageBreakdownLoading}
+                <div class="usage-breakdown-status">
+                  {m.session_breadcrumb_usage_breakdown_loading()}
+                </div>
+              {:else if sessionUsageBreakdown.length === 0}
+                <div class="usage-breakdown-status">
+                  {m.session_breadcrumb_failed()}
+                </div>
+              {:else}
+              {#each sessionUsageBreakdown as row (row.ordinal)}
+                <div class="usage-breakdown-row" title={formatBreakdownTitle(row)}>
+                  <span class="usage-breakdown-label">
+                    {row.label}
+                  </span>
+                  <span class="usage-breakdown-model">
+                    {row.model || row.source}
+                  </span>
+                  <span class="usage-breakdown-tokens">
+                    {formatBreakdownContext(row)} ctx
+                    <span aria-hidden="true">/</span>
+                    {formatTokenCount(row.output_tokens)} out
+                  </span>
+                  {#if row.has_cost}
+                    <span class="usage-breakdown-cost">
+                      {formatCost(row.cost)}
+                    </span>
+                  {/if}
+                </div>
+              {/each}
+              {/if}
+            </div>
+          {/if}
+        </details>
+      {/if}
+      {#if sessionCostLabel}
+        <span class="cost-badge" title={sessionCostTitle}>
+          {#if sessionCostIsRollup}
+            {m.session_breadcrumb_total_cost()}: {sessionCostLabel}
+          {:else}
+            {sessionCostLabel}
+          {/if}
+        </span>
+      {/if}
+      {#if mainModelInfo.model}
+        <span
+          class="model-badge"
+          class:model-badge--with-effort={mainModelInfo.reasoningEffort}
+          title={mainModel}
+        ><span class="model-badge__model">{mainModelInfo.model}</span>{#if mainModelInfo.reasoningEffort}{" "}<span class="model-badge__effort">{mainModelInfo.reasoningEffort}</span>{/if}</span>
       {/if}
       <div class="actions-wrapper">
         <button
           class="link-btn"
           class:link-btn--copied={copiedLinkId === session?.id}
-          title="Copy link to session"
+          title={m.session_breadcrumb_copy_link_to_session()}
           onclick={copySessionLink}
-          aria-label="Copy link to session"
+          aria-label={m.session_breadcrumb_copy_link_to_session()}
         >
           {#if copiedLinkId === session?.id}
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-            </svg>
+            <CheckIcon size="13" strokeWidth="2.4" aria-hidden="true" />
           {:else}
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
-              <path d="M4.715 6.542L3.343 7.914a3 3 0 104.243 4.243l1.828-1.829A3 3 0 008.586 5.5L8 6.086a1.002 1.002 0 00-.154.199 2 2 0 01.861 3.337L6.88 11.45a2 2 0 11-2.83-2.83l.793-.792a4.018 4.018 0 01-.128-1.287z"/>
-              <path d="M11.285 9.458l1.372-1.372a3 3 0 10-4.243-4.243L6.586 5.671A3 3 0 007.414 10.5l.586-.586a1.002 1.002 0 00.154-.199 2 2 0 01-.861-3.337L9.12 4.55a2 2 0 112.83 2.83l-.793.792c.112.42.155.855.128 1.287z"/>
-            </svg>
+            <LinkIcon size="13" strokeWidth="2" aria-hidden="true" />
           {/if}
         </button>
         <button
           class="minimap-btn"
           class:minimap-btn--active={ui.vitalsOpen}
-          title="Session vital signs"
+          title={ui.vitalsOpen
+            ? m.session_breadcrumb_hide_session_analysis()
+            : m.session_breadcrumb_show_session_analysis()}
           onclick={() => ui.toggleVitals()}
-          aria-label="Toggle session vital signs"
+          aria-label={ui.vitalsOpen
+            ? m.session_breadcrumb_hide_session_analysis()
+            : m.session_breadcrumb_show_session_analysis()}
         >
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M1 14V8h2v6H1zm4 0V2h2v12H5zm4 0V5h2v9H9zm4 0V9h2v5h-2z"/>
-          </svg>
+          <ChartColumnIcon size="13" strokeWidth="2" aria-hidden="true" />
+        </button>
+        <button
+          class="insight-btn"
+          title={m.insights_page_agent_analysis()}
+          aria-label={m.insights_page_agent_analysis()}
+          onclick={handleAgentAnalysis}
+        >
+          <LightbulbIcon size="13" strokeWidth="2" aria-hidden="true" />
         </button>
         <button
           class="find-btn"
           class:find-btn--active={inSessionSearch.isOpen}
-          title="Find in session (/)"
+          title={m.session_breadcrumb_find_in_session_shortcut()}
           onclick={() => inSessionSearch.toggle()}
-          aria-label="Find in session"
+          aria-label={m.session_breadcrumb_find_in_session()}
         >
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M11.742 10.344a6.5 6.5 0 10-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 001.415-1.414l-3.85-3.85a1.007 1.007 0 00-.115-.099zm-5.242 1.156a5.5 5.5 0 110-11 5.5 5.5 0 010 11z"/>
-          </svg>
+          <SearchIcon size="13" strokeWidth="2" aria-hidden="true" />
         </button>
         <button
           class="actions-btn"
-          title="Session actions"
+          title={m.session_breadcrumb_session_actions()}
+          aria-label={m.session_breadcrumb_session_actions()}
           bind:this={menuBtnEl}
           onclick={toggleMenu}
         >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 16 16"
-            fill="currentColor"
-          >
-            <circle cx="8" cy="2.5" r="1.5" />
-            <circle cx="8" cy="8" r="1.5" />
-            <circle cx="8" cy="13.5" r="1.5" />
-          </svg>
+          <EllipsisVerticalIcon size="14" strokeWidth="2.4" aria-hidden="true" />
         </button>
         {#if menuOpen}
           <div class="actions-menu" bind:this={menuEl}>
@@ -638,13 +1117,13 @@
               class="actions-menu-item"
               onclick={startRename}
             >
-              Rename
+              {m.session_breadcrumb_rename()}
             </button>
             <button
               class="actions-menu-item danger"
               onclick={handleDelete}
             >
-              Delete
+              {m.session_breadcrumb_delete()}
             </button>
           </div>
         {/if}
@@ -668,6 +1147,12 @@
     flex-shrink: 0;
     font-size: 11px;
     color: var(--text-muted);
+  }
+
+  .sidebar-controls {
+    position: relative;
+    display: flex;
+    align-items: center;
   }
 
   .breadcrumb-link {
@@ -716,7 +1201,8 @@
     align-items: center;
     gap: 6px;
     margin-left: auto;
-    flex-shrink: 0;
+    min-width: 0;
+    flex-shrink: 1;
   }
 
   .agent-badge {
@@ -729,6 +1215,60 @@
     color: white;
     flex-shrink: 0;
     background: var(--text-muted);
+  }
+
+  .entrypoint-badge {
+    opacity: 0.8;
+  }
+
+  .summary-badge {
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
+    color: var(--accent-amber, #e0a458);
+    background: color-mix(in srgb, var(--accent-amber, #e0a458) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-amber, #e0a458) 40%, transparent);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .summary-badge:hover {
+    text-decoration: underline;
+  }
+
+  .malformed-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 8px;
+    letter-spacing: 0.02em;
+    flex-shrink: 0;
+    color: var(--accent-amber, #e0a458);
+    background: color-mix(in srgb, var(--accent-amber, #e0a458) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-amber, #e0a458) 40%, transparent);
+    white-space: nowrap;
+    cursor: default;
+  }
+
+  .decode-badge {
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
+    color: var(--accent-red, #e55);
+    background: color-mix(in srgb, var(--accent-red, #e55) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-red, #e55) 45%, transparent);
+    white-space: nowrap;
+    cursor: help;
   }
 
   .session-time {
@@ -783,8 +1323,12 @@
     background: var(--bg-surface-hover);
   }
 
-  .resume-btn.has-feedback {
+  .resume-btn.has-feedback-success {
     color: var(--accent-green, #2ea043);
+  }
+
+  .resume-btn.has-feedback-error {
+    color: var(--accent-red, #e55);
   }
 
   .open-menu {
@@ -797,18 +1341,19 @@
     border-radius: 8px;
     padding: 4px;
     min-width: 200px;
-    z-index: 100;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    z-index: var(--z-popover);
+    box-shadow: var(--shadow-lg);
   }
 
   .open-menu-item {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     width: 100%;
     padding: 6px 10px;
     font-size: 13px;
     color: var(--text-primary);
+    text-decoration: none;
     border-radius: 5px;
     cursor: pointer;
     transition: background 0.1s;
@@ -884,14 +1429,137 @@
     white-space: nowrap;
   }
 
-  .model-badge {
+  .cost-badge {
     font-size: 10px;
+    font-variant-numeric: tabular-nums;
     color: var(--text-muted);
     padding: 1px 5px;
     border-radius: 4px;
     background: var(--bg-tertiary);
     white-space: nowrap;
     flex-shrink: 0;
+  }
+
+  .usage-breakdown {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .usage-breakdown-trigger {
+    list-style: none;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .usage-breakdown-trigger::-webkit-details-marker {
+    display: none;
+  }
+
+  .usage-breakdown[open] .usage-breakdown-trigger,
+  .usage-breakdown-trigger:hover {
+    color: var(--text-secondary);
+    background: var(--bg-surface-hover);
+  }
+
+  .usage-breakdown-menu {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    width: min(460px, calc(100vw - 24px));
+    max-height: 260px;
+    overflow: auto;
+    padding: 6px;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
+    background: var(--bg-primary);
+    box-shadow: var(--shadow-lg);
+    z-index: var(--z-popover);
+  }
+
+  .usage-breakdown-status {
+    padding: 5px 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .usage-breakdown-row {
+    display: grid;
+    grid-template-columns: minmax(62px, 0.85fr) minmax(90px, 1fr) max-content max-content;
+    gap: 8px;
+    align-items: center;
+    padding: 5px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 1.25;
+    color: var(--text-secondary);
+  }
+
+  .usage-breakdown-row:hover {
+    background: var(--bg-surface-hover);
+  }
+
+  .usage-breakdown-label,
+  .usage-breakdown-model {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .usage-breakdown-label {
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+
+  .usage-breakdown-model {
+    color: var(--text-muted);
+  }
+
+  .usage-breakdown-tokens,
+  .usage-breakdown-cost {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .usage-breakdown-cost {
+    color: var(--text-muted);
+  }
+
+  .model-badge {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    max-width: min(280px, 28vw);
+    font-size: 10px;
+    color: var(--text-muted);
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    white-space: nowrap;
+    overflow: hidden;
+    flex-shrink: 1;
+  }
+
+  .model-badge__model {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .model-badge--with-effort {
+    min-width: 39px;
+  }
+
+  .model-badge__effort {
+    flex-shrink: 0;
+    margin-left: 4px;
   }
 
   .actions-wrapper {
@@ -974,6 +1642,26 @@
     color: var(--accent-blue);
   }
 
+  .insight-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: var(--radius-sm, 4px);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+
+  .insight-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--accent-blue);
+  }
+
   .find-btn--active {
     color: var(--accent-blue);
     background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
@@ -1003,12 +1691,12 @@
     position: absolute;
     top: 100%;
     right: 0;
-    z-index: 9999;
+    z-index: var(--z-popover);
     margin-top: 4px;
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 120px;
   }
@@ -1042,9 +1730,9 @@
     );
   }
 
-  @media (max-width: 767px) {
+  @media (max-width: 900px) {
     .breadcrumb-meta {
-      gap: 4px;
+      gap: 2px;
     }
 
     .session-time {
@@ -1064,8 +1752,51 @@
       text-overflow: ellipsis;
     }
 
+    .usage-breakdown-trigger {
+      font-size: 9px;
+      padding: 1px 4px;
+    }
+
+    .usage-breakdown-menu {
+      right: -54px;
+      width: min(360px, calc(100vw - 16px));
+    }
+
+    .usage-breakdown-row {
+      grid-template-columns: minmax(56px, 0.8fr) minmax(68px, 1fr) max-content;
+      gap: 6px;
+      font-size: 10px;
+    }
+
+    .usage-breakdown-cost {
+      display: none;
+    }
+
     .session-id {
       display: none;
+    }
+
+    .usage-breakdown {
+      display: none;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .session-breadcrumb {
+      gap: 4px;
+      padding: 0 6px;
+    }
+
+    .breadcrumb-meta {
+      gap: 1px;
+    }
+
+    .breadcrumb-meta > .agent-badge {
+      display: none;
+    }
+
+    .actions-wrapper {
+      gap: 0;
     }
   }
 </style>

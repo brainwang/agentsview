@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -92,7 +93,7 @@ func TestParseChatGPTExport(t *testing.T) {
 ]`)
 
 	var results []ParseResult
-	err := ParseChatGPTExport(dir, nil, func(r ParseResult) error {
+	err := parseChatGPTExport(dir, nil, func(r ParseResult) error {
 		results = append(results, r)
 		return nil
 	})
@@ -104,7 +105,7 @@ func TestParseChatGPTExport(t *testing.T) {
 	assert.Equal(t, "chatgpt.com", s.Project)
 	assert.Equal(t, "local", s.Machine)
 	assert.Equal(t, AgentChatGPT, s.Agent)
-	assert.Equal(t, "Hello Chat", s.DisplayName)
+	assert.Equal(t, "Hello Chat", s.SessionName)
 	assert.Equal(t, "What is Go?", s.FirstMessage)
 	assert.Equal(t, 3, s.MessageCount)
 	assert.Equal(t, 2, s.UserMessageCount)
@@ -214,7 +215,7 @@ func TestParseChatGPTExport_ToolCalls(t *testing.T) {
 ]`)
 
 	var results []ParseResult
-	err := ParseChatGPTExport(dir, nil, func(r ParseResult) error {
+	err := parseChatGPTExport(dir, nil, func(r ParseResult) error {
 		results = append(results, r)
 		return nil
 	})
@@ -294,7 +295,7 @@ func TestParseChatGPTExport_Thinking(t *testing.T) {
 ]`)
 
 	var results []ParseResult
-	err := ParseChatGPTExport(dir, nil, func(r ParseResult) error {
+	err := parseChatGPTExport(dir, nil, func(r ParseResult) error {
 		results = append(results, r)
 		return nil
 	})
@@ -384,7 +385,7 @@ func TestParseChatGPTExport_SystemMessage(t *testing.T) {
 ]`)
 
 	var results []ParseResult
-	err := ParseChatGPTExport(dir, nil, func(r ParseResult) error {
+	err := parseChatGPTExport(dir, nil, func(r ParseResult) error {
 		results = append(results, r)
 		return nil
 	})
@@ -408,7 +409,7 @@ func TestParseChatGPTExport_SystemMessage(t *testing.T) {
 func TestParseChatGPTExport_EmptyDir(t *testing.T) {
 	dir := t.TempDir()
 
-	err := ParseChatGPTExport(dir, nil, func(r ParseResult) error {
+	err := parseChatGPTExport(dir, nil, func(r ParseResult) error {
 		return nil
 	})
 	require.Error(t, err)
@@ -459,7 +460,7 @@ func TestParseChatGPTExport_MultipleShards(t *testing.T) {
 		shard("conv-b", "Second"))
 
 	var results []ParseResult
-	err := ParseChatGPTExport(dir, nil, func(r ParseResult) error {
+	err := parseChatGPTExport(dir, nil, func(r ParseResult) error {
 		results = append(results, r)
 		return nil
 	})
@@ -597,9 +598,9 @@ func TestAssembleContent(t *testing.T) {
 func TestAssembleContent_ImageAsset(t *testing.T) {
 	c := chatGPTContent{
 		ContentType: "multimodal_text",
-		Parts: []json.RawMessage{
-			json.RawMessage(`"Here is an image:"`),
-			json.RawMessage(`{
+		Parts: []jsontext.Value{
+			jsontext.Value(`"Here is an image:"`),
+			jsontext.Value(`{
 				"content_type": "image_asset_pointer",
 				"asset_pointer": "file-service://file-abc123"
 			}`),
@@ -622,8 +623,8 @@ func TestAssembleContent_ImageAsset(t *testing.T) {
 func TestAssembleContent_ImageAsset_NilResolver(t *testing.T) {
 	c := chatGPTContent{
 		ContentType: "multimodal_text",
-		Parts: []json.RawMessage{
-			json.RawMessage(`{
+		Parts: []jsontext.Value{
+			jsontext.Value(`{
 				"content_type": "image_asset_pointer",
 				"asset_pointer": "file-service://file-abc123"
 			}`),
@@ -724,7 +725,7 @@ func TestParseChatGPTExport_WebSearch(t *testing.T) {
 ]`)
 
 	var results []ParseResult
-	err := ParseChatGPTExport(dir, nil, func(r ParseResult) error {
+	err := parseChatGPTExport(dir, nil, func(r ParseResult) error {
 		results = append(results, r)
 		return nil
 	})
@@ -743,10 +744,10 @@ func TestParseChatGPTExport_WebSearch(t *testing.T) {
 
 // --- helpers ---
 
-// rawParts creates json.RawMessage slices from strings for
+// rawParts creates jsontext.Value slices from strings for
 // chatGPTContent.Parts test fixtures.
-func rawParts(ss ...string) []json.RawMessage {
-	var parts []json.RawMessage
+func rawParts(ss ...string) []jsontext.Value {
+	var parts []jsontext.Value
 	for _, s := range ss {
 		b, _ := json.Marshal(s)
 		parts = append(parts, b)

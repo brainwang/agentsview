@@ -1,5 +1,6 @@
 import type { Message, ToolCall } from "../api/types.js";
 import { LRUCache } from "./cache.js";
+import { isSystemBoundaryMessage } from "./messages.js";
 
 export type SegmentType = "text" | "thinking" | "tool" | "code" | "skill";
 
@@ -16,28 +17,25 @@ export interface ContentSegment {
  * Marked thinking blocks use explicit [/Thinking] delimiters.
  * Tried first; captures everything between markers.
  */
-const THINKING_MARKED_RE =
-  /\[Thinking\]\n?([\s\S]*?)\n?\[\/Thinking\]/g;
+const THINKING_MARKED_RE = /\[Thinking\]\n?([\s\S]*?)\n?\[\/Thinking\]/g;
 
 /**
  * Legacy thinking blocks without end markers.
  * Used as fallback for old data that predates [/Thinking].
  */
-const THINKING_LEGACY_RE =
-  /\[Thinking\]\n?([\s\S]*?)(?=\n\[|\n\n|$)/g;
+const THINKING_LEGACY_RE = /\[Thinking\]\n?([\s\S]*?)(?=\n\[|\n\n|$)/g;
 
 /**
  * Skill blocks use [Skill: name]...[/Skill] delimiters,
  * same pattern as thinking blocks.
  */
-const SKILL_RE =
-  /\[Skill: (.+?)\]\n?([\s\S]*?)\n?\[\/Skill\]/g;
+const SKILL_RE = /\[Skill: (.+?)\]\n?([\s\S]*?)\n?\[\/Skill\]/g;
 
 const TOOL_NAMES =
-  "Tool|Read|Write|Edit|Bash|Glob|Grep|Other|TaskCreate|TaskUpdate|TaskGet|TaskList|Task|Agent|Skill|" +
+  "Tool|Read|Write|Edit|Patch|Bash|Glob|Grep|Other|TaskCreate|TaskUpdate|TaskGet|TaskList|Task|Agent|Skill|" +
   "SendMessage|Question|Todo List|Entering Plan Mode|" +
   "Exiting Plan Mode|exec_command|shell_command|" +
-  "write_stdin|apply_patch|shell|parallel|view_image|" +
+  "write_stdin|apply_patch|ApplyPatch|shell|parallel|view_image|" +
   "request_user_input|update_plan";
 
 const TOOL_ALIASES: Record<string, string> = {
@@ -47,6 +45,8 @@ const TOOL_ALIASES: Record<string, string> = {
   write_stdin: "Bash",
   shell: "Bash",
   apply_patch: "Edit",
+  ApplyPatch: "Edit",
+  Patch: "Edit",
   // Pi tool names
   str_replace: "Edit",
   run_command: "Bash",
@@ -62,23 +62,12 @@ const TOOL_ALIASES: Record<string, string> = {
   find: "Read",
 };
 
-
-const TOOL_RE = new RegExp(
-  `\\[(${TOOL_NAMES})([^\\]]*)\\]([\\s\\S]*?)(?=\\n\\[|\\n\\n|$)`,
-  "g",
-);
-
-const CODE_BLOCK_RE = /```(\w*)\n([\s\S]*?)```/g;
+const TOOL_RE = new RegExp(`\\[(${TOOL_NAMES})([^\\]]*)\\]([\\s\\S]*?)(?=\\n\\[|\\n\\n|$)`, "g");
 
 /** Returns true if text[from..to) contains a backtick run of
  *  exactly `len` characters. Used to detect a closing inline
  *  code delimiter on the same line as the opener. */
-function hasRunBefore(
-  text: string,
-  from: number,
-  to: number,
-  len: number,
-): boolean {
+function hasRunBefore(text: string, from: number, to: number, len: number): boolean {
   for (let k = from; k < to; k++) {
     if (text[k] !== "`") continue;
     const s = k;
@@ -93,11 +82,9 @@ function hasRunBefore(
  * backtick run of length N is closed by the next run of exactly
  * N backticks. Fenced code blocks (triple-backtick at line
  * start followed by a newline) are excluded — those are handled
- * separately by CODE_BLOCK_RE.
+ * separately by codeBlockMatches.
  */
-function scanInlineCodeSpans(
-  text: string,
-): Array<[number, number]> {
+function scanInlineCodeSpans(text: string): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
   let i = 0;
   while (i < text.length) {
@@ -112,10 +99,7 @@ function scanInlineCodeSpans(
 
     // Skip fenced code blocks: ≥3 backticks at line start
     // with no closing run of the same length on that line.
-    if (
-      runLen >= 3 &&
-      (openStart === 0 || text[openStart - 1] === "\n")
-    ) {
+    if (runLen >= 3 && (openStart === 0 || text[openStart - 1] === "\n")) {
       const nl = text.indexOf("\n", i);
       if (nl >= 0 && !hasRunBefore(text, i, nl, runLen)) {
         continue;
@@ -123,7 +107,6 @@ function scanInlineCodeSpans(
     }
 
     // Scan for a closing run of exactly the same length.
-    let found = false;
     for (let j = i; j < text.length; j++) {
       if (text[j] !== "`") continue;
       const closeStart = j;
@@ -131,7 +114,6 @@ function scanInlineCodeSpans(
       if (j - closeStart === runLen) {
         spans.push([openStart, j]);
         i = j;
-        found = true;
         break;
       }
     }
@@ -181,11 +163,89 @@ export function isToolOnly(msg: Message): boolean {
 }
 
 /** Returns true if pos falls inside any inline code span. */
-function insideInlineCode(
-  pos: number,
-  spans: Array<[number, number]>,
-): boolean {
+function insideInlineCode(pos: number, spans: Array<[number, number]>): boolean {
   return spans.some(([s, e]) => pos > s && pos < e);
+}
+
+function atFenceLineStart(text: string, pos: number): boolean {
+  const lineStart = text.lastIndexOf("\n", pos - 1) + 1;
+  return /^[ \t]{0,3}$/.test(text.slice(lineStart, pos));
+}
+
+function countBackticks(text: string, pos: number): number {
+  let end = pos;
+  while (end < text.length && text[end] === "`") end++;
+  return end - pos;
+}
+
+function closingFence(
+  text: string,
+  contentStart: number,
+  fenceLen: number,
+): { contentEnd: number; end: number } | undefined {
+  let pos = contentStart;
+  while (pos < text.length) {
+    const tickStart = text.indexOf("`", pos);
+    if (tickStart < 0) return undefined;
+    const lineStart = text.lastIndexOf("\n", tickStart - 1) + 1;
+    const nextLineStart = text.indexOf("\n", tickStart);
+    const lineEnd = nextLineStart >= 0 ? nextLineStart : text.length;
+
+    const tickCount = countBackticks(text, tickStart);
+    const rest = text.slice(tickStart + tickCount, lineEnd);
+    if (tickCount >= fenceLen && atFenceLineStart(text, tickStart) && /^[ \t]*$/.test(rest)) {
+      return { contentEnd: lineStart, end: lineEnd };
+    }
+
+    pos = tickStart + tickCount;
+  }
+  return undefined;
+}
+
+function codeBlockMatches(text: string): Match[] {
+  const matches: Match[] = [];
+  let pos = 0;
+
+  while (pos < text.length) {
+    const start = text.indexOf("```", pos);
+    if (start < 0) break;
+
+    if (!atFenceLineStart(text, start)) {
+      pos = start + 1;
+      continue;
+    }
+
+    const fenceLen = countBackticks(text, start);
+    const infoStart = start + fenceLen;
+    const lineEnd = text.indexOf("\n", infoStart);
+    if (lineEnd < 0) break;
+
+    const info = text.slice(infoStart, lineEnd);
+    if (info.includes("`")) {
+      pos = infoStart;
+      continue;
+    }
+
+    const contentStart = lineEnd + 1;
+    const close = closingFence(text, contentStart, fenceLen);
+    if (close === undefined) {
+      pos = infoStart;
+      continue;
+    }
+
+    matches.push({
+      start,
+      end: close.end,
+      segment: {
+        type: "code",
+        content: text.slice(contentStart, close.contentEnd),
+        label: info.trim() || undefined,
+      },
+    });
+    pos = close.end;
+  }
+
+  return matches;
 }
 
 function extractMatches(text: string, parseTools = true): Match[] {
@@ -214,9 +274,7 @@ function extractMatches(text: string, parseTools = true): Match[] {
     const start = m.index!;
     const end = start + m[0].length;
     if (insideInlineCode(start, codeSpans)) continue;
-    const overlaps = matches.some(
-      (o) => start >= o.start && start < o.end,
-    );
+    const overlaps = matches.some((o) => start >= o.start && start < o.end);
     if (overlaps) continue;
     matches.push({
       start,
@@ -233,9 +291,7 @@ function extractMatches(text: string, parseTools = true): Match[] {
     const start = m.index!;
     const end = start + m[0].length;
     if (insideInlineCode(start, codeSpans)) continue;
-    const overlaps = matches.some(
-      (o) => start >= o.start && start < o.end,
-    );
+    const overlaps = matches.some((o) => start >= o.start && start < o.end);
     if (overlaps) continue;
     matches.push({
       start,
@@ -254,9 +310,7 @@ function extractMatches(text: string, parseTools = true): Match[] {
       const toolName = m[1] ?? "";
       const toolArgs = (m[2] ?? "").trim();
       const displayName = TOOL_ALIASES[toolName] ?? toolName;
-      const label = toolArgs
-        ? `${displayName} ${toolArgs}`
-        : displayName;
+      const label = toolArgs ? `${displayName} ${toolArgs}` : displayName;
       matches.push({
         start: m.index!,
         end: m.index! + m[0].length,
@@ -269,22 +323,12 @@ function extractMatches(text: string, parseTools = true): Match[] {
     }
   }
 
-  for (const m of text.matchAll(CODE_BLOCK_RE)) {
-    const idx = m.index!;
-    const insideOther = matches.some(
-      (o) => idx >= o.start && idx < o.end,
-    );
+  for (const m of codeBlockMatches(text)) {
+    const idx = m.start;
+    const insideOther = matches.some((o) => idx >= o.start && idx < o.end);
     if (insideOther) continue;
 
-    matches.push({
-      start: idx,
-      end: idx + m[0].length,
-      segment: {
-        type: "code",
-        content: m[2] ?? "",
-        label: m[1] || undefined,
-      },
-    });
+    matches.push(m);
   }
 
   return matches;
@@ -302,10 +346,7 @@ function resolveOverlaps(matches: Match[]): Match[] {
   return deduped;
 }
 
-function buildSegments(
-  text: string,
-  matches: Match[],
-): ContentSegment[] {
+function buildSegments(text: string, matches: Match[]): ContentSegment[] {
   const segments: ContentSegment[] = [];
   let pos = 0;
 
@@ -336,16 +377,11 @@ function buildSegments(
   return segments;
 }
 
-function mergeThinking(
-  segments: ContentSegment[],
-): ContentSegment[] {
+function mergeThinking(segments: ContentSegment[]): ContentSegment[] {
   const result: ContentSegment[] = [];
   for (const seg of segments) {
     const prev = result[result.length - 1];
-    if (
-      seg.type === "thinking" &&
-      prev?.type === "thinking"
-    ) {
+    if (seg.type === "thinking" && prev?.type === "thinking") {
       prev.content += "\n\n" + seg.content;
     } else {
       result.push({ ...seg });
@@ -380,17 +416,13 @@ export function parseContent(
   const matches = extractMatches(text, hasToolUse);
 
   if (matches.length === 0) {
-    const onlyText: ContentSegment[] = [
-      { type: "text", content: text.trimEnd() },
-    ];
+    const onlyText: ContentSegment[] = [{ type: "text", content: text.trimEnd() }];
     if (cacheKey) segmentCache.set(cacheKey, onlyText);
     return onlyText;
   }
 
   const deduped = resolveOverlaps(matches);
-  const segments = mergeThinking(
-    buildSegments(text, deduped),
-  );
+  const segments = mergeThinking(buildSegments(text, deduped));
 
   if (cacheKey) segmentCache.set(cacheKey, segments);
   return segments;
@@ -427,8 +459,7 @@ export function enrichSegments(
             while (i + 1 < segments.length) {
               const next = segments[i + 1]!;
               if (next.type !== "text") break;
-              if (!next.content.trim() ||
-                fullCmd.includes(next.content.trim())) {
+              if (!next.content.trim() || fullCmd.includes(next.content.trim())) {
                 i++;
               } else {
                 break;
@@ -501,19 +532,16 @@ export function enrichSegments(
  */
 export function hasVisibleSegments(
   msg: Message,
-  isVisible: (
-    type: "user" | "assistant" | "thinking" | "tool" | "code",
-  ) => boolean,
+  isVisible: (type: "user" | "assistant" | "thinking" | "tool" | "code" | "system") => boolean,
 ): boolean {
-  const role: "user" | "assistant" =
-    msg.role === "user" ? "user" : "assistant";
+  // A boundary card shows a label and a one-line preview, never the parsed
+  // segments of its body, so its own block type owns its visibility. Parsing
+  // the body here would let an unrelated toggle hide the card, and would tie
+  // every boundary card to the "user" role it carries for analytics.
+  if (isSystemBoundaryMessage(msg)) return isVisible("system");
+  const role: "user" | "assistant" = msg.role === "user" ? "user" : "assistant";
   const segs = enrichSegments(
-    parseContent(
-      msg.content,
-      msg.has_tool_use,
-      msg.id,
-      msg.content_length,
-    ),
+    parseContent(msg.content, msg.has_tool_use, msg.id, msg.content_length),
     msg.tool_calls,
   );
   // Empty messages (e.g. initial assistant streaming state) should

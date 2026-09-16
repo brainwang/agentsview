@@ -1,10 +1,11 @@
 package sync
 
 import (
+	"slices"
 	"time"
 
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/signals"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/signals"
 )
 
 // computeSignalsFromMessages produces a SessionSignalUpdate from
@@ -17,7 +18,64 @@ import (
 func computeSignalsFromMessages(
 	sess db.Session, msgs []db.Message,
 ) db.SessionSignalUpdate {
+	return computeSignalsFromToolRows(sess, msgs, extractToolCallRows(msgs))
+}
+
+// computeSignalsFromMessagesWithContentFailures is the staged streaming
+// variant: tool rows whose placeholder content hides a pre-computed
+// content-failure verdict get that verdict stamped before the signal pass,
+// so content-driven tool-health signals match the collecting path byte for
+// byte.
+func computeSignalsFromMessagesWithContentFailures(
+	sess db.Session, msgs []db.Message, failures map[string]bool,
+) db.SessionSignalUpdate {
 	toolRows := extractToolCallRows(msgs)
+	patchToolCallRowsWithContentFailures(toolRows, msgs, failures)
+	return computeSignalsFromToolRows(sess, msgs, toolRows)
+}
+
+// patchToolCallRowsWithContentFailures stamps pre-computed content-failure
+// verdicts onto rows whose last event status is empty (status-driven
+// verdicts win). toolRows must be the output of extractToolCallRows over
+// the same msgs slice, so the walk order is identical.
+func patchToolCallRowsWithContentFailures(
+	toolRows []signals.ToolCallRow,
+	msgs []db.Message,
+	failures map[string]bool,
+) {
+	if len(failures) == 0 {
+		return
+	}
+	idx := 0
+	callOccurrences := make(map[string]int)
+	for _, m := range msgs {
+		for _, tc := range m.ToolCalls {
+			if idx >= len(toolRows) {
+				return
+			}
+			failed := false
+			if tc.ToolUseID != "" {
+				occurrence := callOccurrences[tc.ToolUseID]
+				callOccurrences[tc.ToolUseID] = occurrence + 1
+				failed = failures[db.StagedToolCallKey(
+					tc.ToolUseID, occurrence,
+				)]
+			}
+			if failed && toolRows[idx].EventStatus == "" {
+				toolRows[idx].ContentFailure = true
+			}
+			idx++
+		}
+	}
+}
+
+func computeSignalsFromToolRows(
+	sess db.Session, msgs []db.Message, toolRows []signals.ToolCallRow,
+) db.SessionSignalUpdate {
+	heuristics := signals.AnalyzeHeuristics(signals.HeuristicInput{
+		Messages: extractHeuristicMessages(msgs),
+		ToolRows: toolRows,
+	})
 	ctxTokens := extractContextTokens(msgs)
 	boundaries := extractCompactBoundaryOrdinals(msgs)
 	model := extractMostCommonModel(msgs)
@@ -90,6 +148,7 @@ func computeSignalsFromMessages(
 		CompactionCount:        compactionCount,
 		MidTaskCompactionCount: midTaskCount,
 		PressureMax:            ctxPressure.PressureMax,
+		Heuristics:             heuristics,
 	})
 
 	var pendingSince *string
@@ -120,7 +179,36 @@ func computeSignalsFromMessages(
 		HealthGrade:            healthGrade,
 		HasToolCalls:           len(toolRows) > 0,
 		HasContextData:         hasContextData,
+		QualitySignals: db.QualitySignals{
+			Version:           db.CurrentQualitySignalVersion,
+			ShortPromptCount:  heuristics.ShortPromptCount,
+			UnstructuredStart: heuristics.UnstructuredStart,
+			MissingSuccessCriteriaCount: heuristics.
+				MissingSuccessCriteriaCount,
+			MissingVerificationCount: heuristics.
+				MissingVerificationCount,
+			DuplicatePromptCount: heuristics.DuplicatePromptCount,
+			NoCodeContextCount:   heuristics.NoCodeContextCount,
+			RunawayToolLoopCount: heuristics.RunawayToolLoopCount,
+		},
 	}
+}
+
+func extractHeuristicMessages(
+	msgs []db.Message,
+) []signals.HeuristicMessage {
+	rows := make([]signals.HeuristicMessage, 0, len(msgs))
+	for _, m := range msgs {
+		rows = append(rows, signals.HeuristicMessage{
+			Role:          m.Role,
+			SourceSubtype: m.SourceSubtype,
+			Content:       m.Content,
+			IsSystem:      m.IsSystem,
+			Ordinal:       m.Ordinal,
+			Timestamp:     m.Timestamp,
+		})
+	}
+	return rows
 }
 
 // extractToolCallRows builds signal inputs from in-memory tool
@@ -213,16 +301,16 @@ func extractMostCommonModel(msgs []db.Message) string {
 }
 
 // extractLastMessageRole returns the role and content of the
-// last non-system message. Empty strings if none.
+// last non-system, non-tool-result message. Empty strings if none.
 func extractLastMessageRole(
 	msgs []db.Message,
 ) (role, content string) {
 	if msgs == nil {
 		return "", ""
 	}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if !msgs[i].IsSystem {
-			return msgs[i].Role, msgs[i].Content
+	for _, v := range slices.Backward(msgs) {
+		if !v.IsSystem && v.SourceSubtype != "tool_result" {
+			return v.Role, v.Content
 		}
 	}
 	return "", ""

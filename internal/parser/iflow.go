@@ -3,6 +3,7 @@
 package parser
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,12 +25,12 @@ type dagEntryIflow struct {
 	timestamp  time.Time
 }
 
-// ParseIflowSession parses an iFlow JSONL session file.
+// parseSession parses an iFlow JSONL session file.
 // Returns a single ParseResult. Unlike Claude, iFlow's
 // uuid/parentUuid DAG represents streaming incremental updates
 // (sliding-window snapshots), not conversation forks, so fork
 // splitting is intentionally not applied.
-func ParseIflowSession(
+func parseIflowSession(
 	path, project, machine string,
 ) ([]ParseResult, error) {
 	info, err := os.Stat(path)
@@ -67,6 +68,7 @@ func ParseIflowSession(
 	allHaveUUID = true
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 	for {
 		line, ok := lr.next()
 		if !ok {
@@ -361,7 +363,7 @@ func extractMessagesIflow(entries []dagEntryIflow) (
 
 		content := gjson.Get(e.line, "message.content")
 		text, _, hasThinking, hasToolUse, tcs, trs :=
-			ExtractTextContent(content)
+			ExtractTextContent(context.Background(), content)
 
 		// Convert command/skill invocation XML into readable
 		// text (e.g. "/roborev-fix 450"). If the content
@@ -419,6 +421,7 @@ func ExtractIflowProjectHints(
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 
 	for {
 		line, ok := lr.next()

@@ -1,11 +1,8 @@
-import * as api from "../api/client.js";
-import type {
-  SyncProgress,
-  SyncStats,
-  Stats,
-  VersionInfo,
-  UpdateCheck,
-} from "../api/types.js";
+import { triggerResync, triggerSync, watchSession, type SyncHandle } from "../api/client.js";
+import { MetadataService, SyncService } from "../api/generated/index";
+import { ApiError, isRemoteConnection } from "../api/runtime.js";
+import { events } from "./events.svelte.js";
+import type { SyncProgress, SyncStats, Stats, VersionInfo } from "../api/types.js";
 import type { SessionTiming } from "../api/types/timing.js";
 
 type SyncCompleteListener = () => void;
@@ -18,10 +15,7 @@ const POLL_INTERVAL_MS = 10_000;
  * Uses prefix comparison only when one hash is shorter
  * than the other (i.e. an abbreviation).
  */
-export function commitsDisagree(
-  a: string | undefined,
-  b: string | undefined,
-): boolean {
+export function commitsDisagree(a: string | undefined, b: string | undefined): boolean {
   if (!a || !b) return false;
   if (a === "unknown" || b === "unknown") return false;
   if (a === b) return false;
@@ -38,17 +32,27 @@ class SyncStore {
   stats: Stats | null = $state(null);
   serverVersion: VersionInfo | null = $state(null);
   versionMismatch: boolean = $state(false);
+  // True when connected to a remote server that the browser cannot
+  // reach (network error, CSP block, or the server being down).
+  // Surfaced in the status bar so the failure is not silent.
+  remoteUnreachable: boolean = $state(false);
+  // True when the backend process answers but one of its dependencies
+  // is not ready yet, such as a PostgreSQL-backed server before PG
+  // becomes reachable.
+  backendDegraded: boolean = $state(false);
+  backendDegradedMessage: string | null = $state(null);
   updateAvailable: boolean = $state(false);
   latestVersion: string | null = $state(null);
-  readonly buildCommit: string =
-    import.meta.env.VITE_BUILD_COMMIT;
+  readonly buildCommit: string = import.meta.env.VITE_BUILD_COMMIT;
   readonly isDesktop: boolean =
-    typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).has("desktop");
+    typeof window !== "undefined" && new URLSearchParams(window.location.search).has("desktop");
+
+  get readOnly(): boolean {
+    return this.serverVersion?.read_only === true;
+  }
 
   private watchEventSource: EventSource | null = null;
-  private pollTimer: ReturnType<typeof setInterval> | null =
-    null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastStatsParams: {
     include_one_shot?: boolean;
     include_automated?: boolean;
@@ -57,6 +61,7 @@ class SyncStore {
   private syncCompleteListeners: SyncCompleteListener[] = [];
   private statusHydrated = false;
   private pendingHydration = false;
+  private statusProgressActive = false;
 
   /** Register a callback invoked after any sync completes. */
   onSyncComplete(listener: SyncCompleteListener) {
@@ -69,25 +74,84 @@ class SyncStore {
     }
   }
 
+  /** Record whether the backend process responded. Only flags a
+   * failure when a remote server is configured — local failures are
+   * handled by the visibility health check, which reloads the page.
+   * A successful liveness-style response does not prove PG-backed
+   * reads are healthy, so it must not clear backendDegraded. */
+  private markRemoteReachable(reachable: boolean) {
+    if (reachable) {
+      this.remoteUnreachable = false;
+      return;
+    }
+    this.clearBackendDegraded();
+    if (isRemoteConnection()) {
+      this.remoteUnreachable = true;
+    }
+  }
+
+  markBackendDegraded(message = "sync not ready") {
+    this.remoteUnreachable = false;
+    this.backendDegraded = true;
+    this.backendDegradedMessage = message;
+  }
+
+  clearBackendDegraded() {
+    this.backendDegraded = false;
+    this.backendDegradedMessage = null;
+  }
+
+  private markBackendFailure(error: unknown) {
+    if (error instanceof ApiError && error.status >= 500) {
+      this.markBackendDegraded();
+      return;
+    }
+    this.markRemoteReachable(false);
+  }
+
   async loadStatus() {
     try {
-      const status = await api.getSyncStatus();
+      const status = await SyncService.getApiV1SyncStatus();
+      this.markRemoteReachable(true);
+      if (this.serverVersion === null) {
+        await this.loadVersion({ updateBackendHealth: false });
+      }
       const newLastSync = status.last_sync || null;
       const isInitial = !this.statusHydrated;
       this.statusHydrated = true;
-      const changed =
-        newLastSync !== null && newLastSync !== this.lastSync;
+      const changed = newLastSync !== null && newLastSync !== this.lastSync;
       this.lastSync = newLastSync;
-      this.lastSyncStats = status.stats;
+      this.lastSyncStats = status.stats ?? null;
+      const statusProgress = status.progress ?? null;
+      let statusProgressCompleted = false;
+      if (statusProgress) {
+        this.statusProgressActive = true;
+        this.syncing = true;
+        this.progress = statusProgress;
+      } else if (this.statusProgressActive) {
+        this.statusProgressActive = false;
+        this.syncing = false;
+        this.progress = null;
+        statusProgressCompleted = true;
+      }
+      const shouldRetryStats = this.backendDegraded;
       // Suppress notifications on initial hydration and
       // when a local sync just completed (pendingHydration).
       if (this.pendingHydration) {
         this.pendingHydration = false;
-      } else if (changed && !isInitial) {
-        this.loadStats();
+      } else if (statusProgress) {
+        return;
+      } else if (statusProgressCompleted) {
+        await this.loadStats();
         this.notifySyncComplete();
+      } else if (changed && !isInitial) {
+        await this.loadStats();
+        this.notifySyncComplete();
+      } else if (shouldRetryStats) {
+        await this.loadStats();
       }
     } catch (error) {
+      this.markBackendFailure(error);
       this.pendingHydration = false;
       console.warn("Failed to load sync status:", error);
     }
@@ -95,10 +159,7 @@ class SyncStore {
 
   startPolling() {
     this.stopPolling();
-    this.pollTimer = setInterval(
-      () => this.loadStatus(),
-      POLL_INTERVAL_MS,
-    );
+    this.pollTimer = setInterval(() => this.loadStatus(), POLL_INTERVAL_MS);
   }
 
   stopPolling() {
@@ -108,36 +169,36 @@ class SyncStore {
     }
   }
 
-  async loadStats(
-    params?: {
-      include_one_shot?: boolean;
-      include_automated?: boolean;
-    },
-  ) {
+  async loadStats(params?: { include_one_shot?: boolean; include_automated?: boolean }) {
     if (params !== undefined) {
       this.lastStatsParams = params;
     }
     const version = ++this.statsVersion;
     try {
-      const result = await api.getStats(
-        this.lastStatsParams,
-      );
+      const result = await MetadataService.getApiV1Stats(this.lastStatsParams);
       if (this.statsVersion === version) {
         this.stats = result;
+        this.clearBackendDegraded();
       }
     } catch (error) {
-      console.warn("Failed to load sync stats:", error);
+      if (this.statsVersion === version) {
+        this.markBackendFailure(error);
+        console.warn("Failed to load sync stats:", error);
+      }
     }
   }
 
-  async loadVersion() {
+  async loadVersion(opts: { updateBackendHealth?: boolean } = {}) {
+    const updateBackendHealth = opts.updateBackendHealth ?? true;
     try {
-      this.serverVersion = await api.getVersion();
-      this.versionMismatch = commitsDisagree(
-        this.buildCommit,
-        this.serverVersion.commit,
-      );
+      this.serverVersion = await MetadataService.getApiV1Version();
+      events.setAvailable(this.serverVersion.read_only !== true);
+      this.markRemoteReachable(true);
+      this.versionMismatch = commitsDisagree(this.buildCommit, this.serverVersion.commit);
     } catch (error) {
+      if (updateBackendHealth) {
+        this.markBackendFailure(error);
+      }
       console.warn("Failed to load version info:", error);
     }
   }
@@ -148,8 +209,7 @@ class SyncStore {
     // is irrelevant and potentially wrong for forks.
     if (this.isDesktop) return;
     try {
-      const result: UpdateCheck =
-        await api.checkForUpdate();
+      const result = await MetadataService.getApiV1UpdateCheck();
       this.updateAvailable = result.update_available;
       this.latestVersion = result.latest_version ?? null;
     } catch (error) {
@@ -158,30 +218,47 @@ class SyncStore {
   }
 
   triggerSync(onComplete?: () => void) {
-    this.runSync(api.triggerSync, onComplete);
+    if (this.readOnly) {
+      void this.refreshReadOnly(onComplete);
+      return;
+    }
+    this.runSync(triggerSync, onComplete);
   }
 
-  triggerResync(
-    onComplete?: () => void,
-    onError?: (err: Error) => void,
-  ): boolean {
-    return this.runSync(
-      api.triggerResync,
-      onComplete,
-      onError,
-    );
+  triggerResync(onComplete?: () => void, onError?: (err: Error) => void): boolean {
+    if (this.readOnly) {
+      onError?.(new Error("Full resync is unavailable for read-only backends."));
+      return false;
+    }
+    return this.runSync(triggerResync, onComplete, onError);
+  }
+
+  private async refreshReadOnly(onComplete?: () => void): Promise<boolean> {
+    if (this.syncing) return false;
+    this.syncing = true;
+    this.progress = null;
+    this.statusProgressActive = false;
+    try {
+      this.pendingHydration = true;
+      await Promise.all([this.loadStatus(), this.loadStats()]);
+      this.notifySyncComplete();
+      onComplete?.();
+      return true;
+    } finally {
+      this.syncing = false;
+      this.progress = null;
+    }
   }
 
   private runSync(
-    syncFn: (
-      onProgress?: (p: SyncProgress) => void,
-    ) => api.SyncHandle,
+    syncFn: (onProgress?: (p: SyncProgress) => void) => SyncHandle,
     onComplete?: () => void,
     onError?: (err: Error) => void,
   ): boolean {
     if (this.syncing) return false;
     this.syncing = true;
     this.progress = null;
+    this.statusProgressActive = false;
 
     const finalizeSync = () => {
       this.syncing = false;
@@ -206,10 +283,7 @@ class SyncStore {
         onComplete?.();
       })
       .catch((err: unknown) => {
-        if (
-          err instanceof DOMException &&
-          err.name === "AbortError"
-        ) {
+        if (err instanceof DOMException && err.name === "AbortError") {
           return;
         }
         finalizeSync();
@@ -223,17 +297,9 @@ class SyncStore {
     return true;
   }
 
-  watchSession(
-    sessionId: string,
-    onUpdate: () => void,
-    onTiming?: (t: SessionTiming) => void,
-  ) {
+  watchSession(sessionId: string, onUpdate: () => void, onTiming?: (t: SessionTiming) => void) {
     this.unwatchSession();
-    this.watchEventSource = api.watchSession(
-      sessionId,
-      onUpdate,
-      onTiming,
-    );
+    this.watchEventSource = watchSession(sessionId, onUpdate, onTiming);
   }
 
   unwatchSession() {

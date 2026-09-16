@@ -1,6 +1,10 @@
 package parser
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 func TestNormalizeToolCategory(t *testing.T) {
 	tests := []struct {
@@ -22,6 +26,7 @@ func TestNormalizeToolCategory(t *testing.T) {
 		// Codex tools
 		{"shell_command", "Bash"},
 		{"exec_command", "Bash"},
+		{"list_files", "Read"},
 		{"apply_patch", "Edit"},
 		{"write_stdin", "Bash"},
 		{"shell", "Bash"},
@@ -48,6 +53,20 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"glob", "Glob"},
 		{"task", "Task"},
 
+		// Kilo (legacy) / RooCode (Cline-family) camelCase tool names.
+		{"appliedDiff", "Edit"},
+		{"editedExistingFile", "Edit"},
+		{"deleteFile", "Edit"},
+		{"searchFiles", "Grep"},
+		{"codebaseSearch", "Grep"},
+		{"writeToFile", "Write"},
+		{"newFileCreated", "Write"},
+		{"executeCommand", "Bash"},
+		{"newTask", "Task"},
+		{"updateTodoList", "Tool"},
+		{"finishTask", "Tool"},
+		{"switchMode", "Tool"},
+
 		// Amp tools
 		{"create_file", "Write"},
 		{"look_at", "Read"},
@@ -64,12 +83,16 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"view", "Read"},
 		{"report_intent", "Tool"},
 
+		// Cursor tools
+		{"ApplyPatch", "Edit"},
+
 		// Piebald / Zencoder-style built-in tools
 		{"ReadFile", "Read"},
 		{"WriteFile", "Write"},
 		{"EditFile", "Edit"},
 		{"RunTerminalCommand", "Bash"},
 		{"LaunchSubagent", "Task"},
+		{"Subagent", "Task"},
 		{"WebFetch", "Tool"},
 		{"WebSearch", "Tool"},
 		{"TodoWrite", "Tool"},
@@ -94,6 +117,21 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"todo_read", "Tool"},
 		{"parallel", "Task"},
 
+		// RooCode tools
+		{"readFile", "Read"},
+		{"writeToFile", "Write"},
+		{"insertContent", "Write"},
+		{"searchAndReplace", "Edit"},
+		{"appliedDiff", "Edit"},
+		{"listFiles", "Read"},
+		{"listFilesTopLevel", "Read"},
+		{"listFilesRecursive", "Read"},
+		{"listCodeDefinitionNames", "Read"},
+		{"searchFiles", "Grep"},
+		{"newTask", "Task"},
+		{"skill", "Tool"},
+		{"search", "Tool"},
+
 		// Unknown
 		{"view_image", "Other"},
 		{"update_plan", "Other"},
@@ -111,12 +149,8 @@ func TestNormalizeToolCategory(t *testing.T) {
 		}
 		t.Run(testName, func(t *testing.T) {
 			got := NormalizeToolCategory(tt.toolName)
-			if got != tt.want {
-				t.Errorf(
-					"NormalizeToolCategory(%q) = %q, want %q",
-					tt.toolName, got, tt.want,
-				)
-			}
+			assert.Equal(t, tt.want, got,
+				"NormalizeToolCategory(%q)", tt.toolName)
 		})
 	}
 }

@@ -1,27 +1,37 @@
 <!-- ABOUTME: Session Vital Signs panel — replaces ActivityMinimap on the right column. -->
 <script lang="ts">
+  import { onDestroy } from "svelte";
+  import { CopyButton, Tooltip } from "@kenn-io/kit-ui";
   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { liveTick } from "../../stores/liveTick.svelte.js";
   import { fetchSessionTiming } from "../../api/timing.js";
+  import { isAbortError } from "../../api/runtime.js";
   import { formatDuration } from "../../utils/duration.js";
   import { categoryToken } from "../../utils/categoryToken.js";
   import { displayToolName } from "../../utils/toolDisplay.js";
   import { ui } from "../../stores/ui.svelte.js";
+  import { m } from "../../i18n/index.js";
+  import { formatNumber } from "../../utils/format.js";
   import type {
     CallTiming,
     SessionTiming,
     TurnTiming,
   } from "../../api/types/timing.js";
   import ActivityLane from "./ActivityLane.svelte";
+  import RecallPanel from "./RecallPanel.svelte";
   import CallRow from "./CallRow.svelte";
   import CallGroup from "./CallGroup.svelte";
   import SubagentCalls from "./SubagentCalls.svelte";
+  import { ChevronRightIcon, XIcon } from "../../icons.js";
+  import { LatestRead } from "../../utils/latest-read.js";
+  import type { Session } from "../../api/types/core.js";
 
   interface Props {
     sessionId: string;
+    session: Session | undefined;
   }
 
-  let { sessionId }: Props = $props();
+  let { sessionId, session }: Props = $props();
 
   $effect(() => {
     void sessionTiming.load(sessionId);
@@ -42,11 +52,48 @@
   let expandedSubagentIds = $state(new Set<string>());
   let subagentTimings = $state(new Map<string, SessionTiming>());
   let pendingSubagentIds = $state(new Set<string>());
+  const subagentTimingReads = new Map<string, LatestRead>();
+  let subagentReadSessionId: string | null = null;
+
+  function clearPendingSubagent(sid: string) {
+    const next = new Set(pendingSubagentIds);
+    next.delete(sid);
+    pendingSubagentIds = next;
+  }
+
+  function cancelSubagentRead(sid: string) {
+    subagentTimingReads.get(sid)?.cancel();
+    subagentTimingReads.delete(sid);
+    clearPendingSubagent(sid);
+  }
+
+  function cancelAllSubagentReads() {
+    for (const read of subagentTimingReads.values()) read.cancel();
+    subagentTimingReads.clear();
+  }
+
+  $effect(() => {
+    if (subagentReadSessionId === null) {
+      subagentReadSessionId = sessionId;
+      return;
+    }
+    if (sessionId === subagentReadSessionId) return;
+    cancelAllSubagentReads();
+    subagentReadSessionId = sessionId;
+    expandedSubagentIds = new Set();
+    subagentTimings = new Map();
+    pendingSubagentIds = new Set();
+  });
+
+  onDestroy(cancelAllSubagentReads);
 
   async function toggleSubagent(call: CallTiming) {
     if (!call.subagent_session_id) return;
     const sid = call.subagent_session_id;
-    if (pendingSubagentIds.has(sid)) return;
+    if (pendingSubagentIds.has(sid)) {
+      cancelSubagentRead(sid);
+      return;
+    }
     if (expandedSubagentIds.has(sid)) {
       const next = new Set(expandedSubagentIds);
       next.delete(sid);
@@ -54,22 +101,36 @@
       return;
     }
     if (!subagentTimings.has(sid)) {
+      const ownerSessionId = sessionId;
+      const read = new LatestRead();
+      subagentTimingReads.set(sid, read);
+      const signal = read.begin();
       const nextPending = new Set(pendingSubagentIds);
       nextPending.add(sid);
       pendingSubagentIds = nextPending;
       try {
-        const t = await fetchSessionTiming(sid);
-        if (!t) return;
+        const t = await fetchSessionTiming(sid, signal);
+        if (
+          !t ||
+          ownerSessionId !== sessionId ||
+          subagentTimingReads.get(sid) !== read ||
+          !read.isCurrent(signal)
+        ) return;
         const m = new Map(subagentTimings);
         m.set(sid, t);
         subagentTimings = m;
       } catch (err) {
+        if (signal.aborted || isAbortError(err)) return;
         console.error("failed to load sub-agent timing", err);
         return;
       } finally {
-        const cleanup = new Set(pendingSubagentIds);
-        cleanup.delete(sid);
-        pendingSubagentIds = cleanup;
+        if (
+          subagentTimingReads.get(sid) === read &&
+          read.finish(signal)
+        ) {
+          subagentTimingReads.delete(sid);
+          clearPendingSubagent(sid);
+        }
       }
     }
     const next = new Set(expandedSubagentIds);
@@ -215,7 +276,7 @@
     const dur =
       turn.duration_ms != null
         ? formatDuration(turn.duration_ms)
-        : "running";
+        : m.session_vitals_running();
     return `${turn.primary_category} · ${dur}`;
   }
 
@@ -225,71 +286,152 @@
 </script>
 
 <div class="vital">
-  {#if timing}
+  <header class="vital-titlebar">
+    <div>
+      <div class="vital-title">{m.session_vitals_title()}</div>
+      <div class="vital-subtitle">{m.session_vitals_subtitle()}</div>
+    </div>
+    <button
+      type="button"
+      class="vital-close"
+      title={m.session_vitals_close()}
+      aria-label={m.session_vitals_close()}
+      onclick={() => ui.closeVitals()}
+    >
+      <XIcon size="12" strokeWidth="2.4" aria-hidden="true" />
+    </button>
+  </header>
+
+  {#if timing || session}
     <section class="v-section">
       <header class="v-h">
-        <span>Session</span>
-        <span class="v-meta" class:live={timing.running}>
-          {#if timing.running}
-            running {formatDuration(timing.total_duration_ms)}+
-          {:else}
-            {formatDuration(timing.total_duration_ms)}
-          {/if}
-        </span>
+        <span>{m.session_vitals_session()}</span>
+        {#if timing}
+          <span class="v-meta" class:live={timing.running}>
+            {#if timing.running}
+              {m.session_vitals_running_duration({ duration: formatDuration(timing.total_duration_ms) })}
+            {:else}
+              {formatDuration(timing.total_duration_ms)}
+            {/if}
+          </span>
+        {/if}
       </header>
-      <div class="stat-grid">
-        <div>
-          <div class="lbl">tool calls</div>
-          <div class="val">{timing.tool_call_count}</div>
-        </div>
-        <div>
-          <div class="lbl">tool time</div>
-          <div class="val" class:live={timing.running}>
-            {formatDuration(timing.tool_duration_ms)}{timing.running ? "+" : ""}
+      {#if session}
+        <div class="session-context">
+          <div class="context-row">
+            <div class="context-text">
+              <div class="context-label">
+                {m.session_vitals_repository()}
+              </div>
+              <div class="context-value" title={session.project}>
+                {session.project}
+              </div>
+            </div>
+            <CopyButton
+              text={session.project}
+              revealOnHover
+              ariaLabel={m.session_vitals_copy_repository()}
+              copiedAriaLabel={m.session_vitals_repository_copied()}
+              title={m.session_vitals_copy_repository()}
+              copiedTitle={m.session_vitals_repository_copied()}
+            />
+          </div>
+          <div class="context-row">
+            <div class="context-text">
+              <div class="context-label">
+                {m.session_vitals_worktree()}
+              </div>
+              {#if session.cwd}
+                <div class="context-tooltip">
+                  <Tooltip
+                    text={session.cwd}
+                    focusable
+                    align="end"
+                    class="worktree-path-tooltip"
+                  >
+                    <div class="context-value context-value--path">
+                      <bdi dir="ltr">{session.cwd}</bdi>
+                    </div>
+                  </Tooltip>
+                </div>
+              {:else}
+                <div class="context-value">—</div>
+              {/if}
+            </div>
+            {#if session.cwd}
+              <CopyButton
+                text={session.cwd}
+                revealOnHover
+                ariaLabel={m.session_vitals_copy_worktree()}
+                copiedAriaLabel={m.session_vitals_worktree_copied()}
+                title={m.session_vitals_copy_worktree()}
+                copiedTitle={m.session_vitals_worktree_copied()}
+              />
+            {/if}
           </div>
         </div>
-        <div>
-          <div class="lbl">slowest call</div>
-          {#if timing.slowest_call}
-            {@const slowest = timing.slowest_call}
-            <button
-              type="button"
-              class="val slow val-link"
-              title="Jump to call"
-              onclick={() => scrollToCall(slowest)}
-            >
-              {displayToolName(slowest)} · {formatDuration(slowest.duration_ms ?? 0)}
-            </button>
-          {:else}
-            <div class="val slow">—</div>
-          {/if}
+      {/if}
+      {#if timing}
+        <div class="stat-grid">
+          <div>
+            <div class="lbl">{m.session_vitals_tool_calls()}</div>
+            <div class="val">{timing.tool_call_count}</div>
+          </div>
+          <div>
+            <div class="lbl">{m.session_vitals_tool_time()}</div>
+            <div class="val" class:live={timing.running}>
+              {formatDuration(timing.tool_duration_ms)}{timing.running ? "+" : ""}
+            </div>
+          </div>
+          <div>
+            <div class="lbl">{m.session_vitals_slowest_call()}</div>
+            {#if timing.slowest_call}
+              {@const slowest = timing.slowest_call}
+              <button
+                type="button"
+                class="val slow val-link"
+                title={m.session_vitals_jump_to_call()}
+                onclick={() => scrollToCall(slowest)}
+              >
+                {displayToolName(slowest)} · {formatDuration(slowest.duration_ms ?? 0)}
+              </button>
+            {:else}
+              <div class="val slow">—</div>
+            {/if}
+          </div>
+          <div>
+            <div class="lbl">{m.session_vitals_turns()}</div>
+            <div class="val">{timing.turn_count}</div>
+          </div>
+          <div>
+            <div class="lbl">{m.session_vitals_subagents()}</div>
+            <div class="val">{timing.subagent_count}</div>
+          </div>
         </div>
-        <div>
-          <div class="lbl">turns</div>
-          <div class="val">{timing.turn_count}</div>
-        </div>
-        <div>
-          <div class="lbl">sub-agents</div>
-          <div class="val">{timing.subagent_count}</div>
-        </div>
-      </div>
+      {/if}
     </section>
+  {/if}
 
+  <RecallPanel {sessionId} />
+
+  {#if timing}
     {#if timing.by_category.length > 0}
       <section class="v-section">
         <header class="v-h">
-          <span>Time spent</span>
+          <span>{m.session_vitals_time_spent()}</span>
           {#if categoryFilter}
             <button
               class="filter-chip"
               style="color: {categoryToken(categoryFilter)}; border-color: {categoryToken(categoryFilter)};"
               onclick={() => (categoryFilter = null)}
-              aria-label="clear category filter"
+              aria-label={m.session_vitals_clear_category_filter()}
             >
-              {categoryFilter}<span class="x">×</span>
+              {categoryFilter}<span class="x">
+                <XIcon size="10" strokeWidth="2.4" aria-hidden="true" />
+              </span>
             </button>
           {:else}
-            <span class="v-meta">completed turns · click to highlight</span>
+            <span class="v-meta">{m.session_vitals_completed_turns_hint()}</span>
           {/if}
         </header>
         {#each timing.by_category as cat (cat.category)}
@@ -319,12 +461,12 @@
     {#if timing.turns.length > 0}
       <section class="v-section">
         <header class="v-h">
-          <span>Timeline</span>
-          <span class="v-meta">click marks to scroll</span>
+          <span>{m.session_vitals_timeline()}</span>
+          <span class="v-meta">{m.session_vitals_click_marks_to_scroll()}</span>
         </header>
 
         <div class="lane-row">
-          <span class="lane-label">turns</span>
+          <span class="lane-label">{m.session_vitals_turns()}</span>
           <span class="lane-track">
             {#each timing.turns as t (t.message_id)}
               {@const isLive = t.duration_ms == null}
@@ -338,7 +480,10 @@
                 title={turnTitle(t)}
                 onclick={() => scrollToTurn(t)}
                 type="button"
-                aria-label="Jump to {t.primary_category} turn at {t.started_at}"
+                aria-label={m.session_vitals_jump_to_turn({
+                  category: t.primary_category,
+                  time: t.started_at,
+                })}
               ></button>
             {/each}
           </span>
@@ -364,7 +509,10 @@
                   title={turnTitle(t)}
                   onclick={() => scrollToTurn(t)}
                   type="button"
-                  aria-label="Jump to {cat.category} turn at {t.started_at}"
+                  aria-label={m.session_vitals_jump_to_turn({
+                    category: cat.category,
+                    time: t.started_at,
+                  })}
                 ></button>
               {/each}
             </span>
@@ -391,97 +539,123 @@
 
     {#if timing.turns.length > 0}
       <section class="v-section">
-        <header class="v-h">
-          <span>Calls</span>
-          <span class="v-meta">
-            {timing.tool_call_count} call{timing.tool_call_count === 1
-              ? ""
-              : "s"}{timing.running ? " · 1 running" : ""}
-          </span>
+        <header
+          class="v-h calls-header"
+          class:expanded={ui.vitalsCallsExpanded}
+        >
+          <button
+            type="button"
+            class="calls-disclosure"
+            aria-expanded={ui.vitalsCallsExpanded}
+            onclick={() => ui.toggleVitalsCalls()}
+          >
+            <span class="calls-heading">
+              <span
+                class="calls-chevron"
+                class:open={ui.vitalsCallsExpanded}
+              >
+                <ChevronRightIcon
+                  size="10"
+                  strokeWidth="2.4"
+                  aria-hidden="true"
+                />
+              </span>
+              <span>{m.session_vitals_calls()}</span>
+            </span>
+            <span class="v-meta">
+              {m.session_vitals_calls_summary({
+                count: timing.tool_call_count,
+                countLabel: formatNumber(timing.tool_call_count),
+                runningCount: timing.running ? 1 : 0,
+              })}
+            </span>
+          </button>
         </header>
-        <div class="scale-axis">
-          <span>0</span>
-          <span>{formatDuration(timing.total_duration_ms / 4)}</span>
-          <span>{formatDuration(timing.total_duration_ms / 2)}</span>
-          <span
-            >{formatDuration(
-              (3 * timing.total_duration_ms) / 4,
-            )}</span
-          >
-          <span class:now={timing.running}
-            >{timing.running
-              ? "now"
-              : formatDuration(timing.total_duration_ms)}</span
-          >
-        </div>
-        <div class="calls">
-          {#each timing.turns as turn (turn.message_id)}
-            {@const isLive =
-              turn.duration_ms == null &&
-              isLastTurn(turn) &&
-              !!timing.running}
-            {@const liveElapsed = isLive ? liveElapsedFor(turn) : undefined}
-            {#if turn.calls.length === 1}
-              {@const call = turn.calls[0]!}
-              <CallRow
-                {call}
-                barWidthPct={callBarPct(call, timing)}
-                isSlow={isSlowCall(call)}
-                {isLive}
-                liveDurationMs={liveElapsed}
-                dimmed={categoryFilter !== null &&
-                  call.category !== categoryFilter}
-                isSubagentExpanded={!!call.subagent_session_id &&
-                  expandedSubagentIds.has(call.subagent_session_id)}
-                onClick={() => ui.scrollToOrdinal(turn.ordinal)}
-                onChevronClick={() => {
-                  void toggleSubagent(call);
-                }}
-              />
-              {#if call.subagent_session_id && expandedSubagentIds.has(call.subagent_session_id)}
-                {@const subT = subagentTimings.get(
-                  call.subagent_session_id,
-                )}
-                {#if subT}
-                  <SubagentCalls
-                    timing={subT}
-                    barScalePct={(c) => callBarPct(c, subT)}
-                    {categoryFilter}
-                  />
+        {#if ui.vitalsCallsExpanded}
+          <div class="scale-axis">
+            <span>0</span>
+            <span>{formatDuration(timing.total_duration_ms / 4)}</span>
+            <span>{formatDuration(timing.total_duration_ms / 2)}</span>
+            <span
+              >{formatDuration(
+                (3 * timing.total_duration_ms) / 4,
+              )}</span
+            >
+            <span class:now={timing.running}
+              >{timing.running
+                ? m.session_vitals_now()
+                : formatDuration(timing.total_duration_ms)}</span
+            >
+          </div>
+          <div class="calls">
+            {#each timing.turns as turn (turn.message_id)}
+              {@const isLive =
+                turn.duration_ms == null &&
+                isLastTurn(turn) &&
+                !!timing.running}
+              {@const liveElapsed = isLive ? liveElapsedFor(turn) : undefined}
+              {#if turn.calls.length === 1}
+                {@const call = turn.calls[0]!}
+                <CallRow
+                  {call}
+                  barWidthPct={callBarPct(call, timing)}
+                  isSlow={isSlowCall(call)}
+                  {isLive}
+                  liveDurationMs={liveElapsed}
+                  dimmed={categoryFilter !== null &&
+                    call.category !== categoryFilter}
+                  isSubagentExpanded={!!call.subagent_session_id &&
+                    expandedSubagentIds.has(call.subagent_session_id)}
+                  onClick={() => ui.scrollToOrdinal(turn.ordinal)}
+                  onChevronClick={() => {
+                    void toggleSubagent(call);
+                  }}
+                />
+                {#if call.subagent_session_id && expandedSubagentIds.has(call.subagent_session_id)}
+                  {@const subT = subagentTimings.get(
+                    call.subagent_session_id,
+                  )}
+                  {#if subT}
+                    <SubagentCalls
+                      timing={subT}
+                      barScalePct={(c) => callBarPct(c, subT)}
+                      {categoryFilter}
+                    />
+                  {/if}
                 {/if}
+              {:else}
+                <CallGroup
+                  calls={turn.calls}
+                  groupDurationMs={turn.duration_ms}
+                  barScalePct={(c) => callBarPct(c, timing)}
+                  headerBarPct={turnHeaderBarPct(turn, timing)}
+                  {isLive}
+                  liveDurationMs={liveElapsed}
+                  isSlow={isSlowCall}
+                  dimmed={categoryFilter !== null &&
+                    turn.primary_category !== categoryFilter}
+                  onCallClick={() => ui.scrollToOrdinal(turn.ordinal)}
+                  onSubagentExpand={(c) => {
+                    void toggleSubagent(c);
+                  }}
+                  {expandedSubagentIds}
+                />
+                {#each turn.calls.filter((c) => !!c.subagent_session_id && expandedSubagentIds.has(c.subagent_session_id)) as expandedCall (expandedCall.tool_use_id)}
+                  {@const subT = subagentTimings.get(
+                    expandedCall.subagent_session_id!,
+                  )}
+                  {#if subT}
+                    <SubagentCalls
+                      timing={subT}
+                      barScalePct={(c) => callBarPct(c, subT)}
+                      {categoryFilter}
+                    />
+                  {/if}
+                {/each}
               {/if}
-            {:else}
-              <CallGroup
-                calls={turn.calls}
-                groupDurationMs={turn.duration_ms}
-                barScalePct={(c) => callBarPct(c, timing)}
-                headerBarPct={turnHeaderBarPct(turn, timing)}
-                {isLive}
-                liveDurationMs={liveElapsed}
-                isSlow={isSlowCall}
-                dimmed={categoryFilter !== null &&
-                  turn.primary_category !== categoryFilter}
-                onCallClick={() => ui.scrollToOrdinal(turn.ordinal)}
-                onSubagentExpand={(c) => {
-                  void toggleSubagent(c);
-                }}
-                {expandedSubagentIds}
-              />
-              {#each turn.calls.filter((c) => !!c.subagent_session_id && expandedSubagentIds.has(c.subagent_session_id)) as expandedCall (expandedCall.tool_use_id)}
-                {@const subT = subagentTimings.get(
-                  expandedCall.subagent_session_id!,
-                )}
-                {#if subT}
-                  <SubagentCalls
-                    timing={subT}
-                    barScalePct={(c) => callBarPct(c, subT)}
-                    {categoryFilter}
-                  />
-                {/if}
-              {/each}
-            {/if}
-          {/each}
-        </div>
+            {/each}
+          </div>
+        {/if}
       </section>
     {/if}
   {:else if sessionTiming.error}
@@ -495,6 +669,56 @@
     flex: 1;
     overflow-y: auto;
     min-height: 0;
+  }
+
+  .vital-titlebar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    min-height: 42px;
+    padding: 7px 10px 7px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-default);
+  }
+
+  .vital-title {
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.2;
+  }
+
+  .vital-subtitle {
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.2;
+    margin-top: 1px;
+  }
+
+  .vital-close {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .vital-close:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+
+  .vital-close:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
   }
 
   .v-section {
@@ -527,11 +751,73 @@
     animation: duration-pulse 1.6s ease-in-out infinite;
   }
 
+  .session-context {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: 12px;
+    padding-bottom: 11px;
+    border-bottom: 1px solid var(--border-muted);
+    font-family: var(--font-mono);
+  }
+
+  .context-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 26px;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .context-text {
+    min-width: 0;
+  }
+
+  .context-row:hover :global(.kit-copy-btn--reveal),
+  .context-row:focus-within :global(.kit-copy-btn--reveal) {
+    opacity: 1;
+  }
+
+  .context-label {
+    color: var(--text-muted);
+    font-size: 9px;
+    margin-bottom: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  .context-value {
+    overflow: hidden;
+    color: var(--text-primary);
+    font-size: 10px;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .context-value--path {
+    direction: rtl;
+    text-align: left;
+  }
+
+  .context-tooltip {
+    min-width: 0;
+  }
+
+  .context-tooltip :global(.kit-tooltip-trigger) {
+    display: flex;
+    width: 100%;
+  }
+
+  .context-tooltip :global(.worktree-path-tooltip) {
+    max-width: min(50vw, calc(100vw - 32px));
+    overflow-wrap: anywhere;
+  }
+
   /* Stat grid */
   .stat-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 10px;
+    gap: var(--space-4);
     font-family: var(--font-mono);
     font-size: 11px;
   }
@@ -591,7 +877,7 @@
     transition: background 0.12s, opacity 0.18s, border-color 0.12s;
   }
   .agg-row:hover {
-    background: rgba(255, 255, 255, 0.03);
+    background: color-mix(in srgb, var(--text-primary) 3%, transparent);
   }
   .agg-row.active {
     background: color-mix(in srgb, var(--ring, transparent) 10%, transparent);
@@ -629,8 +915,8 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: color-mix(in srgb, var(--text-primary) 4%, transparent);
+    border: 1px solid color-mix(in srgb, var(--text-primary) 12%, transparent);
     padding: 2px 6px;
     border-radius: var(--radius-sm);
     font-family: var(--font-mono);
@@ -639,12 +925,13 @@
     color: var(--text-primary);
   }
   .filter-chip:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: color-mix(in srgb, var(--text-primary) 8%, transparent);
   }
   .filter-chip .x {
+    display: inline-flex;
+    align-items: center;
     margin-left: 2px;
-    font-size: 11px;
-    line-height: 1;
+    flex-shrink: 0;
   }
 
   /* Timeline lanes ----------------------------------------------------- */
@@ -719,21 +1006,66 @@
   }
 
   /* Calls section --------------------------------------------------- */
-  /* Copied verbatim from
-     docs/superpowers/specs/2026-04-26-session-duration-ux-mockup.html
-     (.scale-axis and .calls rules, lines 498–516). */
+  /* Adapted from the session-duration UX mockup, with the raw colors mapped to
+     theme tokens. */
+  .calls-header {
+    margin-bottom: 0;
+  }
+  .calls-header.expanded {
+    margin-bottom: 9px;
+  }
+  .calls-disclosure {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: calc(100% + 8px);
+    padding: 2px 4px;
+    margin: -2px -4px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    text-transform: inherit;
+    letter-spacing: inherit;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  .calls-disclosure:hover {
+    background: var(--bg-surface-hover);
+  }
+  .calls-disclosure:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
+  }
+  .calls-heading,
+  .calls-chevron {
+    display: inline-flex;
+    align-items: center;
+  }
+  .calls-heading {
+    gap: 4px;
+  }
+  .calls-chevron {
+    transition: transform 0.15s ease-out;
+  }
+  .calls-chevron.open {
+    transform: rotate(90deg);
+  }
   .scale-axis {
     display: flex;
     justify-content: space-between;
     font-family: ui-monospace, monospace;
     font-size: 9px;
-    color: #666;
+    color: var(--text-muted);
     padding: 0 4px 5px;
-    border-bottom: 1px solid #232323;
+    border-bottom: 1px solid var(--border-muted);
     margin-bottom: 8px;
   }
   .scale-axis .now {
-    color: #6ad0a8;
+    color: var(--running-fg);
     font-weight: 500;
   }
   .calls {

@@ -1,0 +1,208 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"net/http"
+
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/update"
+)
+
+func (s *Server) registerMetadataRoutes() {
+	group := newRouteGroup(s.api, "/api/v1", "Metadata")
+
+	s.get(group, "/projects", "List projects", s.humaListProjects)
+	s.get(group, "/machines", "List machines", s.humaListMachines)
+	s.get(group, "/branches", "List branches", s.humaListBranches)
+	s.get(group, "/agents", "List agents", s.humaListAgents)
+	s.get(group, "/stats", "Get stats", s.humaGetStats)
+	s.get(group, "/session-stats", "Get session stats", s.humaGetSessionStats)
+	s.get(group, "/version", "Get server version", s.humaGetVersion)
+	s.get(group, "/update/check", "Check for updates", s.humaCheckUpdate)
+}
+
+type statsInput struct {
+	BoolIncludeInput
+}
+
+type sessionStatsInput struct {
+	BoolIncludeInput
+	Since                 string   `query:"since" doc:"Start of window"`
+	Until                 string   `query:"until" doc:"End of window"`
+	Agent                 string   `query:"agent" doc:"Filter by agent"`
+	IncludeProjects       []string `query:"include_project" doc:"Restrict to these projects"`
+	ExcludeProjects       []string `query:"exclude_project" doc:"Exclude these projects"`
+	Timezone              string   `query:"timezone" doc:"IANA timezone name"`
+	IncludeGitOutcomes    bool     `query:"include_git_outcomes" doc:"Include git-derived outcome stats"`
+	IncludeGitHubOutcomes bool     `query:"include_github_outcomes" doc:"Include GitHub PR outcome stats"`
+}
+
+type projectsResponse struct {
+	Projects []db.ProjectInfo `json:"projects"`
+}
+
+type machinesResponse struct {
+	Machines       []string          `json:"machines"`
+	MachineLabels  map[string]string `json:"machine_labels"`
+	MachineAliases map[string]string `json:"machine_aliases"`
+}
+
+func (s *Server) machineAliases(ctx context.Context) (map[string]string, error) {
+	aliases, err := s.db.GetMachineAliases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The old local sentinel belongs only to this archive, never a shared mirror.
+	if _, local := s.db.(*db.DB); local && s.cfg.InstallationID != "" {
+		aliases["local"] = s.cfg.InstallationID
+	}
+	return aliases, nil
+}
+
+type branchesResponse struct {
+	Branches []db.BranchInfo `json:"branches"`
+}
+
+type agentsResponse struct {
+	Agents []db.AgentInfo `json:"agents"`
+}
+
+func (s *Server) humaGetStats(
+	ctx context.Context,
+	in *statsInput,
+) (*jsonOutput[db.Stats], error) {
+	stats, err := s.db.GetStats(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[db.Stats]{Body: stats}, nil
+}
+
+func (s *Server) humaGetSessionStats(
+	ctx context.Context,
+	in *sessionStatsInput,
+) (*jsonOutput[*service.SessionStats], error) {
+	githubToken := ""
+	if in.IncludeGitHubOutcomes {
+		githubToken = s.githubToken(ctx)
+	}
+	stats, err := s.sessions.Stats(ctx, service.StatsFilter{
+		ApplyDefaultVisibility: true,
+		Since:                  in.Since,
+		Until:                  in.Until,
+		Agent:                  in.Agent,
+		IncludeOneShot:         in.IncludeOneShot,
+		IncludeAutomated:       in.IncludeAutomated,
+		IncludeProjects:        in.IncludeProjects,
+		ExcludeProjects:        in.ExcludeProjects,
+		Timezone:               in.Timezone,
+		IncludeGitOutcomes:     in.IncludeGitOutcomes,
+		IncludeGitHubOutcomes:  in.IncludeGitHubOutcomes,
+		GHToken:                githubToken,
+	})
+	if err != nil {
+		if handled := handleHumaContextError(err); handled != nil {
+			return nil, handled
+		}
+		if handled := handleHumaReadOnly(err); handled != nil {
+			return nil, handled
+		}
+		if inputErr, ok := errors.AsType[*db.StatsInputError](err); ok {
+			return nil, apiError(http.StatusBadRequest, inputErr.Msg)
+		}
+		return nil, internalError("session stats error", err)
+	}
+	return &jsonOutput[*service.SessionStats]{Body: stats}, nil
+}
+
+func (s *Server) humaListProjects(
+	ctx context.Context,
+	in *statsInput,
+) (*jsonOutput[projectsResponse], error) {
+	projects, err := s.db.GetProjects(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[projectsResponse]{Body: projectsResponse{Projects: projects}}, nil
+}
+
+func (s *Server) humaListMachines(
+	ctx context.Context,
+	in *statsInput,
+) (*jsonOutput[machinesResponse], error) {
+	machines, err := s.db.GetMachines(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	labels, err := s.db.GetMachineLabels(ctx)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	aliases, err := s.machineAliases(ctx)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines, MachineLabels: labels, MachineAliases: aliases}}, nil
+}
+
+func (s *Server) humaListBranches(
+	ctx context.Context,
+	in *statsInput,
+) (*jsonOutput[branchesResponse], error) {
+	branches, err := s.db.GetBranches(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[branchesResponse]{Body: branchesResponse{Branches: branches}}, nil
+}
+
+func (s *Server) humaListAgents(
+	ctx context.Context,
+	in *statsInput,
+) (*jsonOutput[agentsResponse], error) {
+	agents, err := s.db.GetAgents(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[agentsResponse]{Body: agentsResponse{Agents: agents}}, nil
+}
+
+func (s *Server) humaGetVersion(
+	_ context.Context,
+	_ *emptyInput,
+) (*jsonOutput[VersionInfo], error) {
+	version := s.version
+	version.InsightGenerationAvailable = supportsInsightGeneration(s.db)
+	return &jsonOutput[VersionInfo]{Body: version}, nil
+}
+
+func (s *Server) humaCheckUpdate(
+	_ context.Context,
+	_ *emptyInput,
+) (*jsonOutput[updateCheckResponse], error) {
+	if s.cfg.DisableUpdateCheck {
+		return &jsonOutput[updateCheckResponse]{
+			Body: updateCheckResponse{CurrentVersion: s.version.Version},
+		}, nil
+	}
+	checkFn := s.updateCheckFn
+	if checkFn == nil {
+		checkFn = update.CheckForUpdate
+	}
+	info, err := checkFn(s.version.Version, false, s.dataDir)
+	if err != nil || info == nil {
+		return &jsonOutput[updateCheckResponse]{
+			Body: updateCheckResponse{CurrentVersion: s.version.Version},
+		}, nil
+	}
+	return &jsonOutput[updateCheckResponse]{
+		Body: updateCheckResponse{
+			UpdateAvailable: !info.IsDevBuild,
+			CurrentVersion:  info.CurrentVersion,
+			LatestVersion:   info.LatestVersion,
+			IsDevBuild:      info.IsDevBuild,
+		},
+	}, nil
+}

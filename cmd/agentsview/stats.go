@@ -4,7 +4,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -16,15 +17,16 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/wesm/agentsview/internal/config"
-	"github.com/wesm/agentsview/internal/db"
-	"github.com/wesm/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/service"
 )
 
 func newStatsCommand() *cobra.Command {
 	var (
 		since, until, agent, timezone         string
 		includeProjects, excludeProjects      []string
+		includeOneShot, includeAutomated      bool
 		includeGitOutcomes, includeGHOutcomes bool
 	)
 	cmd := &cobra.Command{
@@ -57,30 +59,33 @@ func newStatsCommand() *cobra.Command {
 				ghToken = resolveGitHubToken(cmd.Context())
 			}
 			stats, err := svc.Stats(cmd.Context(), service.StatsFilter{
-				Since:                 since,
-				Until:                 until,
-				Agent:                 agentFilter,
-				IncludeProjects:       includeProjects,
-				ExcludeProjects:       excludeProjects,
-				Timezone:              timezone,
-				IncludeGitOutcomes:    includeGitOutcomes,
-				IncludeGitHubOutcomes: includeGHOutcomes,
-				GHToken:               ghToken,
+				ApplyDefaultVisibility: true,
+				Since:                  since,
+				Until:                  until,
+				Agent:                  agentFilter,
+				IncludeOneShot:         includeOneShot,
+				IncludeAutomated:       includeAutomated,
+				IncludeProjects:        includeProjects,
+				ExcludeProjects:        excludeProjects,
+				Timezone:               timezone,
+				IncludeGitOutcomes:     includeGitOutcomes,
+				IncludeGitHubOutcomes:  includeGHOutcomes,
+				GHToken:                ghToken,
 			})
 			if err != nil {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(stats)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), stats)
 			}
 			return printStatsHuman(cmd.OutOrStdout(), stats)
 		},
 	}
 
-	cmd.Flags().String("format", "human",
-		"Output format: human or json")
+	registerFormatFlags(cmd.Flags())
 	registerStatsFlags(cmd,
 		&since, &until, &agent, &timezone,
+		&includeOneShot, &includeAutomated,
 		&includeProjects, &excludeProjects,
 		&includeGitOutcomes, &includeGHOutcomes,
 	)
@@ -117,6 +122,7 @@ func resolveGitHubToken(ctx context.Context) string {
 func registerStatsFlags(
 	cmd *cobra.Command,
 	since, until, agent, timezone *string,
+	includeOneShot, includeAutomated *bool,
 	includeProjects, excludeProjects *[]string,
 	includeGitOutcomes, includeGHOutcomes *bool,
 ) {
@@ -127,6 +133,10 @@ func registerStatsFlags(
 		"End of window (YYYY-MM-DD; default: now)")
 	f.StringVar(agent, "agent", "all",
 		"Filter by agent (claude, codex, cursor, ... or 'all')")
+	f.BoolVar(includeOneShot, "include-one-shot", false,
+		"Include one-shot sessions (excluded by default)")
+	f.BoolVar(includeAutomated, "include-automated", false,
+		"Include automated sessions (excluded by default)")
 	f.StringArrayVar(includeProjects, "include-project", nil,
 		"Restrict to these projects (repeatable)")
 	f.StringArrayVar(excludeProjects, "exclude-project", nil,
@@ -139,13 +149,6 @@ func registerStatsFlags(
 		"Include GitHub PR outcome stats via gh (implies --include-git-outcomes)")
 }
 
-// openStatsService opens a SessionService scoped to the local SQLite
-// archive. The stats command deliberately bypasses resolveService
-// (and the HTTP daemon transport) because the daemon does not yet
-// expose a /stats endpoint, and resolveService prefers HTTP when one
-// is running. Reading SQLite directly is also write-safe:
-// GetSessionStats only reads, so a writable daemon owning the
-// database is not disturbed.
 func openStatsService(
 	cmd *cobra.Command,
 ) (service.SessionService, func(), error) {
@@ -153,15 +156,18 @@ func openStatsService(
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
-	applyClassifierConfig(cfg)
-	d, err := openDB(cfg)
+	tr, err := ensureTransport(&cfg, transportIntentRead, 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening db: %w", err)
+		return nil, nil, err
 	}
-	cleanup := func() { d.Close() }
-	// Pass a typed *db.DB so directBackend.Stats has the local handle
-	// it needs; engine is nil because the CLI never syncs.
-	return service.NewDirectBackend(d, nil), cleanup, nil
+	if tr.Mode == transportHTTP && tr.ReadOnly {
+		d, err := openReadOnlyDB(cfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("opening db: %w", err)
+		}
+		return service.NewDirectBackend(d, nil), func() { d.Close() }, nil
+	}
+	return newService(cfg, tr)
 }
 
 // printStatsHuman renders a human-readable summary of a SessionStats
@@ -178,6 +184,9 @@ func printStatsHuman(w io.Writer, stats *service.SessionStats) error {
 	if stats.Totals.SessionsAll == 0 {
 		fmt.Fprintln(ew, "Totals")
 		fmt.Fprintln(ew, "  (no sessions in window)")
+		if stats.CodeAttribution != nil {
+			printCodeAttribution(ew, stats.CodeAttribution)
+		}
 		return ew.err
 	}
 	printTotals(ew, stats)
@@ -199,6 +208,9 @@ func printStatsHuman(w io.Writer, stats *service.SessionStats) error {
 	}
 	if stats.Outcomes != nil {
 		printOutcomes(ew, stats.Outcomes)
+	}
+	if stats.CodeAttribution != nil {
+		printCodeAttribution(ew, stats.CodeAttribution)
 	}
 	return ew.err
 }
@@ -245,10 +257,12 @@ func printHeader(w io.Writer, s *service.SessionStats) {
 
 func printTotals(w io.Writer, s *service.SessionStats) {
 	fmt.Fprintln(w, "Totals")
-	fmt.Fprintf(w, "  Sessions:              %s (human %s, automation %s)\n",
+	fmt.Fprintf(w,
+		"  Sessions:              %s (human %s, automation %s, subagent %s)\n",
 		fmtInt(s.Totals.SessionsAll),
 		fmtInt(s.Totals.SessionsHuman),
-		fmtInt(s.Totals.SessionsAutomation))
+		fmtInt(s.Totals.SessionsAutomation),
+		fmtInt(s.Totals.SessionsSubagent))
 	fmt.Fprintf(w, "  Messages:              %s (user %s)\n",
 		fmtInt(s.Totals.MessagesTotal),
 		fmtInt(s.Totals.UserMessagesTotal))
@@ -385,9 +399,9 @@ func printCacheEconomics(w io.Writer, c *db.StatsCacheEconomics) {
 	fmt.Fprintln(w, "Cache economics (claude-only)")
 	fmt.Fprintf(w, "  Overall hit ratio:   %.2f\n",
 		c.CacheHitRatio.Overall)
-	fmt.Fprintf(w, "  $ spent:             $%.2f\n", c.DollarsSpent)
-	fmt.Fprintf(w, "  $ saved vs uncached: $%.2f\n",
-		c.DollarsSavedVsUncached)
+	fmt.Fprintf(w, "  $ spent:             %s\n", fmtCost(c.DollarsSpent))
+	fmt.Fprintf(w, "  $ saved vs uncached: %s\n",
+		fmtCost(c.DollarsSavedVsUncached))
 	fmt.Fprintln(w)
 }
 
@@ -452,6 +466,71 @@ func printOutcomes(w io.Writer, o *db.StatsOutcomes) {
 	fmt.Fprintf(w, "  Avg edit churn:      %s\n",
 		fmtFloat(o.AvgEditChurn))
 	fmt.Fprintln(w)
+}
+
+func printCodeAttribution(w io.Writer, c *db.CodeAttribution) {
+	fmt.Fprintln(w, "Code attribution")
+	for _, source := range c.Sources {
+		printCodeAttributionSource(w, source)
+	}
+	fmt.Fprintln(w)
+}
+
+func printCodeAttributionSource(w io.Writer, s db.CodeAttributionSource) {
+	fmt.Fprintf(w, "  Source:             %s\n", s.Provider)
+	if s.Status != "" {
+		fmt.Fprintf(w, "  Status:             %s\n", s.Status)
+	}
+	if s.Scope != "" {
+		fmt.Fprintf(w, "  Scope:              %s\n", s.Scope)
+	}
+	for _, warning := range s.Warnings {
+		fmt.Fprintf(w, "  Warning:            %s\n", warning)
+	}
+	switch s.Status {
+	case "unavailable", "error", "unsupported_filter":
+		return
+	case "empty":
+		fmt.Fprintln(w, "  Records:            none in window")
+		return
+	}
+	if s.Provider == "cursor" && s.Metrics != nil {
+		printCursorAttributionMetrics(w, s.Metrics)
+	}
+}
+
+func printCursorAttributionMetrics(w io.Writer, c *db.CursorAttributionMetrics) {
+	fmt.Fprintf(w, "  Scored commits:      %s\n",
+		fmtInt64(c.ScoredCommits))
+	fmt.Fprintf(w, "  Lines added/deleted: %s / %s\n",
+		fmtInt64(c.LinesAdded), fmtInt64(c.LinesDeleted))
+	fmt.Fprintf(w, "  Tab lines:           +%s / -%s\n",
+		fmtInt64(c.TabLinesAdded), fmtInt64(c.TabLinesDeleted))
+	fmt.Fprintf(w, "  Composer lines:      +%s / -%s\n",
+		fmtInt64(c.ComposerLinesAdded), fmtInt64(c.ComposerLinesDeleted))
+	fmt.Fprintf(w, "  Human lines:         +%s / -%s\n",
+		fmtInt64(c.HumanLinesAdded), fmtInt64(c.HumanLinesDeleted))
+	fmt.Fprintf(w, "  Blank lines:         +%s / -%s\n",
+		fmtInt64(c.BlankLinesAdded), fmtInt64(c.BlankLinesDeleted))
+	fmt.Fprintf(w, "  AI-authored pct:     %.1f%%\n",
+		c.AIAuthoredPct*100)
+	if len(c.ConversationCounts) > 0 {
+		fmt.Fprintln(w, "  Conversation counts")
+		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+		for _, entry := range c.ConversationCounts {
+			model := entry.Model
+			if model == "" {
+				model = "(empty)"
+			}
+			mode := entry.Mode
+			if mode == "" {
+				mode = "(empty)"
+			}
+			fmt.Fprintf(tw, "    %s / %s\t%s\n",
+				model, mode, fmtInt64(entry.Count))
+		}
+		tw.Flush()
+	}
 }
 
 // formatGrades renders a grade histogram in canonical A..F order so

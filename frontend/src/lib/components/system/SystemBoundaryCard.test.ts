@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vite-plus/test";
 import { mount, unmount } from "svelte";
 // @ts-ignore
 import SystemBoundaryCard from "./SystemBoundaryCard.svelte";
@@ -47,9 +47,7 @@ describe("SystemBoundaryCard", () => {
     // <details> contains the full content; hidden until expanded.
     const details = document.body.querySelector("details");
     expect(details).toBeTruthy();
-    expect(details?.querySelector("pre")?.textContent).toBe(
-      "line one\nline two\nline three",
-    );
+    expect(details?.querySelector("pre")?.textContent).toBe("line one\nline two\nline three");
     unmount(c);
   });
 });

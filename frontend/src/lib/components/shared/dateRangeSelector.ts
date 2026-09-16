@@ -1,3 +1,5 @@
+import { daysAgo, localDateStr, today } from "../../utils/dates.js";
+
 export interface DateRange {
   from: string;
   to: string;
@@ -8,7 +10,7 @@ export interface DateRangePreset {
   days: number;
 }
 
-export const DATE_RANGE_PRESETS: DateRangePreset[] = [
+const DATE_RANGE_PRESETS: DateRangePreset[] = [
   { label: "7d", days: 7 },
   { label: "30d", days: 30 },
   { label: "90d", days: 90 },
@@ -16,21 +18,10 @@ export const DATE_RANGE_PRESETS: DateRangePreset[] = [
   { label: "All", days: 0 },
 ];
 
-export function localDateStr(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-export function daysAgo(n: number): string {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  return localDateStr(d);
-}
+export { daysAgo, localDateStr };
 
 export function todayStr(): string {
-  return localDateStr(new Date());
+  return today();
 }
 
 export function allFromDate(earliestSession: string | null | undefined): string {
@@ -40,12 +31,15 @@ export function allFromDate(earliestSession: string | null | undefined): string 
   return daysAgo(365);
 }
 
-export function presetRange(
-  days: number,
-  earliestSession: string | null | undefined,
-): DateRange {
+/**
+ * "Last N days" spans N calendar days inclusive of today — today plus the
+ * N−1 preceding dates. Matches kit-ui's RangePicker, which seeds the Custom
+ * tab and labels presets with the same semantics, and rollingRange() in
+ * utils/dates.ts.
+ */
+export function presetRange(days: number, earliestSession: string | null | undefined): DateRange {
   return {
-    from: days === 0 ? allFromDate(earliestSession) : daysAgo(days),
+    from: days === 0 ? allFromDate(earliestSession) : daysAgo(days - 1),
     to: todayStr(),
   };
 }
@@ -58,4 +52,25 @@ export function isPresetActive(
 ): boolean {
   const range = presetRange(days, earliestSession);
   return from === range.from && to === range.to;
+}
+
+export function activePresetDays(
+  from: string,
+  to: string,
+  earliestSession: string | null | undefined,
+  rollingDays?: number | null,
+  isPinned?: boolean,
+): number | null {
+  if (!isPinned && rollingDays != null) {
+    return rollingDays;
+  }
+
+  const matches = DATE_RANGE_PRESETS.filter((preset) =>
+    isPresetActive(from, to, preset.days, earliestSession),
+  );
+  if (matches.length === 0) return null;
+
+  const all = matches.find((preset) => preset.days === 0);
+  if (all) return all.days;
+  return matches[0]?.days ?? null;
 }
