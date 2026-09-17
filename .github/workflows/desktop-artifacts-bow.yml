@@ -17,10 +17,10 @@ concurrency:
 jobs:
   build:
     name: Desktop Build (${{ matrix.name }})
-    runs-on: 
-      - ${{ matrix.os }}-with-cache
-      - nscloud-cache-size-50gb
-      - nscloud-cache-tag-agentsview-bow
+    runs-on: namespace-profile-windows-8cpu
+      # - ${{ matrix.os }}-with-cache
+      # - nscloud-cache-size-50gb
+      # - nscloud-cache-tag-agentsview-bow
     env:
       AGENTSVIEW_VERSION: ${{ inputs.version }}
       AGENTSVIEW_TARGET_TRIPLE: ${{ matrix.target_triple }}    
@@ -34,13 +34,13 @@ jobs:
             target_triple: ""
             artifact_name: agentsview-desktop-windows
             artifact_dir: desktop/src-tauri/target/release/bundle/nsis/
-          - name: macOS (aarch64)
-            os: macos-15
-            runner_arch: ARM64
-            bundle: app
-            target_triple: aarch64-apple-darwin
-            artifact_name: agentsview-desktop-macos-aarch64
-            artifact_dir: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
+          # - name: macOS (aarch64)
+          #   os: macos-15
+          #   runner_arch: ARM64
+          #   bundle: app
+          #   target_triple: aarch64-apple-darwin
+          #   artifact_name: agentsview-desktop-macos-aarch64
+          #   artifact_dir: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
