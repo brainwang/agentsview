@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build:
     name: Desktop Build (${{ matrix.name }})
-    runs-on: namespace-profile-windows-8cpu
+    runs-on: ${{ matrix.os }}
       # - ${{ matrix.os }}-with-cache
       # - nscloud-cache-size-50gb
       # - nscloud-cache-tag-agentsview-bow
@@ -49,7 +49,7 @@ jobs:
 
       - uses: ./.github/actions/build-desktop-artifact
         with:
-          namespace-cache: ${{ matrix.name != 'Linux (arm64)' }}
+          namespace-cache: false
           bundle: ${{ matrix.bundle }}
           target_triple: ${{ matrix.target_triple }}
           artifact_name: ${{ matrix.artifact_name }}
