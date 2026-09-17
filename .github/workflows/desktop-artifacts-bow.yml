@@ -17,7 +17,10 @@ concurrency:
 jobs:
   build:
     name: Desktop Build (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}-with-cache
+    runs-on: 
+      - ${{ matrix.os }}-with-cache
+      - nscloud-cache-size-50gb
+      - nscloud-cache-tag-agentsview-desktop
     env:
       AGENTSVIEW_VERSION: ${{ inputs.version }}
       AGENTSVIEW_TARGET_TRIPLE: ${{ matrix.target_triple }}    
