@@ -259,12 +259,47 @@ v0.43.0 的 `downloadAuthenticatedExport` 在本地连接（无 token）时使�
 
 ---
 
+### 8. HTML 导出补充结构化工具调用（修复 Markdown 与 HTML 不一致）
+
+**功能描述：**
+修复 HTML 导出缺少工具调用（Tool Calls）的问题。之前 Markdown 导出通过 `msg.ToolCalls` 结构化字段渲染工具调用，但 HTML 导出只通过 `toolBlockRe` 正则匹配 `msg.Content` 文本中的内联 `[ToolName]...` 标记。当工具调用只存进数据库 `tool_calls` 表、未以内联标记写进消息正文时（如 OpenCode/Codefree-O、Codex 等 agent），HTML 导出就看不到工具调用，与 Markdown 导出不一致。
+
+现在 HTML 导出也读取 `msg.ToolCalls` 结构化字段，在每条消息内容后以可折叠的 `<details>` 块渲染工具调用，包含工具类别、名称、格式化的输入 JSON 和输出结果。同时把 Thinking 复选框默认设为 `checked`，使 thinking-only 消息（通常包含工具调用）默认可见。
+
+**修改文件：**
+
+- `internal/server/export.go`
+  - `exportMessage` 结构体新增 `ToolCalls []exportToolCall` 字段
+  - 新增 `exportToolCall` 结构体，包含 `Category`、`Name`、`InputHTML`、`Output`、`HasOutput` 字段
+  - 新增 `buildExportToolCalls()`：把 `[]db.ToolCall` 投影为 `[]exportToolCall`
+  - 新增 `toolCallOutput()`：优先取 `ResultContent`，为空时回退到 `ResultEvents` 拼接
+  - 新增 `formatToolInputForExport()`：用 `json/v2` + `jsontext.WithIndent` 把 InputJSON 美化为缩进 JSON，失败时回退为转义原文
+  - `generateExportHTML()` 中为每条消息填充 `ToolCalls: buildExportToolCalls(m.ToolCalls)`
+  - HTML 模板消息 `<div>` 内 `{{.ContentHTML}}` 之后新增 `{{range .ToolCalls}}` 渲染 `<details class="tool-call-block">`，summary 显示类别+名称，body 显示 input（缩进 JSON）和 output
+  - CSS 新增 `.tool-call-block`、`.tool-call-header`、`.tool-call-cat`、`.tool-call-name`、`.tool-call-body`、`.tool-call-section`、`.tool-call-label`、`.tool-call-pre` 样式
+  - `thinking-toggle` 复选框增加 `checked` 属性，默认展开 Thinking 内容
+  - 新增 `encoding/json/jsontext` import（用于 `WithIndent` 选项）
+
+- `internal/server/export_test.go`
+  - 新增 `TestGenerateExportHTML_ToolCalls`：验证有 ResultContent 的 tool call 正确渲染（类别、名称、input JSON、output）
+  - 新增 `TestGenerateExportHTML_ToolCallsWithoutInlineContentMarker`：验证当 `msg.Content` 不含内联 `[ToolName]` 标记时，结构化 `msg.ToolCalls` 仍能渲染到 HTML（原始 bug 的核心场景）
+  - 新增 `TestGenerateExportHTML_ToolCallsFallsBackToResultEvents`：验证 `ResultContent` 为空时从 `ResultEvents` 拼接 output
+
+**影响范围：**
+- HTML 导出文件现在包含所有工具调用的输入参数和输出结果，与 Markdown 导出对齐
+- 工具调用以可折叠的 `<details>` 元素呈现，默认折叠
+- 输入参数格式化为缩进的 JSON，输出结果优先取 `ResultContent`，回退到 `ResultEvents`
+- Thinking blocks 和 thinking-only 消息默认显示，用户仍可点击 "Thinking" 按钮隐藏
+- 适用于所有 agent（OpenCode/Codefree-O、Codex、Claude Code 等）
+
+---
+
 ### 本次未迁移的 bow-0.29.0 定制（v0.43.0 已有等价实现或不再适用）
 
 | bow-0.29.0 定制 | 未迁移原因 |
 |------|------|
 | OpenCode 工具输出提取（`ParsedToolResult`/`ToolResults`） | v0.43.0 的 `opencode.go` 已通过 `ResultEvents` 机制实现工具输出提取 |
-| HTML 导出结构化工具调用块（`<details>` + `exportToolCall`） | v0.43.0 的 `export.go` 已通过 `toolBlockRe` 正则解析消息内容渲染工具块 |
+| HTML 导出结构化工具调用块（`<details>` + `exportToolCall`） | 已在本次修复中实现（见上方第 8 项），适配 v0.43.0 的 `db.ToolCall` 结构 |
 | `db.go` dataVersion 27 → 28 | v0.43.0 已是 dataVersion 108，无需再 bump |
 | `AGENTS.md` → `AGENTS.md.NA` 重命名 | v0.43.0 的 AGENTS.md 内容已演进，不再适用 |
 

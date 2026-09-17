@@ -378,6 +378,117 @@ func TestGenerateExportHTML_Structure(t *testing.T) {
 	})
 }
 
+func TestGenerateExportHTML_ToolCalls(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.MessageCount = 1
+	})
+	msgs := []db.Message{
+		{
+			SessionID:  "test-id",
+			Ordinal:    0,
+			Role:       "assistant",
+			Content:    "Running a command.",
+			Timestamp:  "2025-01-15T10:00:00Z",
+			HasToolUse: true,
+			ToolCalls: []db.ToolCall{{
+				ToolName:      "Bash",
+				Category:      "Bash",
+				ToolUseID:     "toolu_1",
+				InputJSON:     `{"command":"echo hello"}`,
+				ResultContent: "hello\n",
+			}},
+		},
+	}
+
+	html := generateExportHTML(session, msgs)
+
+	assertContainsAll(t, html, []string{
+		`<details class="tool-call-block">`,
+		`<summary class="tool-call-header">`,
+		`<span class="tool-call-cat">Bash</span>`,
+		`<span class="tool-call-name">Bash</span>`,
+		`<div class="tool-call-label">input</div>`,
+		`<pre class="tool-call-pre">`,
+		`&#34;command&#34;: &#34;echo hello&#34;`,
+		`<div class="tool-call-label">output</div>`,
+		"hello",
+	})
+}
+
+func TestGenerateExportHTML_ToolCallsWithoutInlineContentMarker(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.MessageCount = 1
+	})
+	// Content carries no [Bash] inline marker, so the toolBlockRe
+	// regex on Content alone would miss the tool call. The structured
+	// msg.ToolCalls must drive the rendering.
+	msgs := []db.Message{
+		{
+			SessionID:  "test-id",
+			Ordinal:    0,
+			Role:       "assistant",
+			Content:    "Let me check the file.",
+			Timestamp:  "2025-01-15T10:00:00Z",
+			HasToolUse: true,
+			ToolCalls: []db.ToolCall{{
+				ToolName:      "Read",
+				Category:      "Read",
+				ToolUseID:     "toolu_2",
+				InputJSON:     `{"path":"src/main.go"}`,
+				ResultContent: "package main\n",
+			}},
+		},
+	}
+
+	html := generateExportHTML(session, msgs)
+
+	assertContainsAll(t, html, []string{
+		`<details class="tool-call-block">`,
+		`<span class="tool-call-cat">Read</span>`,
+		`<span class="tool-call-name">Read</span>`,
+		`&#34;path&#34;: &#34;src/main.go&#34;`,
+		"package main",
+	})
+}
+
+func TestGenerateExportHTML_ToolCallsFallsBackToResultEvents(t *testing.T) {
+	t.Parallel()
+	session := testSession(func(s *db.Session) {
+		s.MessageCount = 1
+	})
+	// ResultContent is empty; output should come from ResultEvents.
+	msgs := []db.Message{
+		{
+			SessionID:  "test-id",
+			Ordinal:    0,
+			Role:       "assistant",
+			Content:    "Working.",
+			Timestamp:  "2025-01-15T10:00:00Z",
+			HasToolUse: true,
+			ToolCalls: []db.ToolCall{{
+				ToolName:  "Bash",
+				Category:  "Bash",
+				ToolUseID: "toolu_3",
+				InputJSON: `{"command":"ls"}`,
+				ResultEvents: []db.ToolResultEvent{{
+					ToolUseID: "toolu_3",
+					Content:   "file1.txt\nfile2.txt",
+				}},
+			}},
+		},
+	}
+
+	html := generateExportHTML(session, msgs)
+
+	assertContainsAll(t, html, []string{
+		`<span class="tool-call-cat">Bash</span>`,
+		"file1.txt",
+		"file2.txt",
+	})
+}
+
 func TestGenerateExportHTML_ThinkingOnlyClass(t *testing.T) {
 	t.Parallel()
 	session := testSession(func(s *db.Session) {
