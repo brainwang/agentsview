@@ -2996,3 +2996,68 @@ preservation of archived messages for OpenCode, Kilo, MiMoCode, and Icodemate.
 [evener-source-3]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/llm/types.go
 [evener-source-4]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/schema/snapshot.go
 [evener-source-5]: https://github.com/prime-radiant-inc/evener/blob/da7c06396c9848abfae362dcffce3861a6a0c95a/agent/fork.go
+
+## TeleAgent (`teleagent`)
+
+- **Format:** Per-user SQLite archive at
+  `<data_dir>/users/<user_id>/teleagent.db` with three normalized tables:
+  `session` (id, title, directory, parent_id, time_created, time_updated,
+  plus project_id/slug/version/share_url/summary_* columns the parser does
+  not read), `message` (id, session_id, data JSON, time_created,
+  time_updated), and `part` (id, session_id, message_id, data JSON,
+  time_created, time_updated). The `message.data` JSON carries role,
+  model, provider, time, tokens, cost, and finish fields; the `part.data`
+  JSON carries a `type` enum (`text`, `reasoning`, `tool`, `step-start`,
+  `step-finish`, `compaction`, `file`). Tool parts are self-contained:
+  `callID` + `tool` + `state.{status,input,error}` + `output` +
+  `metadata.filepath` pack the call and its result in one row.
+
+- **Evidence:** `documentation` plus a real archive observation.
+
+- **Upstream:** TeleAgent (TeleAI 星辰超级智能体) is a local Electron
+  desktop agent. The schema reference at
+  `ref/teleagent-task-share/references/db-schema.md` documents the
+  three-table layout, the `part.data.type` enum, the self-contained `tool`
+  part structure, the `message.data` token/cost block, and the
+  `_SYS_MEMORY_*` session filter. No first-party source code is published;
+  the reference was produced from the export/import workflow documented in
+  `ref/teleagent-task-share/SKILL.md`.
+
+- **Observation:** A real archive on this machine
+  (`v1_public_1903020978903908355`, observed 2026-09-18) contained 246
+  sessions, 4233 messages, 14527 parts, and 54 MB. 177 of 246 sessions
+  were `_SYS_MEMORY_DAILY_LOG_` (118) and `_SYS_MEMORY_MERGE_` (59)
+  system-maintenance rows filtered at discovery and parse time; 69 of 246
+  were real user sessions (56 top-level + 13 subagent-spawned via the
+  `task` tool with `parent_id` set). The `finish` field carried both
+  `tool_calls` (2384 messages) and `tool-calls` (785 messages) spellings,
+  confirming a TeleAgent client-version transition; the parser normalizes
+  both to `tool_calls`. 47 distinct tool names were observed, including
+  17 `cua-driver_*` and 8 `playwright_browser_*` family members mapped by
+  prefix.
+
+- **Usage and cost:** AgentsView maps `data.tokens.input` +
+  `data.tokens.cache.read` to `ContextTokens`, `data.tokens.output` to
+  `OutputTokens`, and preserves the raw `data.tokens` JSON on
+  `TokenUsage`. Session rollups use `accumulateMessageTokenUsageContext`.
+  `data.cost` is carried in the tokens JSON for downstream attribution
+  but not separately parsed in Phase 1.
+
+- **Agentsview:** `internal/parser/teleagent.go` (parse loop and
+  per-message builders), `internal/parser/teleagent_sqlite.go`
+  (read-only SQLite store with per-session meta listing, row loading,
+  fingerprint helper, and `VirtualSourcePath` integration), and
+  `internal/parser/teleagent_provider.go` (Provider interface
+  implementation with `Discover`/`FindSource`/`Fingerprint`/`Parse`/
+  `WatchPlan`/`SourcesForChangedPath`, two `SourceKind`s
+  `teleagentSourceSQLiteDB` and `teleagentSourceSQLiteSession`, modeled
+  on `kiro_provider.go`). `_SYS_` sessions are filtered at the SQL level
+  (`title NOT LIKE '_SYS\_%' ESCAPE '\' AND title != ''`). Configured
+  roots point at the `users/` parent; the provider auto-discovers the
+  first user subdirectory that contains a `teleagent.db`. Subagent
+  lineage is mapped via `parent_id` to `ParentSessionID` +
+  `RelSubagent`. The SQLite container is a persistent archive: a
+  vanished DB file preserves stored rows (skip without `ForceReplace`),
+  while a vanished row in a present DB force-replaces (tombstones the
+  stored session). `TestTeleAgentProvider_VanishedDBPreservesRows` and
+  `TestTeleAgentProvider_VanishedRowForceReplaces` verify both paths.

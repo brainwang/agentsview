@@ -53,6 +53,7 @@ type testEnv struct {
 	traeDir           string
 	windsurfDir       string
 	antigravityCLIDir string
+	teleagentDir      string
 	db                *db.DB
 	engine            *sync.Engine
 }
@@ -282,6 +283,8 @@ func assignFocusedAgentDir(
 		env.windsurfDir = dir
 	case parser.AgentAntigravityCLI:
 		env.antigravityCLIDir = dir
+	case parser.AgentTeleAgent:
+		env.teleagentDir = dir
 	default:
 		t.Fatalf("unsupported focused test fixture for %s", agent)
 	}

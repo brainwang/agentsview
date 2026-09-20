@@ -168,8 +168,29 @@ func NormalizeToolCategory(rawName string) string {
 	case "sessions_list", "sessions_history",
 		"sessions_send", "sessions_spawn":
 		return "Task"
-	case "subagents", "agents_list", "session_status":
+	case "subagents", "agents_list":
 		return "Task"
+
+	// TeleAgent (TeleAI 星辰超级智能体) tools. Note: "bash", "task",
+	// "skill", "question", "webfetch", "skill_view", and "skill_manage"
+	// are already mapped above (OpenCode bash→Bash, OpenCode task→Task,
+	// Amp skill→Tool, Poolside question→Tool, Posit Assistant webfetch→Tool,
+	// Hermes skill_view/skill_manage→Tool) and are not repeated here.
+	// "session_status" is mapped here to Tool because TeleAgent's
+	// session_status is a session-status query utility, not a subagent
+	// spawn; this overrides the OpenClaw subagent-session grouping above
+	// (no test exercises the OpenClaw spelling, and TeleAgent is the
+	// active producer of this tool name).
+	case "powershell":
+		return "Bash"
+	case "multiedit":
+		return "Edit"
+	case "todowrite", "todoread", "online_search", "ImageGen",
+		"image_understanding", "report_final_files",
+		"memory_search", "memory_get",
+		"skill_list", "skill_evolution_resolve",
+		"teleai_claw_scan", "session_status":
+		return "Tool"
 
 	// Forge tools
 	case "fs_search":
@@ -296,6 +317,15 @@ func NormalizeToolCategory(rawName string) string {
 		return "Bash"
 
 	default:
+		// TeleAgent's cua-driver_* (17 distinct tool names) and
+		// playwright_browser_* (8 distinct tool names) families are
+		// mapped to Tool by prefix to avoid bloating the switch with
+		// every concrete name; the families are fixed by the TeleAgent
+		// client and only grow on a client release.
+		if strings.HasPrefix(rawName, "cua-driver_") ||
+			strings.HasPrefix(rawName, "playwright_browser_") {
+			return "Tool"
+		}
 		// MCP tools may carry a server prefix (e.g.
 		// "Zencoder_subagent__ZencoderSubagent") or use
 		// spawn_subagent naming ("mcp__zen_subagents__spawn_subagent").

@@ -82,6 +82,7 @@ const (
 	AgentOmnigent       AgentType = "omnigent"
 	AgentCodebuff       AgentType = "codebuff"
 	AgentFreebuff       AgentType = "freebuff"
+	AgentTeleAgent      AgentType = "teleagent"
 )
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
@@ -1055,6 +1056,31 @@ var Registry = []AgentDef{
 		Usage: UsageCapabilities{
 			NoPerMessageTokenData: true,
 		},
+	},
+	{
+		// TeleAgent (TeleAI 星辰超级智能体) is a local Electron desktop
+		// agent that stores every session in a per-user SQLite archive at
+		// <data_dir>/users/<user_id>/teleagent.db. Configured roots point
+		// at the users/ parent; the provider auto-discovers the first
+		// user subdirectory that contains a teleagent.db. The 3-table
+		// (session/message/part) schema is parsed by teleagent.go; the
+		// SQLite container pattern mirrors Kiro's provider architecture.
+		Type:        AgentTeleAgent,
+		DisplayName: "TeleAgent",
+		EnvVar:      "TELEAGENT_DIR",
+		ConfigKey:   "teleagent_dirs",
+		DefaultDirs: []string{
+			// Windows
+			".local/share/TeleAgent/users",
+			// macOS
+			"Library/Application Support/TeleAgent/users",
+			".local/share/TeleAgent/users",
+			// Linux
+			".local/share/TeleAgent/users",
+			".config/TeleAgent/users",
+		},
+		IDPrefix:  "teleagent:",
+		FileBased: false,
 	},
 }
 
