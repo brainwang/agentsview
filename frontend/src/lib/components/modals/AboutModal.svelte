@@ -44,7 +44,7 @@
     </div>
     <div class="about-row">
       <span class="about-label"></span>
-      <span class="about-value">Bow (Codefree)</span>
+      <span class="about-value">Bow (Codefree-O+TeleAgent)</span>
     </div>
     {#if sync.serverVersion}
       <div class="about-row">
