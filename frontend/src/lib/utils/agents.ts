@@ -112,7 +112,6 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "codebuff", color: "var(--accent-amber)", label: "Codebuff" },
   { name: "freebuff", color: "var(--accent-sky)", label: "Freebuff" },
   {
-  {
     name: "crush",
     color: "var(--accent-coral)",
     label: "Charm Crush",
