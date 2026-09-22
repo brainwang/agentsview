@@ -79,6 +79,7 @@ const (
 	AgentReasonix       AgentType = "reasonix"
 	AgentEvener         AgentType = "evener"
 	AgentIcodemate      AgentType = "icodemate"
+	AgentCodefreeO      AgentType = "codefree-o"
 	AgentRooCode        AgentType = "roocode"
 	AgentCline          AgentType = "cline"
 	AgentPoolside       AgentType = "poolside"
@@ -86,6 +87,7 @@ const (
 	AgentCodebuff       AgentType = "codebuff"
 	AgentFreebuff       AgentType = "freebuff"
 	AgentCrush          AgentType = "crush"
+	AgentTeleAgent      AgentType = "teleagent"
 )
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
@@ -293,6 +295,27 @@ var Registry = []AgentDef{
 		},
 		FileBased:      true,
 		WatchRootsFunc: ResolveOpenCodeWatchRoots,
+	},
+	{
+		// Codefree-O is a fork of OpenCode with an identical storage
+		// layout but a different root (".codefree-o/.local/share" so
+		// the on-disk tree is .codefree-o/.local/share/storage/session
+		// and the SQLite fallback is codefree.db) and a codefree-o:
+		// ID prefix. The OpenCode-format provider owns parsing and
+		// relabels results through relabelOpenCodeSessionAsCodefreeO.
+		Type:        AgentCodefreeO,
+		DisplayName: "Codefree-O",
+		EnvVar:      "CODEFREE_O_DIR",
+		ConfigKey:   "codefree_o_dirs",
+		DefaultDirs: []string{".codefree-o/.local/share"},
+		IDPrefix:    "codefree-o:",
+		WatchSubdirs: []string{
+			"storage/session",
+			"storage/message",
+			"storage/part",
+		},
+		FileBased:      true,
+		WatchRootsFunc: ResolveCodefreeOWatchRoots,
 	},
 	{
 		Type:        AgentOpenCodeReview,
@@ -1126,6 +1149,31 @@ var Registry = []AgentDef{
 		// events are not authoritative; periodic reconcile covers
 		// registry and schema churn.
 		PeriodicReconcile: true,
+	},
+	{
+		// TeleAgent (TeleAI 星辰超级智能体) is a local Electron desktop
+		// agent that stores every session in a per-user SQLite archive at
+		// <data_dir>/users/<user_id>/teleagent.db. Configured roots point
+		// at the users/ parent; the provider auto-discovers the first
+		// user subdirectory that contains a teleagent.db. The 3-table
+		// (session/message/part) schema is parsed by teleagent.go; the
+		// SQLite container pattern mirrors Kiro's provider architecture.
+		Type:        AgentTeleAgent,
+		DisplayName: "TeleAgent",
+		EnvVar:      "TELEAGENT_DIR",
+		ConfigKey:   "teleagent_dirs",
+		DefaultDirs: []string{
+			// Windows
+			".local/share/TeleAgent/users",
+			// macOS
+			"Library/Application Support/TeleAgent/users",
+			".local/share/TeleAgent/users",
+			// Linux
+			".local/share/TeleAgent/users",
+			".config/TeleAgent/users",
+		},
+		IDPrefix:  "teleagent:",
+		FileBased: false,
 	},
 }
 

@@ -66,6 +66,8 @@ describe("KNOWN_AGENTS", () => {
       "codebuff",
       "freebuff",
       "crush",
+      "codefree-o",
+      "teleagent",
     ]);
   });
 

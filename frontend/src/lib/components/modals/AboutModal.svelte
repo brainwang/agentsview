@@ -42,6 +42,10 @@
       <span class="about-label">{m.about_author()}</span>
       <span class="about-value">Kenn Software LLC</span>
     </div>
+    <div class="about-row">
+      <span class="about-label"></span>
+      <span class="about-value">Bow (Codefree-O+TeleAgent)</span>
+    </div>
     {#if sync.serverVersion}
       <div class="about-row">
         <span class="about-label">{m.about_version()}</span>

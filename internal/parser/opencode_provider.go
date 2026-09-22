@@ -31,6 +31,10 @@ func newMiMoCodeProviderFactory(def AgentDef) ProviderFactory {
 	return newOpenCodeFormatProviderFactory(def, AgentMiMoCode)
 }
 
+func newCodefreeOProviderFactory(def AgentDef) ProviderFactory {
+	return newOpenCodeFormatProviderFactory(def, AgentCodefreeO)
+}
+
 func newOpenCodeFormatProviderFactory(def AgentDef, agent AgentType) ProviderFactory {
 	spec := openCodeProviderSpecForAgent(agent)
 	index := newOpenCodeFormatSourceIndex()
@@ -165,6 +169,18 @@ func openCodeProviderSpecForAgent(agent AgentType) openCodeProviderSpec {
 			streamSQLiteWatermark: streamOpenCodeSessionWatermarkMetaAs(IcodemateSQLiteVirtualPath),
 			sourceMtime:           IcodemateSourceMtime,
 			relabel:               relabelOpenCodeSessionAsIcodemate,
+		}
+	case AgentCodefreeO:
+		return openCodeProviderSpec{
+			agent:                 AgentCodefreeO,
+			format:                codefreeOFmt,
+			dbName:                codefreeOFmt.dbName,
+			listSQLite:            ListCodefreeOSessionMeta,
+			listSQLiteWatermark:   listOpenCodeSessionWatermarkMetaAs(CodefreeOSQLiteVirtualPath),
+			streamSQLite:          streamOpenCodeSessionMetaAs(CodefreeOSQLiteVirtualPath),
+			streamSQLiteWatermark: streamOpenCodeSessionWatermarkMetaAs(CodefreeOSQLiteVirtualPath),
+			sourceMtime:           CodefreeOSourceMtime,
+			relabel:               relabelOpenCodeSessionAsCodefreeO,
 		}
 	default:
 		return openCodeProviderSpec{}

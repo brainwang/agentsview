@@ -670,6 +670,7 @@ func TestOpenCodePlanKeepsAStorageDescendantProofExact(t *testing.T) {
 func TestOpenCodeFamilyPlansWidenTheirOwnContainers(t *testing.T) {
 	for _, agent := range []AgentType{
 		AgentKilo, AgentMiMoCode, AgentIcodemate,
+		AgentCodefreeO,
 	} {
 		t.Run(string(agent), func(t *testing.T) {
 			root := t.TempDir()

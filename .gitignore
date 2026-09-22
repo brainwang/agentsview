@@ -87,3 +87,8 @@ graphify-out/
 .kata.local.toml
 # roborev snapshots
 /.roborev/
+
+# AI
+.opencode/
+opencode.json
+.codefree/

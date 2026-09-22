@@ -274,15 +274,13 @@ async function downloadAuthenticatedExport(
   request: () => Promise<Response>,
   fallbackFilename: string,
 ): Promise<void> {
+  // Use fetch (not window.open) in both local and remote connections so
+  // the download works inside Tauri's WebView2 (where window.open is
+  // blocked) as well as in regular browsers. Remote connections use the
+  // generated service so the Authorization header avoids token leakage.
   const token = getAuthToken();
-  if (!token) {
-    // Local connection — simple navigation is fine.
-    window.open(`${getGeneratedBase()}${url}`, "_blank");
-    return;
-  }
-  // Remote connection — use fetch with Authorization header
-  // to avoid putting the token in the URL.
-  const res = await request();
+  const res = token ? await request() : await fetch(`${getGeneratedBase()}${url}`);
+
   if (!res.ok) {
     throw new ApiError(res.status, `Export failed: ${res.status}`);
   }

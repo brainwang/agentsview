@@ -189,6 +189,15 @@ type kiroSQLiteTestDB struct {
 	db   *sql.DB
 }
 
+// teleagentSQLiteTestDB manages a TeleAgent SQLite database for tests. It
+// mirrors the production 3-table (session/message/part) layout and lives at
+// <dir>/v1_public_testuser/teleagent.db so the provider's first-user
+// auto-discovery picks it up from the configured users/ parent root.
+type teleagentSQLiteTestDB struct {
+	path string
+	db   *sql.DB
+}
+
 var (
 	openCodeLikeSchemaOnce  stdsync.Once
 	openCodeLikeSchemaBytes []byte
@@ -197,6 +206,10 @@ var (
 	kiroSQLiteSchemaOnce  stdsync.Once
 	kiroSQLiteSchemaBytes []byte
 	errKiroSQLiteSchema   error
+
+	teleagentSQLiteSchemaOnce  stdsync.Once
+	teleagentSQLiteSchemaBytes []byte
+	teleagentSQLiteSchemaErr   error
 
 	antigravityCLISchemaOnce  stdsync.Once
 	antigravityCLISchemaBytes []byte
@@ -268,6 +281,37 @@ const kiroSQLiteSchema = `
 	);
 `
 
+// teleagentSQLiteSchema mirrors the production TeleAgent 3-table layout
+// (session/message/part). The parser reads only the columns it needs; the
+// rest of the production schema (project_id, slug, version, share_url,
+// summary_*, etc.) is omitted because the fixture only exercises the parse
+// and sync path.
+const teleagentSQLiteSchema = `
+	CREATE TABLE session (
+		id TEXT PRIMARY KEY,
+		title TEXT NOT NULL,
+		directory TEXT NOT NULL,
+		parent_id TEXT,
+		time_created INTEGER NOT NULL,
+		time_updated INTEGER NOT NULL
+	);
+	CREATE TABLE message (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL,
+		data TEXT NOT NULL,
+		time_created INTEGER NOT NULL,
+		time_updated INTEGER NOT NULL
+	);
+	CREATE TABLE part (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		data TEXT NOT NULL,
+		time_created INTEGER NOT NULL,
+		time_updated INTEGER NOT NULL
+	);
+`
+
 // createOpenCodeDB creates a minimal OpenCode SQLite database
 // with the required schema (project, session, message, part
 // tables). Returns a handle for inserting test data.
@@ -323,6 +367,84 @@ func (k *kiroSQLiteTestDB) close(t *testing.T) {
 	t.Helper()
 	require.NoError(t, k.db.Close())
 	k.db = nil
+}
+
+// createTeleAgentSQLiteDB creates a TeleAgent SQLite database at
+// <dir>/v1_public_testuser/teleagent.db, mirroring the production users/
+// parent layout so the provider's first-user auto-discovery picks it up.
+// Returns a handle for inserting test data.
+func createTeleAgentSQLiteDB(t *testing.T, dir string) *teleagentSQLiteTestDB {
+	t.Helper()
+	userDir := filepath.Join(dir, "v1_public_testuser")
+	require.NoError(t, os.MkdirAll(userDir, 0o755), "mkdir teleagent user subdir")
+	path := filepath.Join(userDir, "teleagent.db")
+	copySQLiteSchemaTemplate(
+		t, path, "teleagent sqlite", &teleagentSQLiteSchemaOnce,
+		&teleagentSQLiteSchemaBytes, &teleagentSQLiteSchemaErr,
+		teleagentSQLiteSchema,
+	)
+	d, err := sql.Open("sqlite3", path)
+	require.NoError(t, err, "opening teleagent sqlite test db")
+	fixture := &teleagentSQLiteTestDB{path: path, db: d}
+	t.Cleanup(func() {
+		if fixture.db != nil {
+			_ = fixture.db.Close()
+		}
+	})
+	return fixture
+}
+
+// addSession inserts a session row that passes the _SYS_ filter (title does
+// not start with _SYS_ and is non-empty). parentID may be nil for a
+// top-level session.
+func (f *teleagentSQLiteTestDB) addSession(
+	t *testing.T,
+	id, title, directory string, parentID *string,
+	timeCreated, timeUpdated int64,
+) {
+	t.Helper()
+	_, err := f.db.Exec(
+		`INSERT INTO session
+			(id, title, directory, parent_id, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, title, directory, parentID, timeCreated, timeUpdated,
+	)
+	require.NoError(t, err, "insert teleagent session")
+}
+
+func (f *teleagentSQLiteTestDB) addMessage(
+	t *testing.T, id, sessionID, data string, timeCreated int64,
+) {
+	t.Helper()
+	_, err := f.db.Exec(
+		`INSERT INTO message (id, session_id, data, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?)`,
+		id, sessionID, data, timeCreated, timeCreated,
+	)
+	require.NoError(t, err, "insert teleagent message")
+}
+
+func (f *teleagentSQLiteTestDB) addTextPart(
+	t *testing.T, id, sessionID, messageID, text string, timeCreated int64,
+) {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{
+		"type": "text",
+		"text": text,
+	})
+	require.NoError(t, err, "marshal teleagent text part")
+	_, err = f.db.Exec(
+		`INSERT INTO part (id, session_id, message_id, data, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, sessionID, messageID, string(data), timeCreated, timeCreated,
+	)
+	require.NoError(t, err, "insert teleagent part")
+}
+
+func (f *teleagentSQLiteTestDB) deleteSession(t *testing.T, id string) {
+	t.Helper()
+	_, err := f.db.Exec("DELETE FROM session WHERE id = ?", id)
+	require.NoError(t, err, "delete teleagent session")
 }
 
 func copySQLiteSchemaTemplate(
