@@ -68,6 +68,9 @@ type SessionService interface {
 	// case-sensitive substring, ordered by most recent activity and capped by
 	// limit.
 	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
+	// FindSessionIDsByRawSuffix matches an exact stored ID or a literal
+	// colon/tilde-delimited suffix before applying limit.
+	FindSessionIDsByRawSuffix(ctx context.Context, raw string, limit int) ([]string, error)
 	List(ctx context.Context, f ListFilter) (*SessionList, error)
 	Messages(ctx context.Context, id string, f MessageFilter) (*MessageList, error)
 	ToolCalls(ctx context.Context, id string) (*ToolCallList, error)
@@ -159,7 +162,7 @@ type SessionSearchResult struct {
 // ContentSearchRequest is the transport-neutral content-search input.
 type ContentSearchRequest struct {
 	Pattern       string   `json:"pattern"`
-	Mode          string   `json:"mode,omitempty"` // substring|regex|fts|semantic|hybrid
+	Mode          string   `json:"mode,omitempty"` // substring|regex|fts|terms|semantic|hybrid
 	Sources       []string `json:"sources,omitempty"`
 	ExcludeSystem bool     `json:"exclude_system,omitempty"`
 	Reveal        bool     `json:"reveal,omitempty"`
@@ -168,6 +171,7 @@ type ContentSearchRequest struct {
 	Context int `json:"context,omitempty"`
 
 	Project, ExcludeProject, Machine, Agent           string
+	SessionID, GitBranchExact                         string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
 	ExcludeSessionIDs                                 []string

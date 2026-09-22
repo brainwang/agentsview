@@ -1,24 +1,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
+import { attachResponseTiming } from "../api/runtime.js";
 import { analytics } from "./analytics.svelte.js";
 import { sessions } from "./sessions.svelte.js";
 import { AnalyticsService } from "../api/generated/index";
-import { callGenerated } from "../api/runtime.js";
-import type {
-  AnalyticsSummary,
-  ActivityResponse,
-  HeatmapResponse,
-  ProjectsAnalyticsResponse,
-  HourOfWeekResponse,
-  SessionShapeResponse,
-  VelocityResponse,
-  ToolsAnalyticsResponse,
-  SkillsAnalyticsResponse,
-  TopSessionsResponse,
-  SignalsAnalyticsResponse,
-} from "../api/types.js";
 
-vi.mock("../api/runtime.js", () => ({
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+import type {
+  DbAnalyticsSummary as AnalyticsSummary,
+  DbActivityResponse as ActivityResponse,
+  DbHeatmapResponse as HeatmapResponse,
+  DbProjectsAnalyticsResponse as ProjectsAnalyticsResponse,
+  DbHourOfWeekResponse as HourOfWeekResponse,
+  DbSessionShapeResponse as SessionShapeResponse,
+  DbVelocityResponse as VelocityResponse,
+  DbToolsAnalyticsResponse as ToolsAnalyticsResponse,
+  DbSkillsAnalyticsResponse as SkillsAnalyticsResponse,
+  DbTopSessionsResponse as TopSessionsResponse,
+  DbSignalsAnalyticsResponse as SignalsAnalyticsResponse,
+} from "../api/generated/index.js";
+
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
   isAbortError: vi.fn(() => false),
 }));
 
@@ -248,6 +249,10 @@ function resetStore() {
   analytics.signals = null;
   analytics.lastUpdatedAt = null;
   analytics.qualityLastUpdatedAt = null;
+  analytics.lastQueryDurationMs = null;
+  analytics.qualityLastQueryDurationMs = null;
+  analytics.lastQuerySteps = [];
+  analytics.qualityLastQuerySteps = [];
   analytics.hasNewData = false;
   sessions.filters.date = "";
   sessions.filters.dateFrom = "";
@@ -458,6 +463,66 @@ describe("AnalyticsStore freshness state", () => {
 
       expect(analytics.lastUpdatedAt).toBe(new Date("2026-06-15T15:05:00Z").getTime());
       expect(analytics.hasNewData).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records dashboard and Quality query durations separately", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      expect(analytics.lastQueryDurationMs).toBeNull();
+      expect(analytics.qualityLastQueryDurationMs).toBeNull();
+
+      vi.mocked(analyticsService.getApiV1AnalyticsVelocity).mockImplementationOnce(async () => {
+        const sentAt = performance.now();
+        vi.advanceTimersByTime(600);
+        const headersAt = performance.now();
+        vi.advanceTimersByTime(100);
+        const data = makeVelocity();
+        attachResponseTiming(data, { sentAt, headersAt, bodyAt: performance.now() });
+        return data;
+      });
+      await analytics.fetchAll();
+      expect(analytics.lastQueryDurationMs).toBe(700);
+      expect(analytics.qualityLastQueryDurationMs).toBeNull();
+      // One step per panel, in execution order, each with its own timing.
+      expect(analytics.lastQuerySteps.map((step) => step.name)).toEqual([
+        "summary",
+        "activity",
+        "heatmap",
+        "projects",
+        "hourOfWeek",
+        "sessionShape",
+        "velocity",
+        "tools",
+        "skills",
+        "topSessions",
+        "signals",
+      ]);
+      // The velocity request carried phase timings: 600 ms waiting on the
+      // server, 100 ms downloading, applied at once.
+      expect(analytics.lastQuerySteps).toContainEqual({
+        name: "velocity",
+        startMs: 0,
+        durationMs: 700,
+        segments: [
+          { phase: "wait", startMs: 0, durationMs: 600 },
+          { phase: "download", startMs: 600, durationMs: 100 },
+          { phase: "apply", startMs: 700, durationMs: 0 },
+        ],
+      });
+
+      vi.mocked(analyticsService.getApiV1AnalyticsSignals).mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(90);
+        return makeSignals();
+      });
+      await analytics.fetchSignalsForQuality();
+      expect(analytics.qualityLastQueryDurationMs).toBe(90);
+      expect(analytics.qualityLastQuerySteps).toEqual([
+        { name: "signals", startMs: 0, durationMs: 90 },
+      ]);
+      expect(analytics.lastQueryDurationMs).toBe(700);
     } finally {
       vi.useRealTimers();
     }
@@ -1114,13 +1179,6 @@ describe("executeFetch concurrency and error handling", () => {
   });
 
   it("aborts stale panel requests when a newer fetch starts", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    vi.mocked(callGenerated).mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     vi.mocked(analyticsService.getApiV1AnalyticsSummary)
       .mockImplementationOnce(() => new Promise(() => {}))
       .mockResolvedValueOnce(makeSummary());
@@ -1130,18 +1188,15 @@ describe("executeFetch concurrency and error handling", () => {
     void analytics.fetchSummary();
     await Promise.resolve();
 
-    expect(signals[0]).toBeDefined();
-    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      vi.mocked(AnalyticsService.getApiV1AnalyticsSummary).mock.calls[0]?.[1]?.signal,
+    ).toBeDefined();
+    expect(
+      vi.mocked(AnalyticsService.getApiV1AnalyticsSummary).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(true);
   });
 
   it("aborts visible panel requests on teardown", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    vi.mocked(callGenerated).mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     vi.mocked(analyticsService.getApiV1AnalyticsSummary).mockImplementationOnce(
       () => new Promise(() => {}),
     );
@@ -1150,7 +1205,9 @@ describe("executeFetch concurrency and error handling", () => {
     await Promise.resolve();
     analytics.cancelInFlightReads();
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      vi.mocked(AnalyticsService.getApiV1AnalyticsSummary).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(true);
   });
 });
 

@@ -517,6 +517,8 @@
 
       <RefreshControl
         lastUpdatedAt={usage.lastUpdatedAt}
+        queryDurationMs={usage.lastQueryDurationMs}
+        querySteps={usage.lastQuerySteps}
         busy={usage.isQuerying}
         onRefresh={() => usage.fetchAll({ preserveTimeRange: true })}
         label={m.usage_refresh()}

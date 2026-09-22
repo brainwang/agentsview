@@ -103,6 +103,14 @@ server configurations retain their document-count batching until their model and
 provider limits are declared. These settings only shape build and repair
 requests; they do not alter input text or the vector-generation fingerprint.
 
+Any `agentsview` command that loads the config, including `sync` and
+`embeddings build`, fails if `[vector]` or its subtables contain an unknown key.
+This check also applies when vector search is disabled, so a misspelled
+`enabled` key cannot silently leave it off. The error names the key. For a
+per-server key written in the parent `[vector.embeddings]` table, it also names
+`[vector.embeddings.servers.<name>]` as the table that owns it. Fix or remove
+the key before running the command again.
+
 This split exists so you can encode search queries against a fast local server
 while offloading bulk index builds to a bigger remote machine:
 
@@ -528,6 +536,18 @@ and FTS5 rankings. Both present the highest-ranked match from each session, with
 at most one result per session, and remember the selected mode across palette
 openings and browser sessions.
 
+After entering a query, the project selector shows the current project scope. It
+starts with the sidebar project filter; choose **All Projects** to search across
+projects without changing the sidebar.
+
+Use the date-range picker beside the search modes to limit the search to
+sessions active during a relative, calendar, or custom range. The default is
+**All time**. Changing the range reruns the query, and the range stays selected
+when switching search modes. Closing the palette resets it to All time. Semantic
+and Hybrid interpret dates in your browser's timezone; Full text uses UTC. Dates
+filter session activity, not individual message timestamps, so a match from a
+session that overlaps the range can contain an earlier or later message.
+
 Semantic and Hybrid depend on the same enabled `[vector]` configuration and
 active embeddings index described above. If `[vector]` is not configured, the
 palette shows a copyable configuration example plus the build and restart steps.
@@ -653,6 +673,29 @@ these modes — a subagent session structurally has exactly one "user" message
 Substring, regex, and FTS modes keep the existing `--include-children` and
 one-shot behavior unchanged.
 
+### MCP all-terms exchange search
+
+The MCP `search_content` tool also has a `terms` mode for literal multi-term
+recall without an embedding query. It splits `pattern` on whitespace and
+requires every term inside one exchange: a user message plus the assistant run
+that follows it on the same main or sidechain branch. Terms can occur in
+different messages. Tool and system content does not participate, and `%`, `_`,
+and backslashes are ordinary characters rather than wildcard syntax.
+
+Terms results are ordered with top-level exchanges first, then newest session
+activity, with stable session and ordinal tie breaks. `scope=top`, `all`, or
+`subordinate` applies before the final limit. Exact `session_id`, raw
+`git_branch`, project, agent, and UTC date filters use the same SQLite and
+PostgreSQL session scope as semantic and hybrid retrieval.
+
+For a recall request from a known running conversation, pass its full ID as
+`current_session_id`. This excludes that session before the limit and disables
+the broader ten-minute activity guard, so an unrelated recent session remains
+searchable. Limits default to 10 and go up to 50; a value outside that range
+falls back to the default. Responses state the effective mode and scope and
+which default exclusions applied; `next_cursor` is present when another page
+exists.
+
 ### Inline context: `--context N`
 
 ```bash
@@ -710,7 +753,7 @@ of `ordinal_range` to read the whole stretch.
 | Only a building generation exists                                                                       | same message, plus `: index is building: N% complete`                                                                                                        |
 | Active generation's fingerprint no longer matches config (model, dimension, or chunking changed)        | same message, plus `: index is stale (embedding config changed): run 'agentsview embeddings build --full-rebuild'`                                           |
 | Index was built by an incompatible agentsview version (mirror schema mismatch)                          | same message, plus `` : vector index was built by an incompatible version: run `agentsview embeddings build` ``                                              |
-| `--scope` with a lexical mode (or without `--semantic`/`--hybrid`)                                      | CLI: `--scope requires --semantic or --hybrid`; HTTP/MCP: `scope is only supported for semantic and hybrid search modes`                                     |
+| `--scope` with a lexical mode (or without `--semantic`/`--hybrid`)                                      | CLI/HTTP: `scope is only supported for semantic and hybrid search modes`; MCP also supports scope with `terms`                                               |
 | Embeddings endpoint unreachable or timed out                                                            | `[vector.embeddings] request: ...` (the underlying transport error)                                                                                          |
 | Embeddings endpoint returned non-200                                                                    | `[vector.embeddings] status <code>: <body>`                                                                                                                  |
 | Embeddings endpoint returned a non-finite or zero-norm vector                                           | `[vector.embeddings] invalid embedding at index <n>: ...`; correct the endpoint/cache configuration, then run `agentsview embeddings build --repair-invalid` |

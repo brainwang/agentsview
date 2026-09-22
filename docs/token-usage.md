@@ -27,20 +27,31 @@ coding yesterday?" — across multiple coding agents from one archive.
 
 !!! note
 
-    **As of 0.42.0**, usage totals are populated when the source session includes
-    token metadata for **Claude Code**, **Codex**, **Copilot CLI**, **OpenCode** and
-    OpenCode-format forks such as **IcodeMate**, **Kilo**, and **MiMoCode**,
-    **Cursor IDE**, **Posit Assistant**, **Pi**, **Prime Agent**, **Gemini**, **Qwen
-    Code**, **OpenClaw**, **QClaw**, **Hermes**, **WorkBuddy**, **Forge**,
-    **Piebald**, **Antigravity IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual
-    Studio Copilot**, **Mistral Vibe**, **gptme**, and **Amp**.
+    Usage totals are populated when the source session includes token metadata for
+    **Claude Code**, **Codex**, **Copilot CLI**, **OpenCode** and OpenCode-format
+    forks such as **IcodeMate**, **Kilo**, and **MiMoCode**, **Cursor IDE**, **Posit
+    Assistant**, **Pi**, **Prime Agent**, **Gemini**, **Qwen Code**, **OpenClaw**,
+    **QClaw**, **Hermes**, **WorkBuddy**, **Forge**, **Piebald**, **Antigravity
+    IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual Studio Copilot**, **Mistral
+    Vibe**, **gptme**, and **Amp**. Version 0.44.0 also adds coverage for **Cline
+    CLI**, **Tencent CodeBuddy CN**, **Augure Code**, **Augure Desktop 3 beta**, and
+    **Charm Crush**, and reads **DeepSeek Harness** formats through version 3.
 
-    Coverage is opportunistic rather than guaranteed for every session from those
-    agents: rows contribute to cost only when the local transcript includes usable
-    token counts and a model name that can be priced. Other supported agents still
-    appear in the session browser, search, and analytics even when their local logs
-    do not expose token usage. Warp records session-level totals, but those totals
-    are not yet folded into the per-message cost report.
+    Coverage depends on what each agent records. AgentsView uses recorded costs
+    when available; otherwise it estimates cost from usable token counts and a
+    model that can be priced. Sessions still appear in the browser, search, and
+    analytics when their logs do not expose usage. Warp records session-level
+    totals, but those totals are not yet folded into the per-message cost report.
+
+Crush contributes recorded session totals and cost, with no per-message token or
+cache breakdown. Its aggregate usage is attributed to the most recent assistant
+model, so it does not provide a model-by-model account of a session that
+switched models.
+
+Augure Code and Augure Desktop retain recorded usage. Proprietary Augure models
+have no catalog price, so token-based cost estimates remain unpriced unless you
+add [custom model pricing](#custom-model-pricing). Recorded authoritative costs
+are retained when the source provides them.
 
 When an agent filter selects only agents that do not expose per-message token
 rows, AgentsView reports that as an unsupported usage state instead of silently
@@ -726,6 +737,9 @@ to X" still works.
     "cacheCreationTokens": 1172133,
     "cacheReadTokens": 10908442,
     "totalCost": 36.4700
+  },
+  "machine_labels": {
+    "build-host": "Build Host"
   }
 }
 ```
@@ -735,7 +749,13 @@ appears first. Daily entries always emit `modelBreakdowns`, `projectBreakdowns`,
 `agentBreakdowns`, and `machineBreakdowns` as arrays; empty breakdowns are `[]`,
 not omitted. `modelBreakdowns` always includes a row per model. The other three
 arrays are populated when `--breakdown` is passed; the flag also controls
-per-model terminal table output.
+per-model terminal table output. With `--breakdown`, `machine_labels` maps each
+`machineBreakdowns[].machineName` key to its display label and contains only
+keys present in the report. The map is `{}` when
+the archive has no labels or the catalog read fails; failures produce a warning
+on stderr while the report continues. Without `--breakdown`, the field is
+omitted and the command does not read the catalog. Adding this field does not
+change `schema_version`.
 
 ### JSON Contract
 

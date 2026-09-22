@@ -12,13 +12,7 @@
     type SegmentedControlOption,
     type TypeaheadOption,
   } from "@kenn-io/kit-ui";
-  import {
-    activateRecallExtractionGeneration,
-    fetchRecallEntries,
-    fetchRecallExtractionProgress,
-    fetchRecallExtractionStatus,
-    retireRecallExtractionGeneration,
-  } from "../../api/recall.js";
+  import { RecallService } from "../../api/generated/index.js";
   import type {
     RecallEntry,
     RecallEvidence,
@@ -27,7 +21,7 @@
     RecallExtractProgressState,
     RecallExtractionStatus,
   } from "../../api/types/recall.js";
-  import { ApiError, isAbortError } from "../../api/runtime.js";
+  import { ApiError, isAbortError, responseTimingOf, type ResponseTiming } from "../../api/runtime.js";
   import { formatDateTime, m } from "../../i18n/index.js";
   import { ChevronDownIcon, ChevronRightIcon } from "../../icons.js";
   import { router } from "../../stores/router.svelte.js";
@@ -35,6 +29,7 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { LatestRead } from "../../utils/latest-read.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
+  import { queryStepFrom, type QueryStep } from "../../utils/refresh.js";
 
   const ENTRY_TYPES = [
     "fact",
@@ -67,6 +62,23 @@
   let statusFailed = $state(false);
   let entriesUpdatedAt = $state<number | null>(null);
   let statusUpdatedAt = $state<number | null>(null);
+  // Wall-clock ms of the most recent query, request start to data applied:
+  // an entries load on its own, or the entries and status pair on refresh.
+  let queryDurationMs = $state<number | null>(null);
+  let querySteps = $state<QueryStep[]>([]);
+  // What one loader measured when it applied its response. Each loader
+  // returns its own record, or null when it failed or a newer load
+  // superseded it, so a refresh can only publish the requests it made.
+  // `seq` is the loader's start counter at the time, so a refresh can also
+  // tell when a later load has overtaken one of its requests.
+  interface LoadTiming {
+    seq: number;
+    startedAt: number;
+    appliedAt: number;
+    timing: ResponseTiming | undefined;
+  }
+  let entriesLoadSeq = 0;
+  let statusLoadSeq = 0;
   let progress = $state<RecallExtractProgress[]>([]);
   let progressExpanded = $state(false);
   let progressState = $state<"" | RecallExtractProgressState>("");
@@ -162,32 +174,43 @@
     },
   ]);
 
-  async function loadEntries(cursor = "") {
+  // An entries load on its own (a filter change or the next page) reports
+  // itself as the latest query. refreshRecall passes publishTiming=false and
+  // reports the entries and status pair together once both have applied.
+  async function loadEntries(cursor = "", publishTiming = true): Promise<LoadTiming | null> {
+    const seq = ++entriesLoadSeq;
+    const startedAt = performance.now();
     const signal = entriesRead.begin();
     const appending = cursor !== "";
     entriesLoading = true;
     entriesFailed = false;
     try {
-      const page = await fetchRecallEntries({
-        query: query || undefined,
+      const page = await RecallService.getApiV1RecallEntries({
+        limit: 200,
+        q: query || undefined,
         project: project || undefined,
         type: entryType || undefined,
-        sourceRunId: generation || undefined,
-        reviewState: reviewState || undefined,
+        source_run_id: generation || undefined,
+        review_state: reviewState || undefined,
         cursor: cursor || undefined,
-      }, signal);
-      if (!entriesRead.isCurrent(signal)) return;
+      }, { signal });
+      if (!entriesRead.isCurrent(signal)) return null;
       entries = appending
         ? [...entries, ...page.entries]
         : page.entries;
-      nextCursor = page.nextCursor ?? "";
-      resultCap = page.resultCap ?? 0;
+      nextCursor = page.next_cursor ?? "";
+      resultCap = page.result_cap ?? 0;
       entriesUpdatedAt = Date.now();
+      const load = { seq, startedAt, appliedAt: performance.now(), timing: responseTimingOf(page) };
+      if (publishTiming) {
+        queryDurationMs = load.appliedAt - startedAt;
+        querySteps = [queryStepFrom("entries", load.timing, startedAt, load.appliedAt, startedAt)];
+      }
+      return load;
     } catch (error) {
-      if (isAbortError(error) || !entriesRead.isCurrent(signal)) return;
+      if (isAbortError(error) || !entriesRead.isCurrent(signal)) return null;
       if (appending && error instanceof ApiError && error.status === 409) {
-        await loadEntries();
-        return;
+        return loadEntries("", publishTiming);
       }
       if (!appending) {
         entries = [];
@@ -195,24 +218,29 @@
         resultCap = 0;
         entriesFailed = true;
       }
+      return null;
     } finally {
       if (entriesRead.finish(signal)) entriesLoading = false;
     }
   }
 
-  async function loadStatus() {
+  async function loadStatus(): Promise<LoadTiming | null> {
+    const seq = ++statusLoadSeq;
+    const startedAt = performance.now();
     const signal = statusRead.begin();
     statusLoading = true;
     statusFailed = false;
     try {
-      const next = await fetchRecallExtractionStatus(signal);
-      if (!statusRead.isCurrent(signal)) return;
+      const next = await RecallService.getApiV1RecallExtractionStatus({ signal });
+      if (!statusRead.isCurrent(signal)) return null;
       status = next;
       statusUpdatedAt = Date.now();
+      return { seq, startedAt, appliedAt: performance.now(), timing: responseTimingOf(next) };
     } catch (error) {
-      if (isAbortError(error) || !statusRead.isCurrent(signal)) return;
+      if (isAbortError(error) || !statusRead.isCurrent(signal)) return null;
       status = null;
       statusFailed = true;
+      return null;
     } finally {
       if (statusRead.finish(signal)) statusLoading = false;
     }
@@ -224,16 +252,17 @@
     progressLoading = true;
     progressFailed = false;
     try {
-      const page = await fetchRecallExtractionProgress({
+      const page = await RecallService.getApiV1RecallExtractionProgress({
+        limit: 50,
         generation: status?.fingerprint || undefined,
         state: progressState || undefined,
         cursor: cursor || undefined,
-      }, signal);
+      }, { signal });
       if (!progressRead.isCurrent(signal)) return;
       progress = appending
         ? [...progress, ...page.progress]
         : page.progress;
-      progressNextCursor = page.nextCursor ?? "";
+      progressNextCursor = page.next_cursor ?? "";
     } catch (error) {
       if (isAbortError(error) || !progressRead.isCurrent(signal)) return;
       if (!appending) {
@@ -254,7 +283,24 @@
   }
 
   async function refreshRecall() {
-    await Promise.all([loadEntries(), loadStatus()]);
+    const startedAt = performance.now();
+    const [entriesLoad, statusLoad] = await Promise.all([loadEntries("", false), loadStatus()]);
+    // Only a refresh whose own two requests both applied, and were not
+    // overtaken by a later load while the other was still in flight, counts
+    // as a completed query. Otherwise the previous duration and timeline
+    // stay, which after a filter change is that load's own timeline.
+    if (
+      entriesLoad !== null &&
+      statusLoad !== null &&
+      entriesLoad.seq === entriesLoadSeq &&
+      statusLoad.seq === statusLoadSeq
+    ) {
+      queryDurationMs = performance.now() - startedAt;
+      querySteps = [
+        queryStepFrom("entries", entriesLoad.timing, entriesLoad.startedAt, entriesLoad.appliedAt, startedAt),
+        queryStepFrom("status", statusLoad.timing, statusLoad.startedAt, statusLoad.appliedAt, startedAt),
+      ];
+    }
     if (progressExpanded) await loadProgress();
   }
 
@@ -287,9 +333,9 @@
     generationActionError = "";
     try {
       if (action.kind === "activate") {
-        await activateRecallExtractionGeneration();
+        await RecallService.postApiV1RecallExtractionActivate();
       } else {
-        await retireRecallExtractionGeneration(action.generation.fingerprint);
+        await RecallService.postApiV1RecallExtractionGenerationsByFingerprintRetire({ fingerprint: action.generation.fingerprint });
       }
       await refreshRecall();
       generationAction = null;
@@ -408,6 +454,8 @@
       {/if}
       <RefreshControl
         {lastUpdatedAt}
+        {queryDurationMs}
+        {querySteps}
         busy={entriesLoading || statusLoading || progressLoading}
         onRefresh={refreshRecall}
         label={m.shared_refresh()}
