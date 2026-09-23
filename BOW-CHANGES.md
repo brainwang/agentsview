@@ -322,3 +322,71 @@ v0.43.0 的 `downloadAuthenticatedExport` 在本地连接（无 token）时使�
 2. 重启服务，Codefree-O 会话将被自动发现并同步
 3. 桌面端需重新构建以应用启动更新检查和导出下载的修改
 
+## 20260923
+
+将 bow-v0.43.0 相对 v0.43.0 的全部定制（14 个提交）合并到 bow-v0.44.0 分支，
+并修复 DeepSeek Harness 在界面上错误显示 agentPreset 预设名的问题。
+
+### 1. 将 bow-v0.43.0 定制合并到 bow-v0.44.0
+
+**功能描述：**
+bow-v0.44.0 升级到 v0.44.0 基线，但未携带 bow-v0.43.0 的定制功能。`bow-v0.43.0` 与 `bow-v0.44.0` 均从合并基点 `9be7745a` 分叉（前者走定制方向，后者走升级方向），因此以一次三方 merge 把定制功能整体落到 v0.44.0 基线上，包含 TeleAgent provider、Codefree-O agent、桌面构建工作流、Windows NSIS 安装脚本、HTML 导出结构化工具调用、以及相关 openspec 产物。
+
+**合并冲突解决：**
+
+- `internal/parser/types.go`、`provider_migration.go`、`frontend/src/lib/utils/agents.ts`
+  - 同时保留 v0.44.0 新增的 Crush 和 bow 新增的 Codefree-O、TeleAgent 两个 agent（常量、Registry 条目、迁移模式、前端 KNOWN_AGENTS 列表）
+- `internal/sync/engine.go`
+  - 沿用 v0.44.0 给 OpenCode-format `*SourceMtime` 函数加的 `ctx` 参数签名，并为 `CodefreeOSourceMtime` 穿透 ctx
+- `internal/parser/codefreeo.go`
+  - `CodefreeOSourceMtime` 改为 `(ctx context.Context, sourcePath string)` 并向 `openCodeSQLiteSessionMtime` 传 ctx（v0.44.0 已给该 helper 加了 ctx 参数）
+- `internal/server/export.go`
+  - 同时保留 v0.44.0 的 `errors` import 和 bow 的 `encoding/json/jsontext` import（结构化工具调用渲染用到后者）
+- `frontend/src/lib/api/client.ts`
+  - 保留 v0.44.0 的三参数 `downloadAuthenticatedExport(url, request, fallbackFilename)` 签名，但本地连接改用 `fetch` 而非 `window.open`，以保留 bow 在 Tauri WebView2 下的导出下载修复
+- `frontend/src/lib/utils/agents.test.ts`
+  - `KNOWN_AGENTS` 名称数组同时加入 `crush`、`codefree-o`、`teleagent`
+
+**影响范围：**
+- bow-v0.44.0 现在同时具备 v0.44.0 升级内容和 bow 定制功能
+- TeleAgent、Codefree-O 会话在 v0.44.0 基线上被发现、解析、显示
+- 桌面端导出下载在 Tauri WebView2 下正常工作
+
+---
+
+### 2. 修复 DeepSeek Harness 界面显示为 agentPreset 预设名
+
+**功能描述：**
+DeepSeek Harness 会话在界面（侧栏、会话面包屑）上显示为 "standard" 等预设名，而非注册表标签 "DeepSeek Harness"。根因是后端 parser 把日志 header / `agent-preset/selected` 事件里的 `agentPreset` 预设名（standard / coding / minimal 等）直接写进了会话的 `AgentLabel` 字段，前端 `agentLabel(agent, override)` 在 override 非空时原样返回，于是预设名盖过了注册表标签。
+
+置空 `AgentLabel`，让前端回退到 `KNOWN_AGENTS` 注册表标签 "DeepSeek Harness"。预设事件仍由 `validateDeepSeekHarnessSemanticEvent` 独立校验，行为不变。
+
+**修改文件：**
+
+- `internal/parser/deepseek_harness.go`
+  - 移除 `latestAgentPreset` 局部变量及其三处赋值（header 初始化、`agent-preset/selected` 事件处理、scan 后回填）
+  - 移除 `consumeEvent` 中 `agent-preset/selected` 的提取分支（校验仍由 `validateDeepSeekHarnessSemanticEvent` 完成）
+  - `ParsedSession` 构造不再设置 `AgentLabel`（留空，回退到前端注册表标签）
+
+- `internal/parser/deepseek_harness_test.go`
+  - 三处 `session.AgentLabel` 断言由预设名（"coding" / "minimal"）改为 `""`
+
+**影响范围：**
+- DeepSeek Harness 会话在界面显示为注册表标签 "DeepSeek Harness"，不再显示 agentPreset 预设名
+- `agentPreset` 字段仍被解析和校验，仅不再作为显示标签
+- 需要重新同步现有 DeepSeek Harness 会话以清空已写入的 `agent_label`
+
+---
+
+## 变更总结
+
+| 功能 | 影响文件数 | 新增测试 | 需要重新同步 |
+|------|-----------|---------|-------------|
+| bow-v0.43.0 定制合并到 v0.44.0 | 7 处冲突 + 全量定制文件 | 复用原有测试 | ✗ |
+| DeepSeek Harness AgentLabel 修复 | 2 | 0（改断言） | ✓ |
+
+**部署说明：**
+1. 重新编译 agentsview：`go build -o agentsview.exe ./cmd/agentsview`
+2. 重启服务，DeepSeek Harness 会话的 `agent_label` 将在重新同步后被清空
+
+

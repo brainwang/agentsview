@@ -96,7 +96,6 @@ func parseDeepSeekHarnessSession(
 	var currentStep *deepSeekHarnessTurnStep
 	latestRequestModel := ""
 	latestTitle := ""
-	latestAgentPreset := ""
 	latestOwnedTime := int64(0)
 	headerSeen := false
 	hasInheritedCut := false
@@ -132,7 +131,6 @@ func parseDeepSeekHarnessSession(
 	) (consumeErr error) {
 		if !headerSeen {
 			latestOwnedTime = header.CreatedAt
-			latestAgentPreset = header.AgentPreset
 			headerSeen = true
 		}
 		if err := lifecycle.validate(event); err != nil {
@@ -144,13 +142,6 @@ func parseDeepSeekHarnessSession(
 				return eventError(event, err)
 			}
 			latestTitle = title
-		}
-		if event.Type == "agent-preset/selected" {
-			preset, err := deepSeekHarnessAgentPreset(event.Data)
-			if err != nil {
-				return eventError(event, err)
-			}
-			latestAgentPreset = preset
 		}
 		if event.Type == "request/header" {
 			model, err := deepSeekHarnessRequestModel(event.Data)
@@ -319,7 +310,6 @@ func parseDeepSeekHarnessSession(
 	}
 	if !headerSeen {
 		latestOwnedTime = scan.Header.CreatedAt
-		latestAgentPreset = scan.Header.AgentPreset
 	}
 	if scan.Header.HasSeedLength && scan.Header.SeedLength > scan.EventCount {
 		return ParseResult{}, fmt.Errorf(
@@ -448,7 +438,6 @@ func parseDeepSeekHarnessSession(
 		Project:             project,
 		Machine:             machine,
 		Agent:               AgentDeepSeekHarness,
-		AgentLabel:          latestAgentPreset,
 		Cwd:                 scan.Header.Cwd,
 		SourceSessionID:     scan.Header.ID,
 		SourceVersion:       strconv.FormatInt(scan.Header.Version, 10),

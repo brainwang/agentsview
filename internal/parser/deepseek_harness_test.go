@@ -121,7 +121,7 @@ func TestDeepSeekHarnessPlainAndMultiframeZstdNormalizeTheSameSession(t *testing
 			assert.Equal(t, AgentDeepSeekHarness, session.Agent)
 			assert.Equal(t, "example", session.Project)
 			assert.Equal(t, deepSeekHarnessFixtureCwd, session.Cwd)
-			assert.Equal(t, "coding", session.AgentLabel)
+			assert.Equal(t, "", session.AgentLabel)
 			assert.Equal(t, "Newest title", session.SessionName)
 			assert.Equal(t, "open image [image]", session.FirstMessage)
 			assert.Equal(t, 1, session.UserMessageCount)
@@ -590,7 +590,7 @@ func TestDeepSeekHarnessFoldsPresetAndCompactionUsage(t *testing.T) {
 
 	result, err := parseDeepSeekHarnessSession(t.Context(), path, "")
 	require.NoError(t, err)
-	assert.Equal(t, "minimal", result.Session.AgentLabel)
+	assert.Equal(t, "", result.Session.AgentLabel)
 	require.Len(t, result.Messages, 2)
 	assert.Equal(t, "compact this", result.Messages[0].Content)
 	assert.Equal(t, "first answer", result.Messages[1].Content)
@@ -1482,7 +1482,7 @@ func TestDeepSeekHarnessV3SessionParses(t *testing.T) {
 	session := result.Session
 	assert.Equal(t, "deepseek-harness:v3-session", session.ID)
 	assert.Equal(t, "3", session.SourceVersion)
-	assert.Equal(t, "minimal", session.AgentLabel)
+	assert.Equal(t, "", session.AgentLabel)
 	assert.Equal(t, "V3 title", session.SessionName)
 	assert.Equal(t, TerminationAwaitingUser, session.TerminationStatus)
 	assert.False(t, session.IsTruncated)
