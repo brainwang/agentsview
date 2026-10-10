@@ -5,6 +5,7 @@
     KbdBadge,
     Spinner,
     TopBar,
+    showFlash,
     type TopBarTab,
   } from "@kenn-io/kit-ui";
   import {
@@ -135,8 +136,10 @@
     if (sessions.activeSessionId) {
       try {
         await downloadExport(sessions.activeSessionId);
+        showFlash(m.export_downloaded(), { tone: "success" });
       } catch (e) {
         console.error("Export failed:", e);
+        showFlash(m.export_failed(), { tone: "danger" });
       }
     }
   }

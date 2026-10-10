@@ -80,6 +80,8 @@
   "header_actions_copied_markdown_link": "コピーされたマークダウンリンク",
   "header_actions_copy_markdown_link": "マークダウン エクスポート リンクをコピーする",
   "header_actions_copy_source_path": "ソースファイルのパスをコピーする",
+  "export_downloaded": "HTMLセッション記録をダウンロードディレクトリに生成しました",
+  "export_failed": "エクスポートに失敗しました",
   "header_actions_publish_title": "Gist に公開 (p)",
   "header_actions_publish_label": "Gist に公開する",
   "header_actions_publish_public": "公開 Gist を公開する",

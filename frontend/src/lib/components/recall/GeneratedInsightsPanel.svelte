@@ -5,6 +5,7 @@
     Card,
     CopyButton,
     IconButton,
+    showFlash,
     Typeahead,
   } from "@kenn-io/kit-ui";
   import { downloadInsightExport } from "../../api/client.js";
@@ -166,8 +167,10 @@
     if (!insights.selectedItem) return;
     try {
       await downloadInsightExport(insights.selectedItem.id);
+      showFlash(m.export_downloaded(), { tone: "success" });
     } catch (error) {
       console.error("Insight export failed:", error);
+      showFlash(m.export_failed(), { tone: "danger" });
     }
   }
 

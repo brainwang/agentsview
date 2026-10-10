@@ -80,6 +80,8 @@
   "header_actions_copied_markdown_link": "Lien markdown copié",
   "header_actions_copy_markdown_link": "Copier le lien d'export markdown",
   "header_actions_copy_source_path": "Copier le chemin du fichier source",
+  "export_downloaded": "Enregistrement de session HTML généré dans le répertoire de téléchargement",
+  "export_failed": "Échec de l'export",
   "header_actions_publish_title": "Publier sur Gist (p)",
   "header_actions_publish_label": "Publier sur Gist",
   "header_actions_publish_public": "Publier un Gist public",

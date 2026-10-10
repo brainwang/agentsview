@@ -80,6 +80,8 @@
   "header_actions_copied_markdown_link": "已复制 Markdown 链接",
   "header_actions_copy_markdown_link": "复制 Markdown 导出链接",
   "header_actions_copy_source_path": "复制源文件路径",
+  "export_downloaded": "HTML会话记录已生成到下载目录",
+  "export_failed": "导出失败",
   "header_actions_publish_title": "发布到 Gist (p)",
   "header_actions_publish_label": "发布到 Gist",
   "header_actions_publish_public": "发布公开 Gist",

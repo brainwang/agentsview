@@ -80,6 +80,8 @@
   "header_actions_copied_markdown_link": "마크다운 링크 복사됨",
   "header_actions_copy_markdown_link": "마크다운 내보내기 링크 복사",
   "header_actions_copy_source_path": "소스 파일 경로 복사",
+  "export_downloaded": "HTML 세션 기록이 다운로드 디렉터리에 생성되었습니다",
+  "export_failed": "내보내기 실패",
   "header_actions_publish_title": "Gist에 게시 (p)",
   "header_actions_publish_label": "Gist에 게시",
   "header_actions_publish_public": "공개 Gist 게시",

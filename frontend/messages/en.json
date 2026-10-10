@@ -80,6 +80,8 @@
   "header_actions_copied_markdown_link": "Copied markdown link",
   "header_actions_copy_markdown_link": "Copy markdown export link",
   "header_actions_copy_source_path": "Copy source file path",
+  "export_downloaded": "HTML session record generated to the downloads directory",
+  "export_failed": "Export failed",
   "header_actions_publish_title": "Publish to Gist (p)",
   "header_actions_publish_label": "Publish to Gist",
   "header_actions_publish_public": "Publish public Gist",
