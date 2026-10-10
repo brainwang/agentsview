@@ -371,11 +371,21 @@ func (k *kiroSQLiteTestDB) close(t *testing.T) {
 
 // createTeleAgentSQLiteDB creates a TeleAgent SQLite database at
 // <dir>/v1_public_testuser/teleagent.db, mirroring the production users/
-// parent layout so the provider's first-user auto-discovery picks it up.
+// parent layout so the provider's multi-user discovery picks it up.
 // Returns a handle for inserting test data.
 func createTeleAgentSQLiteDB(t *testing.T, dir string) *teleagentSQLiteTestDB {
 	t.Helper()
-	userDir := filepath.Join(dir, "v1_public_testuser")
+	return createTeleAgentSQLiteDBForUser(t, dir, "v1_public_testuser")
+}
+
+// createTeleAgentSQLiteDBForUser creates a TeleAgent SQLite database at
+// <dir>/<userSubdir>/teleagent.db, mirroring the production users/ parent
+// layout. Returns a handle for inserting test data.
+func createTeleAgentSQLiteDBForUser(
+	t *testing.T, dir, userSubdir string,
+) *teleagentSQLiteTestDB {
+	t.Helper()
+	userDir := filepath.Join(dir, userSubdir)
 	require.NoError(t, os.MkdirAll(userDir, 0o755), "mkdir teleagent user subdir")
 	path := filepath.Join(userDir, "teleagent.db")
 	copySQLiteSchemaTemplate(

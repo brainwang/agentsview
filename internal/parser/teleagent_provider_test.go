@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -75,12 +76,12 @@ func TestTeleAgentProvider_Discover(t *testing.T) {
 	}
 }
 
-func TestTeleAgentProvider_FirstUserAutoDiscovery(t *testing.T) {
+func TestTeleAgentProvider_AllUsersDiscovered(t *testing.T) {
 	root := t.TempDir()
 	// Two user subdirectories each with a teleagent.db. The provider must
-	// read only the lexicographically first.
+	// read both, not just the lexicographically first.
 	dbPathA, dbA := newTeleAgentProviderSQLiteDBUnderRoot(t, root, "v1_public_aaa")
-	_, dbB := newTeleAgentProviderSQLiteDBUnderRoot(t, root, "v1_public_bbb")
+	dbPathB, dbB := newTeleAgentProviderSQLiteDBUnderRoot(t, root, "v1_public_bbb")
 	seedTeleAgentSession(t, dbA, "ses_a", "A task", "/tmp/a", nil, 1, 2)
 	seedTeleAgentSession(t, dbB, "ses_b", "B task", "/tmp/b", nil, 1, 2)
 
@@ -91,12 +92,18 @@ func TestTeleAgentProvider_FirstUserAutoDiscovery(t *testing.T) {
 	sources, err := provider.Discover(context.Background())
 	require.NoError(t, err)
 	require.NotEmpty(t, sources)
+
+	var hasA, hasB bool
 	for _, src := range sources {
-		assert.Contains(t, src.DisplayPath, dbPathA,
-			"only the lexicographically first user subdirectory is read")
-		assert.NotContains(t, src.DisplayPath, "v1_public_bbb",
-			"the second user subdirectory must not be read")
+		if strings.Contains(src.DisplayPath, dbPathA) {
+			hasA = true
+		}
+		if strings.Contains(src.DisplayPath, dbPathB) {
+			hasB = true
+		}
 	}
+	assert.True(t, hasA, "first user subdirectory is discovered")
+	assert.True(t, hasB, "second user subdirectory is discovered")
 }
 
 func TestTeleAgentProvider_ExplicitSubdirectoryOverride(t *testing.T) {
@@ -263,7 +270,8 @@ func TestTeleAgentProvider_VanishedRowForceReplaces(t *testing.T) {
 
 func TestTeleAgentProvider_WatchPlan(t *testing.T) {
 	root := t.TempDir()
-	dbPath, _ := newTeleAgentProviderSQLiteDBUnderRoot(t, root, "v1_public_user")
+	dbPathA, _ := newTeleAgentProviderSQLiteDBUnderRoot(t, root, "v1_public_aaa")
+	dbPathB, _ := newTeleAgentProviderSQLiteDBUnderRoot(t, root, "v1_public_bbb")
 
 	provider, ok := NewProvider(AgentTeleAgent, ProviderConfig{
 		Roots: []string{root},
@@ -271,23 +279,30 @@ func TestTeleAgentProvider_WatchPlan(t *testing.T) {
 	require.True(t, ok)
 	plan, err := provider.WatchPlan(context.Background())
 	require.NoError(t, err)
-	require.Len(t, plan.Roots, 2, "watch plan has the users/ parent and the DB path")
+	// 1 users/ parent watch + 2 DB watches (one per user subdirectory).
+	require.Len(t, plan.Roots, 3, "watch plan has the users/ parent and both DB paths")
 
-	var hasRoot, hasDB bool
+	var hasRoot, hasDBA, hasDBB bool
 	for _, wr := range plan.Roots {
 		if wr.Path == root {
 			hasRoot = true
 			assert.False(t, wr.Recursive,
 				"users/ parent watch is non-recursive")
 		}
-		if wr.Path == dbPath {
-			hasDB = true
+		if wr.Path == dbPathA {
+			hasDBA = true
+			assert.False(t, wr.Recursive,
+				"DB file watch is non-recursive")
+		}
+		if wr.Path == dbPathB {
+			hasDBB = true
 			assert.False(t, wr.Recursive,
 				"DB file watch is non-recursive")
 		}
 	}
 	assert.True(t, hasRoot, "watch plan must include the users/ parent root")
-	assert.True(t, hasDB, "watch plan must include the resolved DB path")
+	assert.True(t, hasDBA, "watch plan must include the first user's DB path")
+	assert.True(t, hasDBB, "watch plan must include the second user's DB path")
 }
 
 func TestTeleAgentProvider_ParseSession(t *testing.T) {

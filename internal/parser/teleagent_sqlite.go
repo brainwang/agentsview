@@ -288,37 +288,29 @@ func teleagentSQLiteSessionFingerprint(
 	return updatedAt * 1_000_000, partSize, nil
 }
 
-// teleagentSQLiteDBPath returns the TeleAgent DB path when the configured root
-// contains one (either as a direct child for the explicit-subdirectory
-// override, or under the first user subdirectory of a users/ parent).
-func teleagentSQLiteDBPath(dir string) string {
-	path, _ := teleagentSQLiteDBPathChecked(dir)
-	return path
-}
-
-// teleagentSQLiteDBPathChecked resolves the TeleAgent DB path under a
+// teleagentSQLiteDBPathsChecked resolves all TeleAgent DB paths under a
 // configured root. The root may either point directly at a directory
-// containing a teleagent.db (the explicit-subdirectory override case), or at
-// the users/ parent — in which case the first subdirectory (lexicographically)
-// that contains a teleagent.db is selected, matching the "only need first
-// user" requirement. Returns ("", nil) when no candidate is found.
-func teleagentSQLiteDBPathChecked(dir string) (string, error) {
+// containing a teleagent.db (the explicit-subdirectory override case, which
+// returns exactly that one path without scanning siblings), or at the
+// users/ parent — in which case every subdirectory that contains a
+// teleagent.db is returned, sorted lexicographically. Returns (nil, nil) when
+// no candidate is found.
+func teleagentSQLiteDBPathsChecked(dir string) ([]string, error) {
 	if dir == "" {
-		return "", nil
+		return nil, nil
 	}
 	// Explicit-subdirectory override: the directory itself contains a
-	// teleagent.db.
+	// teleagent.db. Return only that path without scanning siblings.
 	if path := teleagentDirectDBPathChecked(dir); path != "" {
-		return path, nil
+		return []string{path}, nil
 	}
-	// users/ parent: pick the first subdirectory (lexicographically) that
-	// contains a teleagent.db.
+	// users/ parent: return every subdirectory that contains a teleagent.db.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return nil, nil
 		}
-		return "", fmt.Errorf("read teleagent users dir %s: %w", dir, err)
+		return nil, fmt.Errorf("read teleagent users dir %s: %w", dir, err)
 	}
 	var names []string
 	for _, entry := range entries {
@@ -328,13 +320,14 @@ func teleagentSQLiteDBPathChecked(dir string) (string, error) {
 		names = append(names, entry.Name())
 	}
 	sort.Strings(names)
+	var paths []string
 	for _, name := range names {
 		subdir := filepath.Join(dir, name)
 		if path := teleagentDirectDBPathChecked(subdir); path != "" {
-			return path, nil
+			paths = append(paths, path)
 		}
 	}
-	return "", nil
+	return paths, nil
 }
 
 // teleagentDirectDBPathChecked returns the teleagent.db path when dir itself

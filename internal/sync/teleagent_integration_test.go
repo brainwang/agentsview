@@ -217,3 +217,55 @@ func TestSyncTeleAgentSQLite_VanishedRowForceReplaces(t *testing.T) {
 	assert.Nil(t, surviving.SourceMissingAt,
 		"surviving session must not be marked source-missing")
 }
+
+// TestSyncTeleAgentSQLite_MultiUserSessionsDiscovered confirms the sync engine
+// discovers TeleAgent sessions from multiple user subdirectories under the
+// same configured root, not just the first.
+func TestSyncTeleAgentSQLite_MultiUserSessionsDiscovered(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentTeleAgent)
+	fixtureA := createTeleAgentSQLiteDBForUser(t, env.teleagentDir, "v1_public_aaa")
+	fixtureA.addSession(
+		t, "ses_a", "User A task", "/tmp/a", nil,
+		1779012000000, 1779012030000,
+	)
+	fixtureA.addMessage(
+		t, "msg_a", "ses_a",
+		`{"role":"user","model":{"modelID":"chat-pro"},"time":{"created":1779012000000}}`,
+		1779012000000,
+	)
+	fixtureA.addTextPart(
+		t, "prt_a", "ses_a", "msg_a", "user A prompt",
+		1779012000000,
+	)
+
+	fixtureB := createTeleAgentSQLiteDBForUser(t, env.teleagentDir, "v1_public_bbb")
+	fixtureB.addSession(
+		t, "ses_b", "User B task", "/tmp/b", nil,
+		1779012000000, 1779012040000,
+	)
+	fixtureB.addMessage(
+		t, "msg_b", "ses_b",
+		`{"role":"user","model":{"modelID":"chat-pro"},"time":{"created":1779012000000}}`,
+		1779012000000,
+	)
+	fixtureB.addTextPart(
+		t, "prt_b", "ses_b", "msg_b", "user B prompt",
+		1779012000000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.Positive(t, stats.TotalSessions, "sync should process sessions")
+	require.GreaterOrEqual(t, stats.Synced, 2, "sync should persist sessions from both users")
+
+	// Both users' sessions are persisted.
+	assertSessionState(t, env.db, "teleagent:ses_a", func(sess *db.Session) {
+		require.NotNil(t, sess.DisplayName)
+		assert.Equal(t, "User A task", *sess.DisplayName)
+		assert.Equal(t, "/tmp/a", sess.Cwd)
+	})
+	assertSessionState(t, env.db, "teleagent:ses_b", func(sess *db.Session) {
+		require.NotNil(t, sess.DisplayName)
+		assert.Equal(t, "User B task", *sess.DisplayName)
+		assert.Equal(t, "/tmp/b", sess.Cwd)
+	})
+}

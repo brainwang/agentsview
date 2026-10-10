@@ -311,20 +311,22 @@ func (s teleagentSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		dbPath, err := teleagentSQLiteDBPathChecked(root)
+		dbPaths, err := teleagentSQLiteDBPathsChecked(root)
 		if err != nil {
 			return nil, err
 		}
-		if dbPath == "" {
-			continue
-		}
-		containerSource, memberSources, err := s.discoverRootDB(root, dbPath)
-		if err != nil {
-			return nil, err
-		}
-		addJSONLSource(containerSource, &sources, seen)
-		for _, member := range memberSources {
-			addJSONLSource(member, &sources, seen)
+		for _, dbPath := range dbPaths {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			containerSource, memberSources, err := s.discoverRootDB(root, dbPath)
+			if err != nil {
+				return nil, err
+			}
+			addJSONLSource(containerSource, &sources, seen)
+			for _, member := range memberSources {
+				addJSONLSource(member, &sources, seen)
+			}
 		}
 	}
 	sortJSONLSources(sources)
@@ -342,30 +344,32 @@ func (s teleagentSourceSet) DiscoverEach(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		dbPath, err := teleagentSQLiteDBPathChecked(root)
+		dbPaths, err := teleagentSQLiteDBPathsChecked(root)
 		if err != nil {
 			return err
 		}
-		if dbPath == "" {
-			continue
-		}
-		store, err := OpenTeleAgentSQLiteStore(dbPath)
-		if err != nil {
-			return err
-		}
-		err = store.ForEachSessionMeta(ctx, func(meta TeleAgentSQLiteSessionMeta) error {
-			source := s.newMemberSourceRef(
-				root, meta.VirtualPath, dbPath, meta.SessionID,
-			)
-			source.DiscoveryMTimeNS = meta.FileMtime
-			return yield(source)
-		})
-		closeErr := store.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return closeErr
+		for _, dbPath := range dbPaths {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			store, err := OpenTeleAgentSQLiteStore(dbPath)
+			if err != nil {
+				return err
+			}
+			err = store.ForEachSessionMeta(ctx, func(meta TeleAgentSQLiteSessionMeta) error {
+				source := s.newMemberSourceRef(
+					root, meta.VirtualPath, dbPath, meta.SessionID,
+				)
+				source.DiscoveryMTimeNS = meta.FileMtime
+				return yield(source)
+			})
+			closeErr := store.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
 		}
 	}
 	return nil
@@ -421,7 +425,7 @@ func (s teleagentSourceSet) discoverRootDB(
 	return container, members, nil
 }
 
-// WatchPlan declares a non-recursive watch on the resolved DB path plus a
+// WatchPlan declares a non-recursive watch on every resolved DB path plus a
 // non-recursive watch on the users/ parent directory so the appearance of a
 // new user subdirectory is detected.
 func (s teleagentSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
@@ -436,11 +440,12 @@ func (s teleagentSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 			Recursive:   false,
 			DebounceKey: string(AgentTeleAgent) + ":root:" + root,
 		})
-		// If auto-discovery resolves a backing DB under the root, watch the
-		// DB file directly so a TeleAgent write triggers a re-sync even when
-		// the users/ parent's directory mtime does not change. IncludeGlobs
-		// covers the DB file plus its WAL/SHM siblings.
-		if dbPath := teleagentSQLiteDBPath(root); dbPath != "" {
+		// Watch every resolved backing DB under the root so a TeleAgent write
+		// triggers a re-sync even when the users/ parent's directory mtime
+		// does not change. IncludeGlobs covers the DB file plus its WAL/SHM
+		// siblings.
+		dbPaths, _ := teleagentSQLiteDBPathsChecked(root)
+		for _, dbPath := range dbPaths {
 			roots = append(roots, WatchRoot{
 				Path:         dbPath,
 				Recursive:    false,
@@ -549,24 +554,23 @@ func (s teleagentSourceSet) FindSource(
 	var candidates []SourceRef
 	candidates = append(candidates, hinted...)
 	for _, root := range s.roots {
-		dbPath, err := teleagentSQLiteDBPathChecked(root)
+		dbPaths, err := teleagentSQLiteDBPathsChecked(root)
 		if err != nil {
 			return SourceRef{}, false, err
 		}
-		if dbPath == "" {
-			continue
-		}
-		exists, err := TeleAgentSQLiteSessionExistsWithError(dbPath, req.RawSessionID)
-		if err != nil {
-			return SourceRef{}, false, fmt.Errorf(
-				"find TeleAgent SQLite session %s: %w", req.RawSessionID, err,
-			)
-		}
-		if exists {
-			candidates = append(candidates, s.newMemberSourceRef(
-				root, TeleAgentSQLiteVirtualPath(dbPath, req.RawSessionID),
-				dbPath, req.RawSessionID,
-			))
+		for _, dbPath := range dbPaths {
+			exists, err := TeleAgentSQLiteSessionExistsWithError(dbPath, req.RawSessionID)
+			if err != nil {
+				return SourceRef{}, false, fmt.Errorf(
+					"find TeleAgent SQLite session %s: %w", req.RawSessionID, err,
+				)
+			}
+			if exists {
+				candidates = append(candidates, s.newMemberSourceRef(
+					root, TeleAgentSQLiteVirtualPath(dbPath, req.RawSessionID),
+					dbPath, req.RawSessionID,
+				))
+			}
 		}
 	}
 	if source, ok := s.bestSource(candidates); ok {
