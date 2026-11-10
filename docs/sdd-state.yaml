@@ -1,0 +1,254 @@
+version: 1
+updated_at: "2026-11-10T06:16:51.760Z"
+items:
+  - item_id: "750381b8-384c-46bf-b23a-c94cdd1e8f3e"
+    spec_id: "SPEC-AV-001"
+    session_ids:
+      - "ahp-chat://default/Y29kZWZyZWU6L2NiZWYxZTk5LTI4MTMtNDQzMS1hYWExLWZmZWRmYzJjOTc3NQ"
+    title: "CodeFree provider AgentLabel fix and frontend registration"
+    work_item_id: "srdcloud-001"
+    feat_ids: []
+    git:
+      source_branch: "sdd/srdcloud-001srd18901883260"
+      target_branch: "bow-v0.44.0"
+      user_id: "srd18901883260"
+      base_commit: "2963d831fa725a0e4d4cf0f519af1145b1f57f2c"
+      remote: "origin"
+    package:
+      name: "sdd-dev-engineer"
+      version: "1.0.36"
+    sop:
+      name: "SDD 标准开发流程"
+      version: 1
+    revision: 2
+    created_at: "2026-11-10T06:15:07.368Z"
+    updated_at: "2026-11-10T06:16:51.760Z"
+    current_node_id: "G0"
+    temp_node_id: null
+    spec_commit: null
+    current_task_id: null
+    execution:
+      status: "idle"
+      message: null
+    nodes:
+      - node_id: "G0"
+        name: "需求分析"
+        type: "requirement"
+        owner: "side"
+        status: "pending"
+        started_at: null
+        completed_at: null
+        updated_by: "agent"
+        waiting: null
+        issues: []
+        links: []
+        artifact_definitions:
+          - key: "prd_index"
+            path: "docs/prd-index.md"
+            required: true
+            identity:
+              - "work_item_id"
+              - "spec_id"
+            anchor:
+              - "权威源模式"
+              - "FEAT"
+              - "归属Spec"
+          - key: "gate0_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate0-report.md"
+            required: true
+            identity:
+              - "item_id"
+              - "work_item_id"
+              - "spec_id"
+        artifacts: []
+      - node_id: "G1"
+        name: "Spec 准入"
+        type: "spec"
+        owner: "side"
+        status: "pending"
+        started_at: null
+        completed_at: null
+        updated_by: "agent"
+        waiting: null
+        issues: []
+        links: []
+        artifact_definitions:
+          - key: "spec"
+            path: "docs/specs/SPEC-AV-001/spec.md"
+            required: true
+            identity: "spec_id"
+            metadata:
+              - "spec_id"
+              - "work_item_id"
+              - "feat_ids"
+            anchor:
+              - "FEAT 映射表"
+              - "FR"
+              - "AC"
+          - key: "gate1_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate1-report.md"
+            required: true
+            identity:
+              - "item_id"
+              - "work_item_id"
+              - "spec_id"
+        artifacts: []
+      - node_id: "G2"
+        name: "设计审查"
+        type: "design"
+        owner: "side"
+        status: "pending"
+        started_at: null
+        completed_at: null
+        updated_by: "agent"
+        waiting: null
+        issues: []
+        links: []
+        artifact_definitions:
+          - key: "design"
+            path: "docs/specs/SPEC-AV-001/design.md"
+            required: true
+            identity: "spec_id"
+            anchor:
+              - "架构设计"
+              - "数据模型"
+              - "接口设计"
+              - "安全设计"
+              - "风险与回滚"
+          - key: "adr"
+            glob: "docs/specs/SPEC-AV-001/adrs/ADR-*.md"
+            required: false
+            identity: "spec_id"
+            anchor:
+              - "决策背景"
+              - "决策内容"
+              - "备选方案"
+              - "影响"
+          - key: "openapi"
+            glob: "docs/specs/SPEC-AV-001/api/*.yaml"
+            required: false
+            identity: "spec_id"
+            anchor:
+              - "openapi"
+              - "paths"
+              - "components"
+          - key: "ui_prototype"
+            glob: "docs/specs/SPEC-AV-001/ui/**"
+            required: false
+            identity: "spec_id"
+          - key: "gate2_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate2-report.md"
+            required: true
+            identity:
+              - "item_id"
+              - "work_item_id"
+              - "spec_id"
+        artifacts: []
+      - node_id: "G3"
+        name: "任务审查"
+        type: "task"
+        owner: "side"
+        status: "pending"
+        started_at: null
+        completed_at: null
+        updated_by: "agent"
+        waiting: null
+        issues: []
+        links: []
+        artifact_definitions:
+          - key: "tasks"
+            path: "docs/specs/SPEC-AV-001/tasks.md"
+            required: true
+            identity: "spec_id"
+            anchor:
+              - "Task ID"
+              - "FR/AC 关联"
+              - "验收标准"
+              - "验证命令"
+              - "依赖"
+          - key: "gate3_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate3-report.md"
+            required: true
+            identity:
+              - "item_id"
+              - "work_item_id"
+              - "spec_id"
+        artifacts: []
+      - node_id: "G4"
+        name: "编码实现"
+        type: "code"
+        owner: "side"
+        status: "pending"
+        started_at: null
+        completed_at: null
+        updated_by: "agent"
+        waiting: null
+        issues: []
+        links: []
+        artifact_definitions:
+          - key: "source_code"
+            glob: "src/**"
+            required: true
+            identity:
+              - "spec_id"
+              - "current_task_id"
+          - key: "tests"
+            glob: "tests/**"
+            required: true
+            identity:
+              - "spec_id"
+              - "current_task_id"
+          - key: "gate4_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate4-report.md"
+            required: true
+            identity:
+              - "item_id"
+              - "work_item_id"
+              - "spec_id"
+            anchor:
+              - "执行命令"
+              - "用例数量"
+              - "通过数"
+              - "失败数"
+              - "结果"
+          - key: "unit_test_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/unit-test-report.md"
+            required: true
+            identity:
+              - "item_id"
+              - "work_item_id"
+              - "spec_id"
+            anchor:
+              - "代码Commit"
+              - "测试框架"
+              - "执行结果"
+              - "质量指标"
+              - "AC验证映射"
+        artifacts: []
+      - node_id: "G5"
+        name: "验收验证"
+        type: "other"
+        owner: "side"
+        status: "pending"
+        started_at: null
+        completed_at: null
+        updated_by: "agent"
+        waiting: null
+        issues: []
+        links: []
+        artifact_definitions:
+          - key: "gate5_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate5-report.md"
+            required: true
+            source: "side"
+            identity:
+              - "item_id"
+              - "work_item_id"
+              - "spec_id"
+            anchor:
+              - "验证范围"
+              - "输入报告"
+              - "检查结果"
+              - "未通过项"
+              - "验收结论"
+        artifacts: []
