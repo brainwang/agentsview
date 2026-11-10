@@ -1,0 +1,194 @@
+{
+	"id": "codefree-parser",
+	"title": "codefree-parser",
+	"queryTitle": "添加支持 CodeFree 的会话读取功能，解析 CodeFree agentSessionData 目录下的 session.db SQLite 数据库",
+	"createdAt": "2026-11-09T08:45:13.189Z",
+	"updatedAt": "2026-11-10T00:27:54.114Z",
+	"current": "completed",
+	"temp_state": null,
+	"activeArtifact": "task",
+	"artifacts": {
+		"requirements": {
+			"path": "requirements.md",
+			"status": "confirmed",
+			"revision": 1,
+			"wasConfirmed": true,
+			"confirmedRevision": 1,
+			"confirmedAt": "2026-11-09T09:20:55.052Z"
+		},
+		"design": {
+			"path": "design.md",
+			"status": "confirmed",
+			"revision": 1,
+			"wasConfirmed": true,
+			"confirmedRevision": 1,
+			"confirmedAt": "2026-11-09T23:34:01.285Z"
+		},
+		"task": {
+			"path": "task.md",
+			"status": "confirmed",
+			"revision": 1,
+			"wasConfirmed": true,
+			"confirmedRevision": 1,
+			"confirmedAt": "2026-11-09T23:47:14.311Z"
+		}
+	},
+	"tasks": [
+		{
+			"id": "task-1",
+			"title": "Task1: Provider 注册与基础框架",
+			"status": "completed",
+			"subtasks": [
+				"`go build ./...` 编译通过，无错误",
+				"`go vet ./...` 无新警告",
+				"`go fmt ./...` 格式正确",
+				"`AgentCodeFree` 常量、Registry 条目、factory switch case、migration mode 均已添加",
+				"三个新文件已创建且编译通过"
+			],
+			"acceptanceCriteria": [
+				"### 验收标准"
+			]
+		},
+		{
+			"id": "task-2",
+			"title": "Task2: SQLite Store 与 Catalog 读取",
+			"status": "completed",
+			"subtasks": [
+				"打开 `<root>/__catalog__/session.db`",
+				"读取 `codefree.catalog.v1` 键值",
+				"用 gjson 解析 JSON，提取 `sessions` 数组",
+				"对每个条目提取 sessionId、startTime、modifiedTime、summary、workingDirectory、defaultAgentUri",
+				"返回 `[]CodeFreeCatalogEntry`",
+				"测试 catalog 读取（构造模拟 session.db）",
+				"测试 session 存在性检查",
+				"测试 LoadStateJSON",
+				"`ListCodeFreeCatalog` 能正确解析 catalog JSON 并返回会话列表",
+				"`LoadStateJSON` 能正确读取 `codefree.state.v1` 键值",
+				"`CodeFreeSessionExists` 正确判断 session.db 是否存在",
+				"单元测试覆盖核心函数",
+				"`go test ./internal/parser/... -run CodeFree` 通过"
+			],
+			"acceptanceCriteria": [
+				"### 验收标准"
+			]
+		},
+		{
+			"id": "task-3",
+			"title": "Task3: JSON 解析与消息构建",
+			"status": "completed",
+			"subtasks": [
+				"去掉 `file:///` 前缀",
+				"URL 解码（`url.QueryUnescape` 或手动解码 `%3A` → `:` 等）",
+				"处理 Windows 路径分隔符（`/` → `\\`）",
+				"从 `codefree-agent://builtin/spec` 提取 `spec`",
+				"从 `codefree-agent://builtin/explore` 提取 `explore`",
+				"从 `session_metadata` 读取 `codefree.state.v1`",
+				"用 gjson 解析 JSON",
+				"构建 `ParsedSession`：",
+				"`ID` = `\"codefree:\" + sessionId`",
+				"`SourceSessionID` = sessionId",
+				"`SessionName` = session.summary",
+				"`Cwd` = codefreeDecodeWorkingDir(session.workingDirectory)",
+				"`StartedAt` = `time.UnixMilli(session.startTime)`",
+				"`EndedAt` = `time.UnixMilli(session.modifiedTime)`",
+				"`Agent` = AgentCodeFree",
+				"`AgentLabel` = codefreeAgentLabel(chats[0].agent.uri)",
+				"`Machine` = machine",
+				"遍历 `completedTurns` 构建消息序列",
+				"遍历 `inFlightTurns` 追加未完成轮次（如有内容）",
+				"计算 `MessageCount`、`UserMessageCount`、`FirstMessage`",
+				"聚合 token 使用量（TotalOutputTokens、PeakContextTokens）",
+				"调用 `accumulateMessageTokenUsageContext`",
+				"`Role` = RoleUser",
+				"`Content` = turn.history.userMessage.text",
+				"如果 text 为空，返回 emitted=false",
+				"`Role` = RoleAssistant",
+				"`Content` = 合并所有 type=text 的 parts 的 text 字段",
+				"`Model` = turn.usage.model",
+				"`ContextTokens` = turn.usage.inputTokens",
+				"`OutputTokens` = turn.usage.outputTokens",
+				"`HasContextTokens` / `HasOutputTokens` = true",
+				"遍历 type=toolCall 的 parts，构建 `ParsedToolCall`：",
+				"`ToolUseID` = toolCallId",
+				"`ToolName` = toolId",
+				"`InputJSON` = input",
+				"构建 `ParsedToolResultEvent` 从 result.content",
+				"如果 Content 为空且无 ToolCalls，返回 emitted=false",
+				"测试 `codefreeDecodeWorkingDir`（多种 URI 格式）",
+				"测试 `codefreeAgentLabel`（多种 URI）",
+				"测试 `loadCodeFreeSession` 使用模拟 JSON 数据",
+				"测试空 turns、缺失字段、toolCall 解析",
+				"测试时间戳转换",
+				"JSON 解析正确提取 session 元数据和消息序列",
+				"用户消息和助手消息正确构建",
+				"toolCall 正确映射为 ParsedToolCall",
+				"token 使用量正确解析",
+				"URL 编码的工作目录正确解码",
+				"agent URI 正确提取 label",
+				"空会话返回 nil（触发 SkipNoSession）",
+				"单元测试覆盖核心解析逻辑",
+				"`go test ./internal/parser/... -run CodeFree` 通过"
+			],
+			"acceptanceCriteria": [
+				"### 验收标准"
+			]
+		},
+		{
+			"id": "task-4",
+			"title": "Task4: SourceSet 完整实现与 Provider 接线",
+			"status": "completed",
+			"subtasks": [
+				"遍历 roots，调用 `ListCodeFreeCatalog(root)`",
+				"对每个 catalog 条目，检查 session.db 存在性",
+				"生成 `SourceRef`（virtual member），设置 `DiscoveryMTimeNS`",
+				"使用 `addJSONLSource` 去重，`sortJSONLSources` 排序",
+				"流式版本，逐个 yield SourceRef",
+				"监听根目录（非递归）",
+				"监听 `__catalog__/session.db`",
+				"监听每个已发现会话的 session.db",
+				"stat session.db，返回 Size + MTimeNS",
+				"考虑 WAL 复合 mtime（`sqliteDBCompositeMtime`）",
+				"文件不存在时返回 Key-only fingerprint",
+				"通过 stored path / fingerprint key / raw session ID 查找",
+				"分类变更路径，返回受影响的 source",
+				"从 SourceRef 提取 codefreeSource",
+				"打开 session.db",
+				"调用 `loadCodeFreeSession`",
+				"返回 `ParseOutcome`（含 ForceReplace=true）",
+				"文件不存在时返回 SkipNoSession",
+				"基于 fingerprint 判断是否需要重新解析",
+				"`go build ./...` 编译通过",
+				"`go vet ./...` 无新警告",
+				"`go test ./internal/parser/...` 全部通过（含现有测试）",
+				"Discover 能正确发现 catalog 中的会话",
+				"Fingerprint 能正确计算 session.db 的指纹",
+				"Parse 能正确解析会话并返回 ParseOutcome",
+				"WatchPlan 能正确生成监听计划",
+				"FindSource 能通过 session ID 查找会话"
+			],
+			"acceptanceCriteria": [
+				"### 验收标准"
+			]
+		},
+		{
+			"id": "task-5",
+			"title": "Task5: 集成验证与收尾",
+			"status": "completed",
+			"subtasks": [
+				"`go build ./...` 通过",
+				"`go vet ./...` 无新警告",
+				"`go fmt` 格式正确",
+				"`go test ./internal/parser/...` 全部通过",
+				"`go test ./... -short` 无回归",
+				"无新增外部依赖",
+				"AgentCodeFree 与 AgentCodefreeO 不冲突（不同 type、不同 prefix、不同路径）"
+			],
+			"acceptanceCriteria": [
+				"### 验收标准"
+			]
+		}
+	],
+	"stateRevision": "mw9ybaf6-c32db18e-0d0e-424f-9f90-f7a924f5eaa8",
+	"chatSessionResource": "agent-host-codefree:/13d93fb4-8112-41e3-9b14-023242e8eae0",
+	"lastStableSnapshotId": "1794270473976-c86fac9a-90c8-4aca-b605-2b18dae1573b"
+}

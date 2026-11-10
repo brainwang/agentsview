@@ -92,3 +92,4 @@ graphify-out/
 .opencode/
 opencode.json
 .codefree/
+.codefree-ide/specs/*/snapshots/**/*
