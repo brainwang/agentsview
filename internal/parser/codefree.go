@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
-	"path"
 	"strings"
 	"time"
 
@@ -32,19 +31,6 @@ func codefreeDecodeWorkingDir(uri string) string {
 	// On Windows, convert forward slashes to backslashes so the Cwd
 	// matches the native path convention used by other providers.
 	return strings.ReplaceAll(decoded, "/", string(rune('\\')))
-}
-
-// codefreeAgentLabel extracts the last path segment from a CodeFree
-// agent URI (e.g. "codefree-agent://builtin/spec" -> "spec").
-func codefreeAgentLabel(uri string) string {
-	if uri == "" {
-		return ""
-	}
-	parsed, err := url.Parse(uri)
-	if err != nil {
-		return ""
-	}
-	return path.Base(parsed.Path)
 }
 
 // loadCodeFreeSession reads the codefree.state.v1 JSON from a CodeFree
@@ -102,13 +88,11 @@ func parseCodeFreeStateJSON(
 		EndedAt:         time.UnixMilli(session.Get("modifiedTime").Int()),
 	}
 
-	// AgentLabel: prefer the first chat's agent URI.
-	chats := root.Get("chats")
-	if chats.IsArray() && len(chats.Array()) > 0 {
-		firstChat := chats.Array()[0]
-		agentURI := firstChat.Get("agent.uri").Str
-		sess.AgentLabel = codefreeAgentLabel(agentURI)
-	}
+	// AgentLabel is intentionally left empty. The agent URI path segment
+	// (e.g. "spec", "sdd-dev-engineer") is an internal digital-employee
+	// type identifier, not a user-facing display name. Leaving it empty
+	// lets the frontend fall back to the KNOWN_AGENTS label for the
+	// "codefree" provider type (e.g. "CodeFree").
 
 	var messages []ParsedMessage
 	ordinal := 0

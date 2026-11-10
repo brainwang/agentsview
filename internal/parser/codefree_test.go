@@ -57,26 +57,6 @@ func TestCodefreeDecodeWorkingDir(t *testing.T) {
 	}
 }
 
-func TestCodefreeAgentLabel(t *testing.T) {
-	cases := []struct {
-		name string
-		uri  string
-		want string
-	}{
-		{name: "spec", uri: "codefree-agent://builtin/spec", want: "spec"},
-		{name: "explore", uri: "codefree-agent://builtin/explore", want: "explore"},
-		{name: "craft", uri: "codefree-agent://builtin/craft", want: "craft"},
-		{name: "empty", uri: "", want: ""},
-		{name: "no path", uri: "codefree-agent://builtin", want: "builtin"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := codefreeAgentLabel(tc.uri)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
 func TestLoadCodeFreeSession_UserAndAssistant(t *testing.T) {
 	dbPath, db := newCodeFreeSQLiteTestDB(t)
 	stateJSON := `{
@@ -125,7 +105,8 @@ func TestLoadCodeFreeSession_UserAndAssistant(t *testing.T) {
 	assert.Equal(t, "codefree:uuid-001", sess.ID)
 	assert.Equal(t, "uuid-001", sess.SourceSessionID)
 	assert.Equal(t, AgentCodeFree, sess.Agent)
-	assert.Equal(t, "spec", sess.AgentLabel)
+	assert.Equal(t, "", sess.AgentLabel,
+		"AgentLabel must be empty so the frontend falls back to the CodeFree label")
 	assert.Equal(t, "Test session", sess.SessionName)
 	assert.Equal(t, `d:\Temp\project`, sess.Cwd)
 	assert.Equal(t, "test-machine", sess.Machine)
@@ -457,7 +438,7 @@ func TestLoadCodeFreeSession_MultipleTurns(t *testing.T) {
 	// Token rollup: TotalOutput = 5+8+12 = 25, PeakContext = max(10,20,30) = 30.
 	assert.Equal(t, 25, sess.TotalOutputTokens)
 	assert.Equal(t, 30, sess.PeakContextTokens)
-	assert.Equal(t, "explore", sess.AgentLabel)
+	assert.Equal(t, "", sess.AgentLabel)
 }
 
 func TestParseCodeFreeStateJSON_TimestampConversion(t *testing.T) {

@@ -122,6 +122,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "Codefree-O",
   },
   { name: "teleagent", color: "var(--accent-amber)", label: "TeleAgent" },
+  { name: "codefree", color: "var(--accent-purple)", label: "CodeFree" },
 
 ];
 
