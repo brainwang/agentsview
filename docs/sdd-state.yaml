@@ -1,5 +1,5 @@
 version: 1
-updated_at: "2026-11-10T07:13:11.294Z"
+updated_at: "2026-11-10T07:20:22.314Z"
 items:
   - item_id: "750381b8-384c-46bf-b23a-c94cdd1e8f3e"
     spec_id: "SPEC-AV-001"
@@ -20,9 +20,9 @@ items:
     sop:
       name: "SDD 标准开发流程"
       version: 1
-    revision: 7
+    revision: 8
     created_at: "2026-11-10T06:15:07.368Z"
-    updated_at: "2026-11-10T07:13:11.294Z"
+    updated_at: "2026-11-10T07:20:22.314Z"
     current_node_id: "G1"
     temp_node_id: null
     spec_commit: null
@@ -73,13 +73,11 @@ items:
         name: "Spec 准入"
         type: "spec"
         owner: "side"
-        status: "in_progress"
+        status: "passed"
         started_at: "2026-11-10T07:10:00.000Z"
-        completed_at: null
+        completed_at: "2026-11-10T07:30:00.000Z"
         updated_by: "agent"
-        waiting:
-          reason: "user_input"
-          message: "Gate 1 自查完成，G1-04 因 openspec 目录同名文件需人工评审确认"
+        waiting: null
         issues: []
         links: []
         artifact_definitions:
