@@ -1,5 +1,5 @@
 version: 1
-updated_at: "2026-11-10T07:56:00.589Z"
+updated_at: "2026-11-10T08:07:13.086Z"
 items:
   - item_id: "750381b8-384c-46bf-b23a-c94cdd1e8f3e"
     spec_id: "SPEC-AV-001"
@@ -20,16 +20,16 @@ items:
     sop:
       name: "SDD 标准开发流程"
       version: 1
-    revision: 14
+    revision: 16
     created_at: "2026-11-10T06:15:07.368Z"
-    updated_at: "2026-11-10T07:56:00.589Z"
-    current_node_id: "G3"
+    updated_at: "2026-11-10T08:07:13.086Z"
+    current_node_id: "G4"
     temp_node_id: null
     spec_commit: null
     current_task_id: null
     execution:
       status: "running"
-      message: "G3 Tasks phase started"
+      message: "G4 Implement phase started"
     nodes:
       - node_id: "G0"
         name: "需求分析"
@@ -214,11 +214,13 @@ items:
         name: "编码实现"
         type: "code"
         owner: "side"
-        status: "pending"
-        started_at: null
+        status: "waiting"
+        started_at: "2026-11-10T00:00:00+08:00"
         completed_at: null
         updated_by: "agent"
-        waiting: null
+        waiting:
+          reason: "review"
+          message: "G4 Implement self-check PASS, awaiting user confirmation"
         issues: []
         links: []
         artifact_definitions:
@@ -260,7 +262,31 @@ items:
               - "执行结果"
               - "质量指标"
               - "AC验证映射"
-        artifacts: []
+        artifacts:
+          - key: "codefree_go"
+            path: "internal/parser/codefree.go"
+            kind: "file"
+            ready: true
+          - key: "agents_ts"
+            path: "frontend/src/lib/utils/agents.ts"
+            kind: "file"
+            ready: true
+          - key: "codefree_test_go"
+            path: "internal/parser/codefree_test.go"
+            kind: "file"
+            ready: true
+          - key: "tasks_md"
+            path: "docs/specs/SPEC-AV-001/tasks.md"
+            kind: "file"
+            ready: true
+          - key: "unit_test_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/unit-test-report.md"
+            kind: "file"
+            ready: true
+          - key: "gate4_report"
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate4-report.md"
+            kind: "file"
+            ready: true
       - node_id: "G5"
         name: "验收验证"
         type: "other"
