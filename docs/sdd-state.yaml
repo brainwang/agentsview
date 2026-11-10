@@ -1,5 +1,5 @@
 version: 1
-updated_at: "2026-11-10T08:30:44.006Z"
+updated_at: "2026-11-10T08:54:16.629Z"
 items:
   - item_id: "750381b8-384c-46bf-b23a-c94cdd1e8f3e"
     spec_id: "SPEC-AV-001"
@@ -20,16 +20,16 @@ items:
     sop:
       name: "SDD 标准开发流程"
       version: 1
-    revision: 19
+    revision: 21
     created_at: "2026-11-10T06:15:07.368Z"
-    updated_at: "2026-11-10T08:30:44.006Z"
-    current_node_id: "G5"
+    updated_at: "2026-11-10T08:54:16.629Z"
+    current_node_id: null
     temp_node_id: null
-    spec_commit: null
+    spec_commit: "2ccfaf0b69a7bdeec70ef0861f941a7581445310"
     current_task_id: null
     execution:
-      status: "paused"
-      message: "Waiting for user confirmation of G5 validation results"
+      status: "idle"
+      message: null
     nodes:
       - node_id: "G0"
         name: "需求分析"
@@ -64,11 +64,11 @@ items:
           - key: "prd_index"
             kind: "file"
             path: "docs/prd-index.md"
-            ready: true
+            ready: false
           - key: "gate0_report"
             kind: "file"
             path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate0-report.md"
-            ready: true
+            ready: false
       - node_id: "G1"
         name: "Spec 准入"
         type: "spec"
@@ -104,11 +104,11 @@ items:
           - key: "spec"
             kind: "file"
             path: "docs/specs/SPEC-AV-001/spec.md"
-            ready: true
+            ready: false
           - key: "gate1_report"
             kind: "file"
             path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate1-report.md"
-            ready: true
+            ready: false
       - node_id: "G2"
         name: "设计审查"
         type: "design"
@@ -161,17 +161,17 @@ items:
               - "spec_id"
         artifacts:
           - key: "design_doc"
+            kind: "file"
             path: "docs/specs/SPEC-AV-001/design.md"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "adr_001"
+            kind: "file"
             path: "docs/specs/SPEC-AV-001/adrs/ADR-001.md"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "gate2_report"
-            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate2-report.md"
             kind: "file"
-            ready: true
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate2-report.md"
+            ready: false
       - node_id: "G3"
         name: "任务审查"
         type: "task"
@@ -203,13 +203,13 @@ items:
               - "spec_id"
         artifacts:
           - key: "tasks_doc"
+            kind: "file"
             path: "docs/specs/SPEC-AV-001/tasks.md"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "gate3_report"
-            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate3-report.md"
             kind: "file"
-            ready: true
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate3-report.md"
+            ready: false
       - node_id: "G4"
         name: "编码实现"
         type: "code"
@@ -262,40 +262,38 @@ items:
               - "AC验证映射"
         artifacts:
           - key: "codefree_go"
+            kind: "file"
             path: "internal/parser/codefree.go"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "agents_ts"
+            kind: "file"
             path: "frontend/src/lib/utils/agents.ts"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "codefree_test_go"
+            kind: "file"
             path: "internal/parser/codefree_test.go"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "tasks_md"
+            kind: "file"
             path: "docs/specs/SPEC-AV-001/tasks.md"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "unit_test_report"
+            kind: "file"
             path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/unit-test-report.md"
-            kind: "file"
-            ready: true
+            ready: false
           - key: "gate4_report"
-            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate4-report.md"
             kind: "file"
-            ready: true
+            path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate4-report.md"
+            ready: false
       - node_id: "G5"
         name: "验收验证"
         type: "other"
         owner: "side"
-        status: "waiting"
+        status: "passed"
         started_at: "2026-11-10T00:00:00+08:00"
-        completed_at: null
+        completed_at: "2026-11-10T16:38:00+08:00"
         updated_by: "agent"
-        waiting:
-          reason: "user_confirmation"
-          message: "G5 Validate self-check complete. G5-01/G5-03/G5-05 PASS, G5-04 WARN (repo not linked to security center), G5-08 WARN (exploratory test pending). Awaiting user confirmation to finalize."
+        waiting: null
         issues: []
         links: []
         artifact_definitions:
@@ -317,4 +315,4 @@ items:
           - key: "gate5_report"
             kind: "file"
             path: "docs/specs/SPEC-AV-001/items/750381b8-384c-46bf-b23a-c94cdd1e8f3e/reports/gate5-report.md"
-            ready: true
+            ready: false
