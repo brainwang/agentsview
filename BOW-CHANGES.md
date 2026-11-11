@@ -389,4 +389,13 @@ DeepSeek Harness 会话在界面（侧栏、会话面包屑）上显示为 "stan
 1. 重新编译 agentsview：`go build -o agentsview.exe ./cmd/agentsview`
 2. 重启服务，DeepSeek Harness 会话的 `agent_label` 将在重新同步后被清空
 
+## 20261110:Codefree provider 的 AgentLabel 显示问题
+
+修复 CodeFree provider 的 AgentLabel 显示问题：移除 parser 中从 agent URI 路径段提取 AgentLabel 的逻辑（此前导致前台显示 "SPEC" 等不友好标签），改为留空并依赖前端 `KNOWN_AGENTS` 注册表回退显示 "CodeFree"；同时在 `frontend/src/lib/utils/agents.ts` 的 `KNOWN_AGENTS` 中注册 `codefree` 条目。
+使用CodeFree SDD Spec: docs\specs\SPEC-AV-001
+
+## 20261111:CodeFree 会话消息时间戳提取
+
+为 CodeFree 会话的消息和工具调用添加 per-turn 时间戳：优先从 CodeFree 运行日志（agenthost.log）提取真实时间戳，找不到时用相邻已知 turn 线性插值，全部缺失时用 session 级时间均匀插值。
+使用CodeFree SDD Spec: docs\specs\SPEC-AV-001
 
