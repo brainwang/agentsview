@@ -1,5 +1,5 @@
 version: 1
-updated_at: "2026-11-11T03:18:56.710Z"
+updated_at: "2026-11-11T03:23:16.680Z"
 items:
   - item_id: "750381b8-384c-46bf-b23a-c94cdd1e8f3e"
     spec_id: "SPEC-AV-001"
@@ -324,7 +324,7 @@ items:
     work_item_id: "srdcloud-001"
     feat_ids: []
     git:
-      source_branch: "sdd/srdcloud-001srd18901883260"
+      source_branch: "sdd/srdcloud-001srd18901883260-ts"
       target_branch: "bow-v0.44.0"
       user_id: "srd18901883260"
       base_commit: "d0e332f42981460504b7b81b9c554e3bda29dbb4"
@@ -335,9 +335,9 @@ items:
     sop:
       name: "SDD 标准开发流程"
       version: 1
-    revision: 4
+    revision: 5
     created_at: "2026-11-11T03:02:13.298Z"
-    updated_at: "2026-11-11T03:18:56.710Z"
+    updated_at: "2026-11-11T03:23:16.680Z"
     current_node_id: "G0"
     temp_node_id: null
     spec_commit: null
