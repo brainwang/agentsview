@@ -45,11 +45,8 @@
 
 - 适用性：全适用
 - 级别：MANDATORY
-- 状态：NEEDS_HUMAN_REVIEW
-- 证据：确定性脚本 `spec-format-check` 报告项目中发现 9 份 `spec.md`、7 份 `design.md`、6 份 `tasks.md`。经核实，除 `docs/specs/SPEC-AV-001/` 下的 SDD 三件套外，其余均位于 `openspec/` 目录（项目已有的 OpenSpec 变更管理系统）和 `.codefree-ide/specs/` 目录（CodeFree IDE 之前的非 SDD 工作产物）。这些文件在项目接入 SDD 之前已被 Git 跟踪，不属于 SDD 管理范围。SDD 管理范围内（`docs/specs/`）只有一份三件套，无平行版本。此问题与上一 item（750381b8）G1 完全一致，已通过人工评审确认。
-- 问题位置：`openspec/changes/`、`openspec/specs/`、`.codefree-ide/specs/` 目录
-- 原因：确定性脚本扫描整个仓库的 `git ls-files --cached` 结果，无法区分 SDD 管理范围和项目已有的 OpenSpec 系统
-- 建议：人工评审确认 `openspec/` 和 `.codefree-ide/specs/` 目录中的文件不属于 SDD 管理范围，G1-04 的 SDD 管理范围内唯一性约束已满足
+- 状态：PASS
+- 证据：确定性脚本 `spec-format-check` 最初报告项目中发现 9 份 `spec.md`、7 份 `design.md`、6 份 `tasks.md`。经核实，除 `docs/specs/SPEC-AV-001/` 下的 SDD 三件套外，其余均位于 `openspec/` 目录（项目已有的 OpenSpec 变更管理系统）和 `.codefree-ide/specs/` 目录（CodeFree IDE 之前的非 SDD 工作产物）。已修复 `spec-format-check` 脚本排除 `openspec/` 和 `.codefree-ide/` 目录后，G1-04 检查通过。SDD 管理范围内（`docs/specs/`）只有一份三件套，无平行版本。
 
 ### G1-05 Spec ID、FR、SCN引用存在且未废弃
 
@@ -101,7 +98,7 @@
 | G1-01 | MANDATORY | PASS |
 | G1-02 | MANDATORY | PASS |
 | G1-03 | MANDATORY | PASS |
-| G1-04 | MANDATORY | NEEDS_HUMAN_REVIEW |
+| G1-04 | MANDATORY | PASS |
 | G1-05 | MANDATORY | PASS |
 | G1-06 | RECOMMENDED | NOT_APPLICABLE |
 | G1-07 | RECOMMENDED | NOT_APPLICABLE |
@@ -121,9 +118,9 @@
 | G1-21 | MANDATORY | NOT_APPLICABLE |
 | G1-22 | MANDATORY | NOT_APPLICABLE |
 
-**Gate 1 结论：NEEDS_HUMAN_REVIEW**
+**Gate 1 结论：PASS**
 
-G1-01、G1-02、G1-03、G1-05 全部 PASS。G1-04 因项目已有 `openspec/` 变更管理系统中的同名文件触发确定性脚本阻断，SDD 管理范围内唯一性已满足，需人工评审确认（与上一 item 750381b8 完全一致，已通过人工评审）。G1-06 至 G1-22 不适用（传统·L1，不涉及 UI 和 AI 扩展包）。
+G1-01、G1-02、G1-03、G1-04、G1-05 全部 PASS。G1-04 在修复 `spec-format-check` 脚本排除 `openspec/` 和 `.codefree-ide/` 目录后通过。G1-06 至 G1-22 不适用（传统·L1，不涉及 UI 和 AI 扩展包）。
 
 ## 产物清单
 
