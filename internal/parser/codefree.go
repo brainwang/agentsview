@@ -40,10 +40,15 @@ func codefreeDecodeWorkingDir(uri string) string {
 // followed by a RoleAssistant message (from history.parts). inFlightTurns
 // are appended if they carry content. An empty session (no turns, no
 // user message text) returns nil to signal SkipNoSession.
+//
+// root is the agentSessionData directory path. It is used to locate the
+// sibling logs/ directory for real per-turn timestamps from
+// agenthost.log. If root is empty or logs are unavailable, timestamps
+// fall back to session-level interpolation.
 func loadCodeFreeSession(
 	ctx context.Context,
 	db *sql.DB,
-	dbPath, sessionID, machine string,
+	dbPath, sessionID, machine, root string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	if db == nil {
 		return nil, nil, fmt.Errorf("codefree sqlite db is nil for %s", dbPath)
@@ -62,14 +67,30 @@ func loadCodeFreeSession(
 	if stateJSON == "" {
 		return nil, nil, nil
 	}
-	return parseCodeFreeStateJSON(ctx, stateJSON, sessionID, machine)
+
+	// Try to load real per-turn timestamps from agenthost.log files.
+	// This is best-effort: if logs are unavailable or the turn is not
+	// found, the caller falls back to session-level interpolation.
+	logTS, err := loadCodeFreeLogTimestamps(root)
+	if err != nil {
+		// Log loading failures are non-fatal; proceed with empty map.
+		logTS = nil
+	}
+
+	return parseCodeFreeStateJSON(ctx, stateJSON, sessionID, machine, logTS)
 }
 
 // parseCodeFreeStateJSON parses the codefree.state.v1 JSON value into
 // a ParsedSession and ParsedMessage slice.
+//
+// logTS holds real per-turn timestamps extracted from agenthost.log.
+// Turns whose turnId appears in logTS use the logged start time.
+// Turns without a log entry fall back to interpolated timestamps
+// distributed evenly across the session duration.
 func parseCodeFreeStateJSON(
 	ctx context.Context,
 	stateJSON, sessionID, machine string,
+	logTS codefreeLogTimestampMap,
 ) (*ParsedSession, []ParsedMessage, error) {
 	root := gjson.Parse(stateJSON)
 	session := root.Get("session")
@@ -97,6 +118,36 @@ func parseCodeFreeStateJSON(
 	var messages []ParsedMessage
 	ordinal := 0
 
+	// CodeFree state JSON does not carry per-turn or per-message
+	// timestamps — only session-level startTime and modifiedTime.
+	// We try to fill real per-turn timestamps from agenthost.log
+	// (passed in via logTS). The resolution strategy is:
+	//   1. Use log timestamps for turns that have them.
+	//   2. Fill missing turns from the nearest known neighbour.
+	//   3. If no log timestamps exist at all, distribute the session
+	//      duration evenly across all turns as a last resort.
+	totalCompleted := 0
+	if completedTurns := root.Get("completedTurns"); completedTurns.IsArray() {
+		totalCompleted = len(completedTurns.Array())
+	}
+
+	// Collect turnIds in order (completedTurns then inFlightTurns)
+	// and resolve all timestamps up front.
+	var allTurnIDs []string
+	if completedTurns := root.Get("completedTurns"); completedTurns.IsArray() {
+		for _, turn := range completedTurns.Array() {
+			allTurnIDs = append(allTurnIDs, turn.Get("history.turnId").Str)
+		}
+	}
+	if inFlightTurns := root.Get("inFlightTurns"); inFlightTurns.IsArray() {
+		for _, turn := range inFlightTurns.Array() {
+			allTurnIDs = append(allTurnIDs, turn.Get("history.turnId").Str)
+		}
+	}
+	turnTimestamps := resolveTurnTimestamps(
+		logTS, sessionID, allTurnIDs, sess.StartedAt, sess.EndedAt,
+	)
+
 	// Process completedTurns.
 	completedTurns := root.Get("completedTurns")
 	if completedTurns.IsArray() {
@@ -104,7 +155,8 @@ func parseCodeFreeStateJSON(
 			if err := contextErrEvery(ctx, i); err != nil {
 				return nil, nil, err
 			}
-			emitted := codefreeEmitTurnMessages(&messages, &ordinal, turn)
+			turnTime := turnTimestamps[i]
+			emitted := codefreeEmitTurnMessages(&messages, &ordinal, turn, turnTime)
 			_ = emitted
 		}
 	}
@@ -116,7 +168,8 @@ func parseCodeFreeStateJSON(
 			if err := contextErrEvery(ctx, i); err != nil {
 				return nil, nil, err
 			}
-			codefreeEmitTurnMessages(&messages, &ordinal, turn)
+			turnTime := turnTimestamps[totalCompleted+i]
+			codefreeEmitTurnMessages(&messages, &ordinal, turn, turnTime)
 		}
 	}
 
@@ -143,11 +196,15 @@ func parseCodeFreeStateJSON(
 }
 
 // codefreeEmitTurnMessages emits user and assistant messages for one
-// CodeFree turn. Returns true if at least one message was emitted.
+// CodeFree turn. turnTime is the timestamp assigned to every message
+// in this turn (CodeFree state JSON has no per-message timestamps, so
+// the caller distributes the session duration across turns). Returns
+// true if at least one message was emitted.
 func codefreeEmitTurnMessages(
 	messages *[]ParsedMessage,
 	ordinal *int,
 	turn gjson.Result,
+	turnTime time.Time,
 ) bool {
 	emitted := false
 	history := turn.Get("history")
@@ -160,6 +217,7 @@ func codefreeEmitTurnMessages(
 			Role:          RoleUser,
 			Content:       userText,
 			ContentLength: len(userText),
+			Timestamp:     turnTime,
 		})
 		*ordinal++
 		emitted = true
@@ -191,6 +249,7 @@ func codefreeEmitTurnMessages(
 				Role:          RoleAssistant,
 				Content:       content,
 				ContentLength: len(content),
+				Timestamp:     turnTime,
 			}
 			if len(toolCalls) > 0 {
 				msg.HasToolUse = true

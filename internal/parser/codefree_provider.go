@@ -123,7 +123,7 @@ func (p *codefreeProvider) parseSQLiteSession(
 		return ParseOutcome{}, err
 	}
 	defer store.Close()
-	sess, msgs, err := loadCodeFreeSession(ctx, store.db, src.DBPath, src.SessionID, machine)
+	sess, msgs, err := loadCodeFreeSession(ctx, store.db, src.DBPath, src.SessionID, machine, src.Root)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
