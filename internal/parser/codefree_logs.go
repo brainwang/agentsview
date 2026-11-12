@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 // codefreeTurnTimestamps holds the start and end times for a single
@@ -202,6 +204,122 @@ func codefreeParseLogLineForTurnTimestamp(
 		entry.Terminal = ts
 		m[key] = entry
 	}
+}
+
+// codefreeToolOutputDir is the subdirectory under a session's working
+// directory where CodeFree writes tool call output files. Each terminal-
+// type tool call produces a file named "<toolCallId>-run_in_terminal.txt".
+const codefreeToolOutputDir = ".codefree" + string(filepath.Separator) + "tooloutput"
+
+// codefreeToolOutputSuffix is the filename suffix for terminal tool call
+// output files.
+const codefreeToolOutputSuffix = "-run_in_terminal.txt"
+
+// loadCodeFreeToolOutputTimestamps scans the working directory's
+// .codefree/tooloutput/ folder for files named
+// "<toolCallId>-run_in_terminal.txt" and uses their modification time
+// as a fallback timestamp source for turns that lack an agenthost.log
+// entry.
+//
+// The mtime of a tooloutput file approximates when the tool call was
+// executed, which is close to the turn's start time. When a turn has
+// multiple tool calls with output files, the earliest mtime is used
+// (closest to the turn start).
+//
+// This function only returns entries for turns that have at least one
+// matching tooloutput file. The caller should merge these into the log
+// timestamp map, giving log timestamps priority.
+//
+// If workingDir is empty or the tooloutput directory does not exist,
+// an empty map and nil error are returned.
+func loadCodeFreeToolOutputTimestamps(
+	workingDir, sessionID string, turns []gjson.Result,
+) codefreeLogTimestampMap {
+	if workingDir == "" || sessionID == "" || len(turns) == 0 {
+		return nil
+	}
+
+	toolOutputDir := filepath.Join(workingDir, codefreeToolOutputDir)
+
+	m := make(codefreeLogTimestampMap)
+
+	for _, turn := range turns {
+		turnID := turn.Get("history.turnId").Str
+		if turnID == "" {
+			continue
+		}
+		key := codefreeLogTimestampKey(sessionID, turnID)
+
+		parts := turn.Get("history.parts")
+		if !parts.IsArray() {
+			continue
+		}
+
+		var earliest time.Time
+		for _, part := range parts.Array() {
+			if part.Get("type").Str != "toolCall" {
+				continue
+			}
+			toolCallID := part.Get("toolCallId").Str
+			if toolCallID == "" {
+				continue
+			}
+
+			filename := toolCallID + codefreeToolOutputSuffix
+			filePath := filepath.Join(toolOutputDir, filename)
+			info, err := os.Stat(filePath)
+			if err != nil {
+				// File doesn't exist or is inaccessible — skip.
+				continue
+			}
+
+			mtime := info.ModTime()
+			if earliest.IsZero() || mtime.Before(earliest) {
+				earliest = mtime
+			}
+		}
+
+		if !earliest.IsZero() {
+			// Only set Started; Terminal is left zero since we
+			// can't determine turn end from tooloutput files.
+			m[key] = codefreeTurnTimestamps{Started: earliest}
+		}
+	}
+
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// mergeToolOutputTimestamps adds entries from the tooloutput map only
+// for keys that do not already exist in the log map (log timestamps
+// take priority). The log map is modified in place.
+func mergeToolOutputTimestamps(
+	logTS, toolOutputTS codefreeLogTimestampMap,
+) codefreeLogTimestampMap {
+	if len(toolOutputTS) == 0 {
+		return logTS
+	}
+	if logTS == nil {
+		logTS = make(codefreeLogTimestampMap)
+	}
+	for key, ts := range toolOutputTS {
+		if existing, ok := logTS[key]; !ok || existing.Started.IsZero() {
+			// Only fill if the log map doesn't already have a
+			// valid Started timestamp for this turn.
+			if !ok {
+				logTS[key] = ts
+			} else {
+				// Key exists but Started is zero — fill in
+				// the Started from tooloutput, preserve
+				// any existing Terminal.
+				existing.Started = ts.Started
+				logTS[key] = existing
+			}
+		}
+	}
+	return logTS
 }
 
 // lookupTurnTimestamp returns the start timestamp for a turn from the

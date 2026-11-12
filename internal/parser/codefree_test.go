@@ -10,6 +10,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestCodefreeDecodeWorkingDir(t *testing.T) {
@@ -872,4 +873,192 @@ func codefreeLogTimeToUTC(t *testing.T, s string) time.Time {
 		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(),
 		codefreeLogTimezone,
 	).UTC()
+}
+
+// --- tooloutput mtime timestamp tests ---
+
+func TestLoadCodeFreeToolOutputTimestamps_WithFile(t *testing.T) {
+	tmp := t.TempDir()
+	workingDir := filepath.Join(tmp, "project")
+	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
+	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
+
+	// Create a tooloutput file for toolCallId "tc-001".
+	toolCallID := "tc-001"
+	outFile := filepath.Join(toolOutputDir, toolCallID+codefreeToolOutputSuffix)
+	require.NoError(t, os.WriteFile(outFile, []byte("output"), 0o644))
+
+	// Set a known mtime on the file.
+	expectedMTime := time.Date(2026, 11, 10, 14, 30, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(outFile, expectedMTime, expectedMTime))
+
+	// Build a turn JSON with a toolCall part referencing tc-001.
+	turnJSON := `{"history": {"turnId": "turn-mtime-1", "parts": [
+		{"type": "toolCall", "toolCallId": "tc-001", "toolId": "run_in_terminal"}
+	]}}`
+	turns := []gjson.Result{gjson.Parse(turnJSON)}
+
+	m := loadCodeFreeToolOutputTimestamps(workingDir, "sess-mtime", turns)
+	require.NotNil(t, m)
+	require.Len(t, m, 1)
+
+	ts, ok := m.lookupTurnTimestamp("sess-mtime", "turn-mtime-1")
+	require.True(t, ok)
+	assert.True(t, ts.Equal(expectedMTime),
+		"timestamp should match file mtime; got %v want %v", ts, expectedMTime)
+}
+
+func TestLoadCodeFreeToolOutputTimestamps_NoFile(t *testing.T) {
+	tmp := t.TempDir()
+	workingDir := filepath.Join(tmp, "project")
+	// tooloutput dir exists but has no matching file.
+	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
+	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
+
+	turnJSON := `{"history": {"turnId": "turn-no-file", "parts": [
+		{"type": "toolCall", "toolCallId": "tc-missing", "toolId": "run_in_terminal"}
+	]}}`
+	turns := []gjson.Result{gjson.Parse(turnJSON)}
+
+	m := loadCodeFreeToolOutputTimestamps(workingDir, "sess-no-file", turns)
+	// No matching file → nil or empty map.
+	assert.Empty(t, m)
+}
+
+func TestLoadCodeFreeToolOutputTimestamps_EmptyWorkingDir(t *testing.T) {
+	turnJSON := `{"history": {"turnId": "turn-empty-cwd", "parts": [
+		{"type": "toolCall", "toolCallId": "tc-001", "toolId": "run_in_terminal"}
+	]}}`
+	turns := []gjson.Result{gjson.Parse(turnJSON)}
+
+	m := loadCodeFreeToolOutputTimestamps("", "sess-empty", turns)
+	assert.Nil(t, m)
+}
+
+func TestLoadCodeFreeToolOutputTimestamps_MultipleToolCalls_EarliestMTime(t *testing.T) {
+	tmp := t.TempDir()
+	workingDir := filepath.Join(tmp, "project")
+	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
+	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
+
+	// Create two tooloutput files with different mtimes.
+	file1 := filepath.Join(toolOutputDir, "tc-a"+codefreeToolOutputSuffix)
+	file2 := filepath.Join(toolOutputDir, "tc-b"+codefreeToolOutputSuffix)
+	require.NoError(t, os.WriteFile(file1, []byte("a"), 0o644))
+	require.NoError(t, os.WriteFile(file2, []byte("b"), 0o644))
+
+	earlier := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
+	later := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(file1, earlier, earlier))
+	require.NoError(t, os.Chtimes(file2, later, later))
+
+	// Turn has two tool calls; the earliest mtime should be used.
+	turnJSON := `{"history": {"turnId": "turn-multi", "parts": [
+		{"type": "toolCall", "toolCallId": "tc-a", "toolId": "run_in_terminal"},
+		{"type": "toolCall", "toolCallId": "tc-b", "toolId": "run_in_terminal"}
+	]}}`
+	turns := []gjson.Result{gjson.Parse(turnJSON)}
+
+	m := loadCodeFreeToolOutputTimestamps(workingDir, "sess-multi", turns)
+	require.NotNil(t, m)
+
+	ts, ok := m.lookupTurnTimestamp("sess-multi", "turn-multi")
+	require.True(t, ok)
+	assert.True(t, ts.Equal(earlier),
+		"should use earliest mtime; got %v want %v", ts, earlier)
+}
+
+func TestMergeToolOutputTimestamps_LogPriority(t *testing.T) {
+	logTS := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
+	toolTS := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
+
+	logMap := codefreeLogTimestampMap{
+		"s/turn-log": {Started: logTS},
+		"s/turn-gap": {}, // exists but Started is zero
+	}
+
+	toolMap := codefreeLogTimestampMap{
+		"s/turn-log": {Started: toolTS}, // should NOT overwrite log
+		"s/turn-gap": {Started: toolTS}, // should fill the gap
+		"s/turn-new": {Started: toolTS}, // should be added
+	}
+
+	merged := mergeToolOutputTimestamps(logMap, toolMap)
+
+	// turn-log: log timestamp preserved.
+	ts, ok := merged.lookupTurnTimestamp("s", "turn-log")
+	require.True(t, ok)
+	assert.Equal(t, logTS, ts, "log timestamp must take priority over tooloutput")
+
+	// turn-gap: filled from tooloutput.
+	ts, ok = merged.lookupTurnTimestamp("s", "turn-gap")
+	require.True(t, ok)
+	assert.Equal(t, toolTS, ts, "gap should be filled from tooloutput")
+
+	// turn-new: added from tooloutput.
+	ts, ok = merged.lookupTurnTimestamp("s", "turn-new")
+	require.True(t, ok)
+	assert.Equal(t, toolTS, ts, "new entry should be added from tooloutput")
+}
+
+func TestLoadCodeFreeSession_WithToolOutputMTime(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "agentSessionData")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+
+	// No logs directory — log timestamps will be empty.
+
+	// Create a working directory with a tooloutput file.
+	workingDir := filepath.Join(tmp, "myproject")
+	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
+	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
+	toolCallID := "tc-mtime-session"
+	outFile := filepath.Join(toolOutputDir, toolCallID+codefreeToolOutputSuffix)
+	require.NoError(t, os.WriteFile(outFile, []byte("terminal output"), 0o644))
+
+	// Set a known mtime.
+	expectedMTime := time.Date(2026, 11, 10, 15, 45, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(outFile, expectedMTime, expectedMTime))
+
+	// Encode workingDir as a file:// URI (as CodeFree stores it).
+	cwdURI := "file:///" + filepath.ToSlash(workingDir)
+
+	// Create a session DB with a turn that has a toolCall part.
+	sessionDir := filepath.Join(root, "uuid-mtime")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+	dbPath := filepath.Join(sessionDir, codefreeSQLiteDBName)
+	_, db := newCodeFreeSQLiteTestDBAt(t, dbPath)
+	stateJSON := `{
+		"session": {"sessionId": "uuid-mtime", "startTime": 1000, "modifiedTime": 9999999999999, "summary": "MTime test", "workingDirectory": "` + cwdURI + `"},
+		"chats": [{"agent": {"uri": "codefree-agent://builtin/spec"}}],
+		"completedTurns": [
+			{"history": {"turnId": "turn-mtime", "userMessage": {"text": "run cmd"}, "parts": [
+				{"type": "text", "text": "running..."},
+				{"type": "toolCall", "toolCallId": "` + toolCallID + `", "toolId": "run_in_terminal"}
+			]}}
+		],
+		"inFlightTurns": []
+	}`
+	seedCodeFreeMetadata(t, db, codefreeStateKey, stateJSON)
+	db.Close()
+
+	store, err := OpenCodeFreeSQLiteStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+
+	sess, msgs, err := loadCodeFreeSession(
+		context.Background(), store.db, dbPath, "uuid-mtime", "m", root,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 2, "1 turn x 2 messages")
+
+	// The timestamp should come from the tooloutput file mtime, not
+	// from session-level interpolation (which would be time.UnixMilli(1000)).
+	assert.True(t, msgs[0].Timestamp.Equal(expectedMTime),
+		"user message should use tooloutput mtime; got %v want %v",
+		msgs[0].Timestamp, expectedMTime)
+	assert.True(t, msgs[1].Timestamp.Equal(expectedMTime),
+		"assistant message should use tooloutput mtime; got %v want %v",
+		msgs[1].Timestamp, expectedMTime)
 }

@@ -120,11 +120,15 @@ func parseCodeFreeStateJSON(
 
 	// CodeFree state JSON does not carry per-turn or per-message
 	// timestamps — only session-level startTime and modifiedTime.
-	// We try to fill real per-turn timestamps from agenthost.log
-	// (passed in via logTS). The resolution strategy is:
-	//   1. Use log timestamps for turns that have them.
-	//   2. Fill missing turns from the nearest known neighbour.
-	//   3. If no log timestamps exist at all, distribute the session
+	// We try to fill real per-turn timestamps from multiple sources,
+	// resolved in priority order:
+	//   1. Use agenthost.log timestamps for turns that have them.
+	//   2. For turns without a log entry, try the modification time
+	//      of tooloutput files (<cwd>/.codefree/tooloutput/
+	//      <toolCallId>-run_in_terminal.txt) as a fallback.
+	//   3. Fill remaining missing turns from the nearest known
+	//      neighbour (linear interpolation).
+	//   4. If no timestamps exist at all, distribute the session
 	//      duration evenly across all turns as a last resort.
 	totalCompleted := 0
 	if completedTurns := root.Get("completedTurns"); completedTurns.IsArray() {
@@ -134,16 +138,31 @@ func parseCodeFreeStateJSON(
 	// Collect turnIds in order (completedTurns then inFlightTurns)
 	// and resolve all timestamps up front.
 	var allTurnIDs []string
+	var allTurns []gjson.Result
 	if completedTurns := root.Get("completedTurns"); completedTurns.IsArray() {
 		for _, turn := range completedTurns.Array() {
 			allTurnIDs = append(allTurnIDs, turn.Get("history.turnId").Str)
+			allTurns = append(allTurns, turn)
 		}
 	}
 	if inFlightTurns := root.Get("inFlightTurns"); inFlightTurns.IsArray() {
 		for _, turn := range inFlightTurns.Array() {
 			allTurnIDs = append(allTurnIDs, turn.Get("history.turnId").Str)
+			allTurns = append(allTurns, turn)
 		}
 	}
+
+	// Supplement log timestamps with tooloutput file mtimes for
+	// turns that lack a log entry. The working directory (sess.Cwd)
+	// is the session's workingDirectory decoded to a native path.
+	// Log timestamps take priority; tooloutput mtime only fills gaps.
+	if sess.Cwd != "" {
+		toolOutputTS := loadCodeFreeToolOutputTimestamps(
+			sess.Cwd, sessionID, allTurns,
+		)
+		logTS = mergeToolOutputTimestamps(logTS, toolOutputTS)
+	}
+
 	turnTimestamps := resolveTurnTimestamps(
 		logTS, sessionID, allTurnIDs, sess.StartedAt, sess.EndedAt,
 	)
