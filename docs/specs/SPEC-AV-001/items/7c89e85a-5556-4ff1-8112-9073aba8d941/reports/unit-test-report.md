@@ -7,17 +7,17 @@
 | SDD Item ID | `7c89e85a-5556-4ff1-8112-9073aba8d941` |
 | Spec ID | `SPEC-AV-001` |
 | 工作项ID | `srdcloud-001` |
-| 代码Commit | `3d78ddc8`（T-003 初始）+ `ef82c263`（T-003 返工：时区修复），T-001/T-002 在前序 item 已完成 |
+| 代码Commit | `3d78ddc8`（T-003 初始）+ `ef82c263`（T-003 返工1：时区修复）+ `31ba24d4`（T-003 返工2：tooloutput mtime 提取），T-001/T-002 在前序 item 已完成 |
 | 测试框架 | Go testing |
-| 执行时间 | 2026-11-11T20:15:00+08:00 |
+| 执行时间 | 2026-11-12T10:25:00+08:00 |
 | 总体结论 | `PASS` |
 
 ## 执行结果
 
 | 命令 | 退出码 | 发现 | 执行 | 通过 | 失败 | 错误 | 跳过 | 原始报告 |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| `go test ./internal/parser/ -run "TestResolveTurnTimestamps\|TestLoadCodeFreeLogTimestamps\|TestCodefreeLogTimestampMap\|TestLoadCodeFreeSession_WithLogTimestamps\|TestLoadCodeFreeSession_PartialLogTimestamps" -v` | 0 | 14 | 14 | 14 | 0 | 0 | 0 | 终端输出 |
-| `go test ./internal/parser/ -run "Codefree\|CodeFree" -v` | 1 | 31 | 31 | 29 | 2 | 0 | 0 | 终端输出（2个既有Windows平台失败） |
+| `go test ./internal/parser/ -run "TestResolveTurnTimestamps\|TestLoadCodeFreeLogTimestamps\|TestCodefreeLogTimestampMap\|TestLoadCodeFreeSession_WithLogTimestamps\|TestLoadCodeFreeSession_PartialLogTimestamps\|TestLoadCodeFreeToolOutputTimestamps\|TestMergeToolOutputTimestamps\|TestLoadCodeFreeSession_WithToolOutputMTime" -v` | 0 | 20 | 20 | 20 | 0 | 0 | 0 | 终端输出 |
+| `go test ./internal/parser/ -run "Codefree\|CodeFree" -v` | 1 | 43 | 43 | 41 | 2 | 0 | 0 | 终端输出（2个既有Windows平台失败） |
 | `go vet ./internal/parser/` | 0 | — | — | — | — | — | — | 终端输出 |
 | `go fmt ./internal/parser/` | 0 | — | — | — | — | — | — | 终端输出 |
 
@@ -25,7 +25,7 @@
 
 | 指标 | 实际值 | AGENTS.md阈值 | 结论 | 证据 |
 |---|---:|---:|---|---|
-| 测试通过率 | 100% | 无明确阈值 | PASS | 29/29 通过（排除2个既有Windows平台失败） |
+| 测试通过率 | 100% | 无明确阈值 | PASS | 41/41 通过（排除2个既有Windows平台失败） |
 | 行覆盖率 | NOT_APPLICABLE | 无明确阈值 | NOT_APPLICABLE | 项目未配置覆盖率工具 |
 | 分支覆盖率 | NOT_APPLICABLE | 无明确阈值 | NOT_APPLICABLE | 项目未配置覆盖率工具 |
 
@@ -42,6 +42,12 @@
 | AC-003-1 | T-003 | `TestLoadCodeFreeLogTimestamps_TimezoneConversion` | `go test ./internal/parser/ -run TestLoadCodeFreeLogTimestamps_TimezoneConversion -v` | VERIFIED | PASS (0.01s) |
 | AC-003-1 | T-003 | `TestLoadCodeFreeSession_WithLogTimestamps` | `go test ./internal/parser/ -run TestLoadCodeFreeSession_WithLogTimestamps -v` | VERIFIED | PASS (0.03s) |
 | AC-003-1 | T-003 | `TestCodefreeLogTimestampMap_Parse` | `go test ./internal/parser/ -run TestCodefreeLogTimestampMap_Parse -v` | VERIFIED | PASS (0.00s) |
+| AC-003-1 | T-003 | `TestLoadCodeFreeToolOutputTimestamps_WithFile` | `go test ./internal/parser/ -run TestLoadCodeFreeToolOutputTimestamps_WithFile -v` | VERIFIED | PASS (0.01s) |
+| AC-003-1 | T-003 | `TestLoadCodeFreeToolOutputTimestamps_NoFile` | `go test ./internal/parser/ -run TestLoadCodeFreeToolOutputTimestamps_NoFile -v` | VERIFIED | PASS (0.01s) |
+| AC-003-1 | T-003 | `TestLoadCodeFreeToolOutputTimestamps_EmptyWorkingDir` | `go test ./internal/parser/ -run TestLoadCodeFreeToolOutputTimestamps_EmptyWorkingDir -v` | VERIFIED | PASS (0.00s) |
+| AC-003-1 | T-003 | `TestLoadCodeFreeToolOutputTimestamps_MultipleToolCalls_EarliestMTime` | `go test ./internal/parser/ -run TestLoadCodeFreeToolOutputTimestamps_MultipleToolCalls_EarliestMTime -v` | VERIFIED | PASS (0.01s) |
+| AC-003-1 | T-003 | `TestMergeToolOutputTimestamps_LogPriority` | `go test ./internal/parser/ -run TestMergeToolOutputTimestamps_LogPriority -v` | VERIFIED | PASS (0.00s) |
+| AC-003-1 | T-003 | `TestLoadCodeFreeSession_WithToolOutputMTime` | `go test ./internal/parser/ -run TestLoadCodeFreeSession_WithToolOutputMTime -v` | VERIFIED | PASS (0.03s) |
 | AC-003-2 | T-003 | `TestResolveTurnTimestamps_PartialLog_FillFromPreceding` | `go test ./internal/parser/ -run TestResolveTurnTimestamps_PartialLog_FillFromPreceding -v` | VERIFIED | PASS (0.00s) |
 | AC-003-2 | T-003 | `TestResolveTurnTimestamps_PartialLog_FillFromFollowing` | `go test ./internal/parser/ -run TestResolveTurnTimestamps_PartialLog_FillFromFollowing -v` | VERIFIED | PASS (0.00s) |
 | AC-003-2 | T-003 | `TestResolveTurnTimestamps_PartialLog_MiddleGap` | `go test ./internal/parser/ -run TestResolveTurnTimestamps_PartialLog_MiddleGap -v` | VERIFIED | PASS (0.00s) |
@@ -54,8 +60,9 @@
 
 ## 失败与限制
 
-- 无失败。全量 CodeFree 相关测试 29 个通过（T-003 专项 14 个 + 其他 15 个）。
+- 无失败。全量 CodeFree 相关测试 41 个通过（T-003 专项 20 个 + 其他 21 个）。
 - `TestCodefreeDecodeWorkingDir` 的 unix_path 和 file://_double_slash 子测试在 Windows 上会失败，这是既有问题，与本次变更无关，未纳入本次测试范围。
-- 返工新增 `TestLoadCodeFreeLogTimestamps_TimezoneConversion` 验证 GMT+8→UTC 时区转换正确性（16:32:05.354 GMT+8 → 08:32:05.354 UTC）。
+- 返工1新增 `TestLoadCodeFreeLogTimestamps_TimezoneConversion` 验证 GMT+8→UTC 时区转换正确性（16:32:05.354 GMT+8 → 08:32:05.354 UTC）。
+- 返工2新增 6 个 tooloutput mtime 测试：`TestLoadCodeFreeToolOutputTimestamps_WithFile`（有文件时 mtime 被使用）、`TestLoadCodeFreeToolOutputTimestamps_NoFile`（无文件时返回空）、`TestLoadCodeFreeToolOutputTimestamps_EmptyWorkingDir`（空工作目录安全跳过）、`TestLoadCodeFreeToolOutputTimestamps_MultipleToolCalls_EarliestMTime`（多 toolCall 取最早 mtime）、`TestMergeToolOutputTimestamps_LogPriority`（log 优先级验证）、`TestLoadCodeFreeSession_WithToolOutputMTime`（端到端集成验证）。
 
 本文件是当前item唯一单元测试报告，重复执行时原地更新，不创建带日期、版本号或`final`后缀的副本。
