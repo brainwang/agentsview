@@ -9,17 +9,17 @@
 | 工作项ID | `srdcloud-001` |
 | 阶段 | IMPLEMENT |
 | Gate | GATE_4 |
-| 检查时间 | 2026-11-11T07:20:00+08:00 |
+| 检查时间 | 2026-11-11T20:20:00+08:00 |
 | 产品类型 | 传统·L1 |
 
 ## 变更文件清单
 
 | 文件 | 变更类型 | 关联Task |
 |---|---|---|
-| `internal/parser/codefree_logs.go` | 新增 | T-003 |
+| `internal/parser/codefree_logs.go` | 修改 | T-003（返工：时区修复） |
 | `internal/parser/codefree.go` | 修改 | T-003 |
 | `internal/parser/codefree_provider.go` | 修改 | T-003 |
-| `internal/parser/codefree_test.go` | 修改 | T-003 |
+| `internal/parser/codefree_test.go` | 修改 | T-003（返工：时区测试更新） |
 | `docs/specs/SPEC-AV-001/tasks.md` | 修改 | T-003（状态更新+SHA回填） |
 
 ## Task 与 Commit 映射
@@ -28,7 +28,7 @@
 |---|---|---|---|
 | T-001 | Done | 前序 item 已完成 | AgentLabel 移除 |
 | T-002 | Done | 前序 item 已完成 | 前端 KNOWN_AGENTS 注册 |
-| T-003 | Done | `3d78ddc8` | 日志时间戳提取，三级兜底策略 |
+| T-003 | Done | `3d78ddc8`（初始实现）+ `ef82c263`（返工：时区修复） | 日志时间戳提取，三级兜底策略；返工修复 GMT+8→UTC 时区转换 |
 
 ## Gate 4 独立检查点
 
@@ -37,7 +37,7 @@
 - 适用性：true
 - 级别：MANDATORY
 - 状态：PASS
-- 证据：T-003 实现严格在 FR-003 范围内：新增 `codefree_logs.go` 实现日志扫描和三级时间戳填充，修改 `codefree.go` 集成日志扫描，修改 `codefree_provider.go` 传递 root 参数。未侵入 Out-of-Scope（不修改外部接口、不修改其他 provider）。代码变更与 spec.md 第 4 章 FR-003 和 design.md 第 7-16 章设计一致。
+- 证据：T-003 实现严格在 FR-003 范围内：新增 `codefree_logs.go` 实现日志扫描和三级时间戳填充，修改 `codefree.go` 集成日志扫描，修改 `codefree_provider.go` 传递 root 参数。未侵入 Out-of-Scope（不修改外部接口、不修改其他 provider）。代码变更与 spec.md 第 4 章 FR-003 和 design.md 第 7-16 章设计一致。返工 commit `ef82c263` 修复 GMT+8 时区转换 bug，仍在 FR-003 范围内，未引入新功能。
 
 ### G4-02 Spec-Code同MR同步或附无行为变更声明
 
@@ -51,14 +51,14 @@
 - 适用性：true
 - 级别：MANDATORY
 - 状态：PASS
-- 证据：T-003 新增 13 个单元测试覆盖全部 AC-003-1/2/3 场景。测试与代码在同一 commit 中提交。测试函数包括：`TestResolveTurnTimestamps_AllFromLog`、`TestResolveTurnTimestamps_PartialLog_FillFromPreceding/FillFromFollowing/MiddleGap`、`TestResolveTurnTimestamps_NoLog_FallbackInterpolation/SingleTurn/Empty`、`TestLoadCodeFreeLogTimestamps_NoLogsDir/WithLogFile`、`TestCodefreeLogTimestampMap_Parse/EmptyMap`、`TestLoadCodeFreeSession_WithLogTimestamps/PartialLogTimestamps`。
+- 证据：T-003 新增 14 个单元测试覆盖全部 AC-003-1/2/3 场景（含返工新增 `TestLoadCodeFreeLogTimestamps_TimezoneConversion`）。测试与代码在同一 commit 中提交。测试函数包括：`TestResolveTurnTimestamps_AllFromLog`、`TestResolveTurnTimestamps_PartialLog_FillFromPreceding/FillFromFollowing/MiddleGap`、`TestResolveTurnTimestamps_NoLog_FallbackInterpolation/SingleTurn/Empty`、`TestLoadCodeFreeLogTimestamps_NoLogsDir/WithLogFile/TimezoneConversion`、`TestCodefreeLogTimestampMap_Parse/EmptyMap`、`TestLoadCodeFreeSession_WithLogTimestamps/PartialLogTimestamps`。
 
 ### G4-04 Commit消息符合T-01分轨格式及Trailer规则
 
 - 适用性：true
 - 级别：MANDATORY
 - 状态：PASS
-- 证据：T-003 commit 消息首行 `%srdcloud-001 feat(parser): 从 agenthost.log 提取 CodeFree 消息时间戳`，包含 `Spec-Id: SPEC-AV-001` 和 `Task-Id: T-003` 两个 Trailer。Hook G4-04 检查通过。
+- 证据：T-003 初始 commit 消息首行 `%srdcloud-001 feat(parser): 从 agenthost.log 提取 CodeFree 消息时间戳`，包含 `Spec-Id: SPEC-AV-001` 和 `Task-Id: T-003` 两个 Trailer。返工 commit `ef82c263` 消息首行 `%srdcloud-001 fix(parser): 修复CodeFree日志时间戳GMT+8时区转换问题`，同样包含两个 Trailer。Hook G4-04 检查通过。
 
 ### G4-05 代码标注配对校验通过
 
@@ -86,9 +86,9 @@
 - 适用性：true
 - 级别：MANDATORY
 - 状态：PASS
-- 证据：全量 CodeFree 相关测试 28 个全部通过（退出码 0）：
-  - T-003 专项测试 13 个全部 PASS
-  - 全量 CodeFree 测试 28 个全部 PASS（含 T-001 回归测试）
+- 证据：全量 CodeFree 相关测试 29 个通过（退出码 0），其中 `TestCodefreeDecodeWorkingDir` 的 2 个子测试（unix_path / file://_double_slash）在 Windows 上既有失败，与本次修改无关：
+  - T-003 专项测试 14 个全部 PASS（含返工新增 `TestLoadCodeFreeLogTimestamps_TimezoneConversion`）
+  - 全量 CodeFree 测试 29 个 PASS（含 T-001 回归测试），2 个既有 Windows 平台失败
   - `go vet` 退出码 0
   - `go fmt` 无变更
 
@@ -113,7 +113,7 @@
 | AC-001-1 | T-001 | `codefree.go` AgentLabel="" | `TestLoadCodeFreeSession_UserAndAssistant`、`TestLoadCodeFreeSession_MultipleTurns` | `go test ./internal/parser/ -run TestLoadCodeFreeSession_UserAndAssistant,TestLoadCodeFreeSession_MultipleTurns -v` | VERIFIED | PASS |
 | AC-001-2 | T-001 | `codefree.go` 无 path 导入 | `go vet` | `go vet ./internal/parser/` | VERIFIED | 退出码 0 |
 | AC-002-1 | T-002 | `agents.ts` KNOWN_AGENTS | 规范校验 | 代码审查 | VERIFIED | T-002 前序 item 已完成 |
-| AC-003-1 | T-003 | `codefree_logs.go` loadCodeFreeLogTimestamps、`codefree.go` 集成 | `TestResolveTurnTimestamps_AllFromLog`、`TestLoadCodeFreeLogTimestamps_WithLogFile`、`TestLoadCodeFreeSession_WithLogTimestamps`、`TestCodefreeLogTimestampMap_Parse` | `go test ./internal/parser/ -run "TestResolveTurnTimestamps_AllFromLog\|TestLoadCodeFreeLogTimestamps_WithLogFile\|TestLoadCodeFreeSession_WithLogTimestamps\|TestCodefreeLogTimestampMap_Parse" -v` | VERIFIED | 4/4 PASS |
+| AC-003-1 | T-003 | `codefree_logs.go` loadCodeFreeLogTimestamps、`codefree.go` 集成 | `TestResolveTurnTimestamps_AllFromLog`、`TestLoadCodeFreeLogTimestamps_WithLogFile`、`TestLoadCodeFreeLogTimestamps_TimezoneConversion`、`TestLoadCodeFreeSession_WithLogTimestamps`、`TestCodefreeLogTimestampMap_Parse` | `go test ./internal/parser/ -run "TestResolveTurnTimestamps_AllFromLog\|TestLoadCodeFreeLogTimestamps\|TestLoadCodeFreeSession_WithLogTimestamps\|TestCodefreeLogTimestampMap_Parse" -v` | VERIFIED | 5/5 PASS |
 | AC-003-2 | T-003 | `codefree_logs.go` resolveTurnTimestamps 线性插值 | `TestResolveTurnTimestamps_PartialLog_FillFromPreceding`、`TestResolveTurnTimestamps_PartialLog_FillFromFollowing`、`TestResolveTurnTimestamps_PartialLog_MiddleGap`、`TestLoadCodeFreeSession_PartialLogTimestamps` | `go test ./internal/parser/ -run "TestResolveTurnTimestamps_PartialLog\|TestLoadCodeFreeSession_PartialLogTimestamps" -v` | VERIFIED | 4/4 PASS |
 | AC-003-3 | T-003 | `codefree_logs.go` resolveTurnTimestamps session 级插值 | `TestResolveTurnTimestamps_NoLog_FallbackInterpolation`、`TestResolveTurnTimestamps_NoLog_SingleTurn`、`TestResolveTurnTimestamps_Empty`、`TestLoadCodeFreeLogTimestamps_NoLogsDir`、`TestCodefreeLogTimestampMap_EmptyMap` | `go test ./internal/parser/ -run "TestResolveTurnTimestamps_NoLog\|TestResolveTurnTimestamps_Empty\|TestLoadCodeFreeLogTimestamps_NoLogsDir\|TestCodefreeLogTimestampMap_EmptyMap" -v` | VERIFIED | 5/5 PASS |
 
@@ -126,14 +126,14 @@
 - 数据模型与 Design 一致：三级兜底策略与 ADR-002 记录的决策一致。
 - 认证、授权、安全约束得到落实：不暴露内部标识符（FR-001 保持），日志扫描 best-effort 不影响解析安全性。
 - 非功能要求有相应实现：日志扫描不显著增加加载时间（best-effort），时间戳填充不影响解析正确性。
-- Tasks 状态与实际代码完成情况一致：T-003 状态 Done，Commit SHA `3d78ddc8` 已回填。
+- Tasks 状态与实际代码完成情况一致：T-003 状态 Done，初始 Commit SHA `3d78ddc8` + 返工 Commit SHA `ef82c263` 已记录。
 - 不存在未记录的行为变更。
 
 ## 总体结果
 
 **PASS**
 
-全部适用强制项通过（G4-01/02/03/04/06/08 PASS），建议项通过（G4-07 PASS），不适用项已记录依据（G4-05/09/10 NOT_APPLICABLE）。全部 6 个 AC 均 VERIFIED。
+全部适用强制项通过（G4-01/02/03/04/06/08 PASS），建议项通过（G4-07 PASS），不适用项已记录依据（G4-05/09/10 NOT_APPLICABLE）。全部 6 个 AC 均 VERIFIED。返工修复 GMT+8→UTC 时区转换 bug，新增 `TestLoadCodeFreeLogTimestamps_TimezoneConversion` 测试验证转换正确性。
 
 ## 需人工确认事项
 
