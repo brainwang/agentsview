@@ -46,6 +46,21 @@ var codefreeLogTurnTerminalRe = regexp.MustCompile(
 // of every agenthost.log line: "2026-11-09 16:32:05.354".
 const codefreeLogTimestampLayout = "2006-01-02 15:04:05.000"
 
+// codefreeLogTimezone is the timezone used by CodeFree agenthost.log
+// timestamps. The log writes local wall-clock time, which is GMT+8
+// (Asia/Shanghai) in the deployment environment. time.Parse without a
+// zone returns UTC, so we must re-interpret the parsed time in the
+// correct zone and convert to UTC for storage.
+var codefreeLogTimezone = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		// Fallback: fixed offset of +8 hours if the timezone
+		// database is not available.
+		return time.FixedZone("CST", 8*3600)
+	}
+	return loc
+}()
+
 // loadCodeFreeLogTimestamps scans all agenthost.log files under the
 // logs directory sibling to the agentSessionData root and builds a
 // map of sessionID/turnId → turn timestamps.
@@ -154,6 +169,16 @@ func codefreeParseLogLineForTurnTimestamp(
 	if err != nil {
 		return
 	}
+	// The log writes local wall-clock time (GMT+8). time.Parse
+	// without a zone returns UTC, which would make the stored
+	// timestamp 8 hours too late. Re-interpret the parsed
+	// wall-clock components in the correct zone, then convert to
+	// UTC for storage.
+	ts = time.Date(
+		ts.Year(), ts.Month(), ts.Day(),
+		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(),
+		codefreeLogTimezone,
+	).UTC()
 
 	// Try "Turn started" first.
 	if m2 := codefreeLogTurnStartedRe.FindStringSubmatch(line); m2 != nil {

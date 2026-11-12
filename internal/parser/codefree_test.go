@@ -530,20 +530,20 @@ func TestCodefreeLogTimestampMap_Parse(t *testing.T) {
 		codefreeParseLogLineForTurnTimestamp(line, m)
 	}
 
-	// Turn aaa: started at 16:32:05.354, terminal at 16:32:59.322.
+	// Turn aaa: started at 16:32:05.354 GMT+8, converted to 08:32:05.354 UTC.
 	ts, ok := m.lookupTurnTimestamp("sess-1", "request_aaa")
 	require.True(t, ok)
-	assert.Equal(t, "2026-11-09 16:32:05.354", ts.Format(codefreeLogTimestampLayout))
+	assert.Equal(t, "2026-11-09 08:32:05.354", ts.Format(codefreeLogTimestampLayout))
 
-	// Turn bbb: started at 16:35:03.247.
+	// Turn bbb: started at 16:35:03.247 GMT+8, converted to 08:35:03.247 UTC.
 	ts, ok = m.lookupTurnTimestamp("sess-1", "request_bbb")
 	require.True(t, ok)
-	assert.Equal(t, "2026-11-09 16:35:03.247", ts.Format(codefreeLogTimestampLayout))
+	assert.Equal(t, "2026-11-09 08:35:03.247", ts.Format(codefreeLogTimestampLayout))
 
-	// Turn ccc: different session.
+	// Turn ccc: different session, 16:46:11.295 GMT+8 → 08:46:11.295 UTC.
 	ts, ok = m.lookupTurnTimestamp("sess-2", "request_ccc")
 	require.True(t, ok)
-	assert.Equal(t, "2026-11-09 16:46:11.295", ts.Format(codefreeLogTimestampLayout))
+	assert.Equal(t, "2026-11-09 08:46:11.295", ts.Format(codefreeLogTimestampLayout))
 
 	// Unknown turn.
 	_, ok = m.lookupTurnTimestamp("sess-1", "request_unknown")
@@ -593,11 +593,41 @@ func TestLoadCodeFreeLogTimestamps_WithLogFile(t *testing.T) {
 
 	ts, ok := m.lookupTurnTimestamp("sess-log", "request_t1")
 	require.True(t, ok)
-	assert.Equal(t, "2026-11-09 16:32:05.354", ts.Format(codefreeLogTimestampLayout))
+	// Log time is GMT+8 (16:32:05.354), stored as UTC (08:32:05.354).
+	assert.Equal(t, "2026-11-09 08:32:05.354", ts.Format(codefreeLogTimestampLayout))
+	assert.Equal(t, time.UTC, ts.Location())
 
 	ts, ok = m.lookupTurnTimestamp("sess-log", "request_t2")
 	require.True(t, ok)
-	assert.Equal(t, "2026-11-09 16:35:03.247", ts.Format(codefreeLogTimestampLayout))
+	// Log time is GMT+8 (16:35:03.247), stored as UTC (08:35:03.247).
+	assert.Equal(t, "2026-11-09 08:35:03.247", ts.Format(codefreeLogTimestampLayout))
+	assert.Equal(t, time.UTC, ts.Location())
+}
+
+func TestLoadCodeFreeLogTimestamps_TimezoneConversion(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "agentSessionData")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+
+	logDir := filepath.Join(tmp, "logs", "20261109T145816")
+	require.NoError(t, os.MkdirAll(logDir, 0o755))
+	// Log time 2026-11-09 16:32:05.354 is GMT+8 (Asia/Shanghai).
+	// Expected UTC: 2026-11-09 08:32:05.354.
+	logContent := "2026-11-09 16:32:05.354 [info] [CodeFree] Turn started session=sess-tz turn=request_tz1 authRevision=5 stage=preflight\n"
+	require.NoError(t, os.WriteFile(
+		filepath.Join(logDir, "agenthost.log"), []byte(logContent), 0o644,
+	))
+
+	m, err := loadCodeFreeLogTimestamps(root)
+	require.NoError(t, err)
+	require.Len(t, m, 1)
+
+	ts, ok := m.lookupTurnTimestamp("sess-tz", "request_tz1")
+	require.True(t, ok)
+	// The stored timestamp must be UTC, not the raw GMT+8 value.
+	assert.Equal(t, time.UTC, ts.Location())
+	assert.Equal(t, "2026-11-09 08:32:05.354", ts.Format(codefreeLogTimestampLayout),
+		"GMT+8 16:32:05.354 must convert to UTC 08:32:05.354")
 }
 
 func TestLoadCodeFreeSession_WithLogTimestamps(t *testing.T) {
@@ -640,13 +670,13 @@ func TestLoadCodeFreeSession_WithLogTimestamps(t *testing.T) {
 	require.NotNil(t, sess)
 	require.Len(t, msgs, 2)
 
-	// The timestamp should come from the log (2026-11-09 16:32:05.354),
-	// not from the session-level interpolation (which would be
-	// time.UnixMilli(1000) = 1970-01-01 00:00:01).
-	expectedLogTS, err := time.Parse(codefreeLogTimestampLayout, "2026-11-09 16:32:05.354")
-	require.NoError(t, err)
-	assert.Equal(t, expectedLogTS, msgs[0].Timestamp, "user message should use log timestamp")
-	assert.Equal(t, expectedLogTS, msgs[1].Timestamp, "assistant message should use log timestamp")
+	// The timestamp should come from the log (2026-11-09 16:32:05.354
+	// GMT+8), converted to UTC (08:32:05.354), not from the session-
+	// level interpolation (which would be time.UnixMilli(1000) =
+	// 1970-01-01 00:00:01).
+	expectedLogTS := codefreeLogTimeToUTC(t, "2026-11-09 16:32:05.354")
+	assert.Equal(t, expectedLogTS, msgs[0].Timestamp, "user message should use log timestamp (UTC)")
+	assert.Equal(t, expectedLogTS, msgs[1].Timestamp, "assistant message should use log timestamp (UTC)")
 }
 
 func TestResolveTurnTimestamps_AllFromLog(t *testing.T) {
@@ -811,10 +841,10 @@ func TestLoadCodeFreeSession_PartialLogTimestamps(t *testing.T) {
 	require.NotNil(t, sess)
 	require.Len(t, msgs, 6, "3 turns x 2 messages")
 
-	// Turn 0: from log → 16:32:05.354
-	ts0, _ := time.Parse(codefreeLogTimestampLayout, "2026-11-09 16:32:05.354")
-	// Turn 2: from log → 16:45:00.000
-	ts2, _ := time.Parse(codefreeLogTimestampLayout, "2026-11-09 16:45:00.000")
+	// Turn 0: from log → 16:32:05.354 GMT+8 → 08:32:05.354 UTC
+	ts0 := codefreeLogTimeToUTC(t, "2026-11-09 16:32:05.354")
+	// Turn 2: from log → 16:45:00.000 GMT+8 → 08:45:00.000 UTC
+	ts2 := codefreeLogTimeToUTC(t, "2026-11-09 16:45:00.000")
 
 	assert.Equal(t, ts0, msgs[0].Timestamp, "turn 0 user msg from log")
 	assert.Equal(t, ts0, msgs[1].Timestamp, "turn 0 assistant msg from log")
@@ -827,4 +857,19 @@ func TestLoadCodeFreeSession_PartialLogTimestamps(t *testing.T) {
 
 	assert.Equal(t, ts2, msgs[4].Timestamp, "turn 2 user msg from log")
 	assert.Equal(t, ts2, msgs[5].Timestamp, "turn 2 assistant msg from log")
+}
+
+// codefreeLogTimeToUTC parses a CodeFree agenthost.log timestamp string
+// (GMT+8 wall-clock time) and returns the equivalent UTC time. This
+// mirrors the conversion in codefreeParseLogLineForTurnTimestamp:
+// time.Parse returns UTC, so we must re-interpret the wall-clock
+// components in the GMT+8 zone and then convert to UTC.
+func codefreeLogTimeToUTC(t *testing.T, s string) time.Time {
+	ts, err := time.Parse(codefreeLogTimestampLayout, s)
+	require.NoError(t, err)
+	return time.Date(
+		ts.Year(), ts.Month(), ts.Day(),
+		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(),
+		codefreeLogTimezone,
+	).UTC()
 }
