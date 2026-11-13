@@ -1,5 +1,5 @@
 version: 1
-updated_at: "2026-11-12T07:13:47.186Z"
+updated_at: "2026-11-13T00:10:35.501Z"
 items:
   - item_id: "750381b8-384c-46bf-b23a-c94cdd1e8f3e"
     spec_id: "SPEC-AV-001"
@@ -335,9 +335,9 @@ items:
     sop:
       name: "SDD 标准开发流程"
       version: 1
-    revision: 24
+    revision: 25
     created_at: "2026-11-11T03:02:13.298Z"
-    updated_at: "2026-11-12T07:13:47.186Z"
+    updated_at: "2026-11-13T00:10:35.501Z"
     current_node_id: null
     temp_node_id: "G4"
     spec_commit: "13c876c81f7e1357db7372a8a1513466edc6437c"
@@ -604,6 +604,22 @@ items:
           - key: "unit_test_report"
             kind: "file"
             path: "docs/specs/SPEC-AV-001/items/7c89e85a-5556-4ff1-8112-9073aba8d941/reports/unit-test-report.md"
+            ready: true
+          - key: "codefree_logtools"
+            kind: "file"
+            path: "internal/parser/codefree_logtools.go"
+            ready: true
+          - key: "codefree_logs"
+            kind: "file"
+            path: "internal/parser/codefree_logs.go"
+            ready: true
+          - key: "codefree_main"
+            kind: "file"
+            path: "internal/parser/codefree.go"
+            ready: true
+          - key: "codefree_test"
+            kind: "file"
+            path: "internal/parser/codefree_test.go"
             ready: true
       - node_id: "G5"
         name: "验收验证"
