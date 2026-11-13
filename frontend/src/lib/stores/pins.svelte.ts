@@ -75,7 +75,9 @@ class PinsStore {
         this.#loadVersion === loadVer &&
         this.#mutationVersion === mutVer
       ) {
-        this.sessionPinIds = new Set(res.pins.map((p) => p.message_id));
+        this.sessionPinIds = new Set(
+          res.pins.filter((p) => !p.unresolved).map((p) => p.message_id),
+        );
       }
     } catch (e) {
       if (isAbortError(e) || !this.#sessionPinsRead.isCurrent(signal)) return;
@@ -109,12 +111,29 @@ class PinsStore {
   /** Re-fetch session pins after the last in-flight mutation settles. */
   #refetchAfterMutation() {
     if (this.#inflight.size === 0 && this.#currentSessionId) {
-      this.loadForSession(this.#currentSessionId);
+      void this.loadForSession(this.#currentSessionId);
+    }
+  }
+
+  async removeReference(pin: PinnedMessage) {
+    if (!pin.message_key) return;
+    this.#mutationVersion++;
+    try {
+      await PinsService.deleteApiV1SessionsByIdPinReferencesByMessageKey({
+        id: pin.session_id,
+        messageKey: pin.message_key,
+      });
+      this.pins = this.pins.filter(
+        (p) => !(p.session_id === pin.session_id && p.message_key === pin.message_key),
+      );
+    } finally {
+      void this.loadAll(this.#loadedProject);
+      if (this.#currentSessionId) void this.loadForSession(this.#currentSessionId);
     }
   }
 
   async unpin(sessionId: string, messageId: number) {
-    if (this.#inflight.has(messageId)) return;
+    if (this.#inflight.has(messageId)) return false;
     this.#inflight.add(messageId);
     this.#mutationVersion++;
     try {
@@ -131,8 +150,7 @@ class PinsStore {
       this.pins = this.pins.filter(
         (p) => !(p.session_id === sessionId && p.message_id === messageId),
       );
-    } catch {
-      // Silently ignore — refetch will reconcile state.
+      return true;
     } finally {
       this.#inflight.delete(messageId);
       this.#refetchAfterMutation();
@@ -140,9 +158,9 @@ class PinsStore {
   }
 
   async togglePin(sessionId: string, messageId: number, ordinal: number) {
-    if (this.#inflight.has(messageId)) return;
+    if (this.#inflight.has(messageId)) return false;
     if (this.sessionPinIds.has(messageId)) {
-      await this.unpin(sessionId, messageId);
+      return this.unpin(sessionId, messageId);
     } else {
       this.#inflight.add(messageId);
       this.#mutationVersion++;
@@ -167,8 +185,7 @@ class PinsStore {
           },
           ...this.pins.filter((p) => !(p.session_id === sessionId && p.message_id === messageId)),
         ];
-      } catch {
-        // Silently ignore — refetch will reconcile state.
+        return true;
       } finally {
         this.#inflight.delete(messageId);
         this.#refetchAfterMutation();

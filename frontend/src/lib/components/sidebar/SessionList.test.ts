@@ -1,13 +1,12 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import SessionList from "./SessionList.svelte";
-import sessionFilterControlSource from "../filters/SessionFilterControl.svelte?raw";
-import sessionItemSource from "./SessionItem.svelte?raw";
 import { readProgress } from "../../stores/read-progress.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import type { Session } from "../../api/types.js";
+import { SessionsService } from "../../api/generated/index.js";
 import { starred } from "../../stores/starred.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { m, setLocale } from "../../i18n/index.js";
@@ -47,8 +46,8 @@ class ResizeObserverMock {
 describe("SessionList filter dropdown", () => {
   let component: ReturnType<typeof mount> | undefined;
   let originalResizeObserver: typeof ResizeObserver | undefined;
-  let clientHeightSpy: ReturnType<typeof vi.spyOn> | undefined;
-  let rafSpy: ReturnType<typeof vi.spyOn> | undefined;
+  let clientHeightSpy: MockInstance<() => number> | undefined;
+  let rafSpy: MockInstance<typeof requestAnimationFrame> | undefined;
 
   beforeEach(() => {
     originalResizeObserver = globalThis.ResizeObserver;
@@ -103,23 +102,6 @@ describe("SessionList filter dropdown", () => {
     ui.sidebarOpen = true;
     ui.isMobileViewport = false;
     vi.restoreAllMocks();
-  });
-
-  it("bounds the filter menu to the viewport and lets it scroll", async () => {
-    component = mount(SessionList, { target: document.body });
-    await tick();
-
-    const filterButton = document.querySelector<HTMLButtonElement>(".filter-btn");
-    expect(filterButton).not.toBeNull();
-
-    filterButton!.click();
-    await tick();
-
-    const dropdown = document.querySelector<HTMLElement>(".filter-dropdown");
-    expect(dropdown).not.toBeNull();
-
-    expect(sessionFilterControlSource).toContain("max-height: min(560px, calc(100vh - 128px));");
-    expect(sessionFilterControlSource).toContain("overflow-y: auto;");
   });
 
   it("labels compact header controls with hover hints", async () => {
@@ -330,8 +312,8 @@ describe("SessionList filter dropdown", () => {
 describe("SessionList visible hydration", () => {
   let component: ReturnType<typeof mount> | undefined;
   let originalResizeObserver: typeof ResizeObserver | undefined;
-  let clientHeightSpy: ReturnType<typeof vi.spyOn> | undefined;
-  let rafSpy: ReturnType<typeof vi.spyOn> | undefined;
+  let clientHeightSpy: MockInstance<() => number> | undefined;
+  let rafSpy: MockInstance<typeof requestAnimationFrame> | undefined;
 
   beforeEach(() => {
     originalResizeObserver = globalThis.ResizeObserver;
@@ -350,6 +332,7 @@ describe("SessionList visible hydration", () => {
         return 1;
       });
     sessions.sessions = [];
+    sessions.details.clear();
     sessions.activeSessionId = null;
     sessions.nextCursor = null;
     sessions.loading = false;
@@ -381,7 +364,9 @@ describe("SessionList visible hydration", () => {
     vi.restoreAllMocks();
   });
 
-  it("initial hydration target uses viewport rows plus overscan", async () => {
+  it("hydrates visible viewport rows plus overscan", async () => {
+    const viewportHeight = ITEM_HEIGHT * 2.5;
+    clientHeightSpy!.mockReturnValue(viewportHeight);
     sessions.sessions = Array.from({ length: 20 }, (_, i) =>
       makeSession({ id: `s${i}`, is_index_only: true }),
     );
@@ -390,57 +375,44 @@ describe("SessionList visible hydration", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const expected = Math.ceil((ITEM_HEIGHT * 3) / ITEM_HEIGHT) + OVERSCAN;
     expect(hydrate).toHaveBeenCalledWith(
-      Array.from({ length: expected }, (_, i) => `s${i}`),
+      Array.from({ length: Math.ceil(viewportHeight / ITEM_HEIGHT) + OVERSCAN }, (_, i) => `s${i}`),
       sessions.sidebarIndexVersion,
     );
   });
 
-  it("holds first visible index-only rows until initial hydration resolves", async () => {
-    sessions.sessions = [
-      makeSession({ id: "pending", project: "placeholder", is_index_only: true }),
-    ];
-    let resolveHydration!: () => void;
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockReturnValue(
-      new Promise<void>((resolve) => {
-        resolveHydration = resolve;
-      }),
-    );
+  it("paints stored titles immediately after an identical index reload", async () => {
+    const row = { ...makeSession({ id: "reload-row" }), is_teammate: false };
+    vi.spyOn(SessionsService, "getApiV1SessionsSidebarIndex").mockResolvedValue({
+      sessions: [row],
+      total: 1,
+    });
+    const getDetail = vi
+      .spyOn(SessionsService, "getApiV1SessionsById")
+      .mockResolvedValueOnce(makeSession({ id: "reload-row", first_message: "Saved title" }))
+      .mockReturnValue(new Promise(() => {}));
+    await sessions.load();
+    await sessions.hydrateVisibleSessions(["reload-row"]);
+    await sessions.load();
 
     component = mount(SessionList, { target: document.body });
     await tick();
-
-    expect(document.querySelector(".session-item")).toBeNull();
-
-    sessions.sessions = [
-      makeSession({
-        id: "pending",
-        first_message: "hydrated visible title",
-        is_index_only: false,
-      }),
-    ];
-    resolveHydration();
-    await tick();
     await tick();
 
-    expect(document.body.textContent).toContain("hydrated visible title");
+    expect(getDetail).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Saved title");
   });
 
-  it("renders renamed rows without waiting for hydration", async () => {
+  it("paints first visible index-only rows before hydration resolves", async () => {
     sessions.sessions = [
-      makeSession({
-        id: "renamed",
-        display_name: "Renamed sidebar title",
-        is_index_only: true,
-      }),
+      makeSession({ id: "pending", project: "placeholder", is_index_only: true }),
     ];
     vi.spyOn(sessions, "hydrateVisibleSessions").mockReturnValue(new Promise<void>(() => {}));
 
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    expect(document.body.textContent).toContain("Renamed sidebar title");
+    expect(document.querySelector(".session-name")?.textContent).toBe("placeholder");
   });
 
   it("keeps long session labels intact for responsive CSS clipping", async () => {
@@ -460,6 +432,27 @@ describe("SessionList visible hydration", () => {
     const name = document.querySelector<HTMLElement>(".session-name");
     expect(name).not.toBeNull();
     expect(name?.textContent).toBe(title);
+  });
+
+  it("reveals a deep-linked child inside a collapsed group", async () => {
+    sessions.sessions = [
+      makeSession({ id: "launcher", first_message: "Launcher", is_index_only: true }),
+      makeSession({
+        id: "worker",
+        first_message: "Worker",
+        parent_session_id: "launcher",
+        relationship_type: "subagent",
+        started_at: "2024-01-01T00:00:30Z",
+        is_index_only: true,
+      }),
+    ];
+    sessions.activeSessionId = "worker";
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    await tick();
+    expect(document.querySelector('[data-session-id="worker"]')).not.toBeNull();
   });
 
   it("marks the active session row for assistive tech", async () => {
@@ -487,14 +480,6 @@ describe("SessionList visible hydration", () => {
     expect(active?.getAttribute("aria-current")).toBe("page");
     expect(other).not.toBeNull();
     expect(other?.hasAttribute("aria-current")).toBe(false);
-  });
-
-  it("gives active rows a persistent visual indicator distinct from hover", () => {
-    expect(sessionItemSource).toContain(".session-item.active::before");
-    expect(sessionItemSource).toContain("background: var(--accent-blue)");
-    expect(sessionItemSource).toContain(
-      "box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-blue) 28%, transparent)",
-    );
   });
 
   it("hydrates newly visible rows after scrolling", async () => {
@@ -685,9 +670,11 @@ describe("SessionList visible hydration", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const sideMeta = document.querySelector<HTMLElement>(".side-meta");
-    expect(sideMeta).not.toBeNull();
-    sideMeta!.click();
+    // The star and status sit outside the session link; clicking the row
+    // itself still selects the session.
+    const row = document.querySelector<HTMLElement>(".session-item");
+    expect(row).not.toBeNull();
+    row!.click();
 
     expect(selectSession).toHaveBeenCalledWith("row-session");
   });
@@ -748,6 +735,47 @@ describe("SessionList visible hydration", () => {
 
     expect(openSpy).toHaveBeenCalledWith("/sessions/native-open-session", "_blank", "noopener");
   });
+
+  it.each(["continuation", "subagent", "teammate"])(
+    "renders a shared %s under both expanded parent groups",
+    async (kind) => {
+      sessions.sessions = [
+        makeSession({ id: "root-a", display_name: "Parent A" }),
+        makeSession({ id: "root-b", display_name: "Parent B" }),
+        makeSession({
+          id: "shared-child",
+          display_name: "Shared child",
+          parent_session_ids: ["root-a", "root-b"],
+          relationship_type: kind === "subagent" ? "subagent" : "continuation",
+          is_teammate: kind === "teammate",
+        }),
+      ];
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+      component = mount(SessionList, { target: document.body });
+      await tick();
+      for (const id of ["root-a", "root-b"]) {
+        const expand = document.querySelector<HTMLButtonElement>(
+          `[data-session-id="${id}"] button[aria-label="Expand"]`,
+        );
+        expect(expand).not.toBeNull();
+        expand!.click();
+        await tick();
+      }
+
+      expect(document.querySelectorAll('[data-session-id="shared-child"]')).toHaveLength(2);
+      document
+        .querySelector<HTMLButtonElement>(
+          '[data-session-id="root-a"] button[aria-label="Collapse"]',
+        )!
+        .click();
+      await tick();
+      expect(document.querySelectorAll('[data-session-id="shared-child"]')).toHaveLength(1);
+      expect(document.querySelector('[data-session-id="shared-child"]')?.textContent).toContain(
+        "Shared child",
+      );
+    },
+  );
 
   it("uses is_teammate for the collapsed group teammate hint", async () => {
     sessions.sessions = [

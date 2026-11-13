@@ -17,6 +17,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"go.kenn.io/agentsview/internal/jsonutil"
+	"go.kenn.io/kit/atomicfile"
 )
 
 const (
@@ -523,6 +524,8 @@ func (s *captureState) seal(data []byte) error {
 	return s.saveManifestContext(ctx)
 }
 
+// finalizationContext bounds sealing by the finalization deadline only. The
+// sealed result must persist after the run's context ends.
 func (s *captureState) finalizationContext() (context.Context, context.CancelFunc) {
 	if s.finalizationDeadline.IsZero() {
 		return context.WithCancel(context.Background())
@@ -637,7 +640,7 @@ func atomicWriteContext(ctx context.Context, path string, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := atomicfile.Replace(tmpPath, path); err != nil {
 		return fmt.Errorf("installing output: %w", err)
 	}
 	return nil

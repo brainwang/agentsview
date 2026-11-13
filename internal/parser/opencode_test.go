@@ -21,7 +21,7 @@ import (
 // parseOpenCodeDBSession), reproducing the deleted ParseOpenCodeDB
 // whole-database free function for the retained parse tests.
 func parseOpenCodeAll(dbPath, machine string) ([]ParseResult, error) {
-	metas, err := ListOpenCodeSessionMeta(dbPath)
+	metas, err := ListOpenCodeSessionMeta(context.Background(), dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +373,8 @@ func TestParseOpenCodeDB_StandardSession(t *testing.T) {
 	assertEq(t, "Project", s.Session.Project, "myapp")
 	assertEq(t, "Cwd", s.Session.Cwd, "/home/user/code/myapp")
 	assertEq(t, "MessageCount", s.Session.MessageCount, 2)
-	assertEq(t, "FirstMessage", s.Session.FirstMessage, "Test Session")
+	assertEq(t, "SessionName", s.Session.SessionName, "Test Session")
+	assertEq(t, "FirstMessage", s.Session.FirstMessage, "Hello, help me with Go")
 
 	wantPath := dbPath + "#ses_abc"
 	assertEq(t, "File.Path", s.Session.File.Path, wantPath)
@@ -502,7 +503,8 @@ func TestParseOpenCodeFile_StorageSession(t *testing.T) {
 	assertEq(t, "Cwd", sess.Cwd, "/home/user/code/myapp")
 	assertEq(t, "Machine", sess.Machine, "testmachine")
 	assertEq(t, "MessageCount", sess.MessageCount, 2)
-	assertEq(t, "FirstMessage", sess.FirstMessage, "Storage Session")
+	assertEq(t, "SessionName", sess.SessionName, "Storage Session")
+	assertEq(t, "FirstMessage", sess.FirstMessage, "Hello from storage")
 	assertEq(t, "File.Path", sess.File.Path, sessionPath)
 	assertEq(t, "File.Mtime", sess.File.Mtime > 0, true)
 
@@ -1424,6 +1426,8 @@ func TestParseOpenCodeDB_TitleFallback(t *testing.T) {
 			assertEq(t, "placeholder title fallback",
 				s.Session.FirstMessage,
 				"Refactor the auth module")
+			assertEq(t, "placeholder is not a session name",
+				s.Session.SessionName, "")
 		}
 	}
 }
@@ -1461,6 +1465,119 @@ func TestParseOpenCodeDB_ToolParts(t *testing.T) {
 		ToolUseID: "call_1",
 		InputJSON: `{"file_path":"main.go"}`,
 	}})
+}
+
+func TestParseOpenCodeDB_DispatchTiming(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	const (
+		projectID = "prj_timing"
+		sessionID = "ses_timing"
+		base      = int64(1700000000000)
+	)
+	seeder.AddProject(projectID, "/tmp/proj")
+	seeder.AddSession(sessionID, projectID, "", "", base, base+1000)
+	seeder.AddMessage("msg_user", sessionID, base, base, `{"role":"user"}`)
+	seeder.AddPart("prt_user", "msg_user", sessionID, base, base,
+		`{"type":"text","text":"run the tools"}`)
+	seeder.AddMessage("msg_assistant", sessionID, base+1, base+1,
+		`{"role":"assistant"}`)
+
+	cases := []struct {
+		name, tool, state  string
+		wantEvents         int
+		wantStatus         string
+		wantStart, wantEnd int64
+	}{
+		{
+			name:       "completed",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"a"},"time":{"start":1000,"end":32000}}`,
+			wantEvents: 2, wantStatus: "completed", wantStart: 1000, wantEnd: 32000,
+		},
+		{
+			name:       "errored",
+			tool:       "read",
+			state:      `{"status":"error","input":{"path":"b"},"time":{"start":40000,"end":40000}}`,
+			wantEvents: 2, wantStatus: "errored", wantStart: 40000, wantEnd: 40000,
+		},
+		{
+			name:       "interrupted-equal-bounds",
+			tool:       "read",
+			state:      `{"status":"error","input":{"path":"b-aborted"},"error":"interrupted","metadata":{"interrupted":true},"time":{"start":45000,"end":45000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "completed-equal-bounds",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"instant"},"time":{"start":45000,"end":45000}}`,
+			wantEvents: 2, wantStatus: "completed", wantStart: 45000, wantEnd: 45000,
+		},
+		{
+			name:       "bash-nonzero-exit",
+			tool:       "bash",
+			state:      `{"status":"completed","input":{"command":"false"},"metadata":{"exit":1},"time":{"start":46000,"end":47000}}`,
+			wantEvents: 2, wantStatus: "errored", wantStart: 46000, wantEnd: 47000,
+		},
+		{
+			name:       "invalid-tool",
+			tool:       "invalid",
+			state:      `{"status":"completed","input":{},"time":{"start":48000,"end":49000}}`,
+			wantEvents: 2, wantStatus: "errored", wantStart: 48000, wantEnd: 49000,
+		},
+		{
+			name:       "pending",
+			tool:       "read",
+			state:      `{"status":"pending","input":{"path":"pending"},"time":{"start":50000,"end":51000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "missing-start",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"c"},"time":{"end":50000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "reversed",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"d"},"time":{"start":70000,"end":60000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "running",
+			tool:       "read",
+			state:      `{"status":"running","input":{"path":"e"},"time":{"start":80000}}`,
+			wantEvents: 0,
+		},
+	}
+	for i, tc := range cases {
+		callID := fmt.Sprintf("call_timing_%d", i)
+		partID := fmt.Sprintf("prt_timing_%d", i)
+		seeder.AddPart(partID, "msg_assistant", sessionID, base+2+int64(i), base+2+int64(i),
+			fmt.Sprintf(`{"type":"tool","tool":%q,"callID":%q,"state":%s}`, tc.tool, callID, tc.state))
+	}
+
+	sessions, err := parseOpenCodeAll(dbPath, "m")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1)
+	tools := sessions[0].Messages[1].ToolCalls
+	require.Len(t, tools, len(cases))
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			call := tools[i]
+			require.Len(t, call.ResultEvents, tc.wantEvents)
+			if tc.wantEvents == 0 {
+				return
+			}
+			assert.Equal(t, "tool_execution", call.ResultEvents[0].Source)
+			assert.Equal(t, "started", call.ResultEvents[0].Status)
+			assert.Equal(t, time.UnixMilli(tc.wantStart), call.ResultEvents[0].Timestamp)
+			assert.Equal(t, "tool_execution", call.ResultEvents[1].Source)
+			assert.Equal(t, tc.wantStatus, call.ResultEvents[1].Status)
+			assert.Equal(t, time.UnixMilli(tc.wantEnd), call.ResultEvents[1].Timestamp)
+		})
+	}
 }
 
 // TestParseOpenCodeDB_SkillTool verifies that a "skill" tool part
@@ -2123,7 +2240,7 @@ func TestListOpenCodeSessionMeta(t *testing.T) {
 	defer db.Close()
 	seedStandardSession(t, seeder)
 
-	metas, err := ListOpenCodeSessionMeta(dbPath)
+	metas, err := ListOpenCodeSessionMeta(t.Context(), dbPath)
 	require.NoError(t, err, "ListOpenCodeSessionMeta")
 	assertEq(t, "metas len", len(metas), 1)
 
@@ -2139,7 +2256,7 @@ func TestListOpenCodeSessionMeta(t *testing.T) {
 
 func TestListOpenCodeSessionMeta_NonexistentDB(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "nope.db")
-	metas, err := ListOpenCodeSessionMeta(dbPath)
+	metas, err := ListOpenCodeSessionMeta(t.Context(), dbPath)
 	require.NoError(t, err, "unexpected error")
 	assertEq(t, "metas len", len(metas), 0)
 }
@@ -2171,7 +2288,7 @@ func TestListOpenCodeSessionWatermarkMeta(t *testing.T) {
 	)
 	require.NoError(t, err, "raise project time")
 
-	metas, err := ListOpenCodeSessionWatermarkMeta(dbPath)
+	metas, err := ListOpenCodeSessionWatermarkMeta(t.Context(), dbPath)
 	require.NoError(t, err, "ListOpenCodeSessionWatermarkMeta")
 	require.Len(t, metas, 1)
 
@@ -2232,11 +2349,11 @@ func TestListOpenCodeSessionWatermarkMeta_LegacySchema(t *testing.T) {
 		"ses_legacy", "prj_legacy", "", "Legacy", 1700000000000, 1700000060000,
 	)
 
-	metas, err := ListOpenCodeSessionWatermarkMeta(dbPath)
+	metas, err := ListOpenCodeSessionWatermarkMeta(t.Context(), dbPath)
 	require.NoError(t, err, "ListOpenCodeSessionWatermarkMeta legacy")
 	require.Len(t, metas, 1)
 
-	full, err := ListOpenCodeSessionMeta(dbPath)
+	full, err := ListOpenCodeSessionMeta(t.Context(), dbPath)
 	require.NoError(t, err, "ListOpenCodeSessionMeta legacy")
 	require.Len(t, full, 1)
 
@@ -2473,6 +2590,105 @@ func TestParseOpenCodeDB_ZeroTokens(t *testing.T) {
 	assertEq(t, "ContextTokens", asst.ContextTokens, 0)
 }
 
+// TestParseOpenCodeDB_ReasoningTokens covers both tokens.output conventions.
+// Each record is shaped like an OpenCode writer reporting one OpenAI call
+// with 1000 input tokens (200 cached) and 300 output tokens, 120 of them
+// reasoning, so the SDK total is 1300. Builds before v1.3.16 store output
+// 300; later builds store 180 and bill reasoning separately. Stored output
+// must be 300 either way, with reasoning recorded as its subset.
+func TestParseOpenCodeDB_ReasoningTokens(t *testing.T) {
+	tests := []struct {
+		name          string
+		messageTokens string
+		stepTokens    string
+		wantOutput    int
+		wantReasoning int
+	}{
+		{
+			name:          "output excludes reasoning",
+			messageTokens: `{"total":1300,"input":800,"output":180,"reasoning":120,"cache":{"read":200,"write":0}}`,
+			wantOutput:    300,
+			wantReasoning: 120,
+		},
+		{
+			name:          "output includes reasoning",
+			messageTokens: `{"total":1300,"input":800,"output":300,"reasoning":120,"cache":{"read":200,"write":0}}`,
+			wantOutput:    300,
+			wantReasoning: 120,
+		},
+		{
+			// Builds before v1.1.57 did not persist total; all of them
+			// predate the change and store output with reasoning.
+			name:          "no total keeps stored output",
+			messageTokens: `{"input":800,"output":300,"reasoning":120,"cache":{"read":200,"write":0}}`,
+			wantOutput:    300,
+			wantReasoning: 120,
+		},
+		{
+			name:          "total matching neither sum keeps stored output",
+			messageTokens: `{"total":5000,"input":800,"output":180,"reasoning":120,"cache":{"read":200,"write":0}}`,
+			wantOutput:    180,
+			wantReasoning: 120,
+		},
+		{
+			name:          "step-finish part supplies the total",
+			messageTokens: `{"input":800,"output":180,"reasoning":120,"cache":{"read":200,"write":0}}`,
+			stepTokens:    `{"total":1300,"input":800,"output":180,"reasoning":120,"cache":{"read":200,"write":0}}`,
+			wantOutput:    300,
+			wantReasoning: 120,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath, seeder, db := newTestDB(t)
+			defer db.Close()
+
+			seeder.AddProject("prj_1", "/tmp/proj")
+			seeder.AddSession("ses_r", "prj_1", "", "Reasoning",
+				1700000000000, 1700000010000)
+			seeder.AddMessage("msg_u", "ses_r",
+				1700000000000, 1700000000000, `{"role":"user"}`)
+			seeder.AddPart("prt_u", "msg_u", "ses_r",
+				1700000000000, 1700000000000,
+				`{"type":"text","text":"hi"}`)
+			seeder.AddMessage("msg_a", "ses_r",
+				1700000005000, 1700000005000,
+				`{"role":"assistant","modelID":"gpt-5.4","providerID":"openai",`+
+					`"tokens":`+tc.messageTokens+`}`)
+			seeder.AddPart("prt_a", "msg_a", "ses_r",
+				1700000005000, 1700000005000,
+				`{"type":"text","text":"answer"}`)
+			if tc.stepTokens != "" {
+				seeder.AddPart("prt_step", "msg_a", "ses_r",
+					1700000006000, 1700000006000,
+					`{"type":"step-finish","reason":"stop","tokens":`+tc.stepTokens+`}`)
+			}
+
+			sessions, err := parseOpenCodeAll(dbPath, "m")
+			require.NoError(t, err)
+			require.Len(t, sessions, 1)
+			var asst *ParsedMessage
+			for i := range sessions[0].Messages {
+				if sessions[0].Messages[i].Role == RoleAssistant {
+					asst = &sessions[0].Messages[i]
+				}
+			}
+			require.NotNil(t, asst)
+			var got map[string]int
+			require.NoError(t, json.Unmarshal(asst.TokenUsage, &got))
+			assert.Equal(t, map[string]int{
+				"input_tokens":                800,
+				"output_tokens":               tc.wantOutput,
+				"reasoning_tokens":            tc.wantReasoning,
+				"cache_read_input_tokens":     200,
+				"cache_creation_input_tokens": 0,
+			}, got)
+			assert.Equal(t, tc.wantOutput, asst.OutputTokens)
+			assert.True(t, asst.HasOutputTokens)
+		})
+	}
+}
+
 // TestParseOpenCodeDB_NoTokenUsage verifies that assistant
 // messages with no tokens block (e.g. errored requests) leave
 // TokenUsage empty so they are filtered out by the usage query.
@@ -2550,4 +2766,54 @@ func TestOpenCodeStorageFingerprintMissingDetectsContentRewrite(
 
 	assert.True(t, OpenCodeStorageFingerprintMissing(stored, current),
 		"expected content rewrite to invalidate fingerprint")
+}
+
+func TestParseOpenCodeDB_CountsUndecodableMessageRows(t *testing.T) {
+	tests := []struct {
+		name         string
+		withV2       bool
+		wantMessages []string
+	}{
+		{
+			name:         "legacy rows only",
+			wantMessages: []string{"Hello, help me with Go", "Sure, I can help with Go."},
+		},
+		{
+			// The v2 path merges legacy rows into the projection and builds
+			// the session separately, so the count must survive the merge.
+			name:         "legacy rows merged into v2 projection",
+			withV2:       true,
+			wantMessages: []string{"Hello, help me with Go", "Sure, I can help with Go.", "Projected reply"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dbPath, seeder, db := newTestDB(t)
+			defer db.Close()
+			seedStandardSession(t, seeder)
+			seeder.AddMessage("msg_bad", "ses_abc", 1700000005000, 1700000005000, `{"role":"assistant"`)
+			seeder.AddPart("prt_bad", "msg_bad", "ses_abc", 1700000005000, 1700000005000, `{"type":"text","text":"lost text"}`)
+			// A decodable message whose second part is corrupt keeps its first.
+			seeder.AddPart("prt_2_bad", "msg_2", "ses_abc", 1700000011000, 1700000011000, `{"type":"text","text":"lost`)
+			if tt.withV2 {
+				_, err := db.ExecContext(t.Context(), openCodeV2TestSchema)
+				require.NoError(t, err)
+				_, err = db.ExecContext(t.Context(), `INSERT INTO session_message VALUES
+ ('msg_v2', 'ses_abc', 'assistant', 10, 1700000020000, 1700000020000,
+ '{"agent":"build","model":{"id":"gpt-5.4","providerID":"openai"},"time":{"created":1700000020000},"content":[{"type":"text","id":"txt_v2","text":"Projected reply"}]}')`)
+				require.NoError(t, err)
+			}
+
+			sess, msgs, err := parseOpenCodeDBSession(dbPath, "ses_abc", "m")
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+
+			assert.Equal(t, 2, sess.MalformedLines, "one bad message row and one bad part row")
+			contents := make([]string, 0, len(msgs))
+			for _, m := range msgs {
+				contents = append(contents, m.Content)
+			}
+			assert.Equal(t, tt.wantMessages, contents)
+		})
+	}
 }

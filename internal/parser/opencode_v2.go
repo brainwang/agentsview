@@ -196,6 +196,7 @@ type openCodeV2Message struct {
 
 type openCodeV2Time struct {
 	Created   int64 `json:"created"`
+	Ran       int64 `json:"ran"`
 	Completed int64 `json:"completed"`
 }
 
@@ -285,7 +286,7 @@ func loadOpenCodeV2Messages(ctx context.Context, db *sql.DB, sessionID, cwd stri
 					}
 				case "tool":
 					pm.HasToolUse = true
-					call, err := openCodeV2ToolCall(item, cwd)
+					call, err := openCodeV2ToolCall(ctx, item, cwd)
 					if err != nil {
 						return nil, true, "", fmt.Errorf("decoding opencode v2 tool %s: %w", item.ID, err)
 					}
@@ -293,7 +294,7 @@ func loadOpenCodeV2Messages(ctx context.Context, db *sql.DB, sessionID, cwd stri
 				}
 			}
 			pm.Content = strings.Join(texts, "\n")
-			applyOpenCodeTokenUsage(&pm, openCodeMessageData{ModelID: data.Model.ID}, raw, nil)
+			applyOpenCodeTokenUsage(&pm, openCodeMessageData{ModelID: data.Model.ID}, raw, nil, true)
 		case "system", "synthetic", "skill", "compaction":
 			pm.Role, pm.IsSystem, pm.Content = RoleUser, true, data.Text
 			if kind == "compaction" {
@@ -335,7 +336,7 @@ func loadOpenCodeV2Messages(ctx context.Context, db *sql.DB, sessionID, cwd stri
 	return parsed, present, fmt.Sprintf("opencode-v2:%x", hash.Sum(nil)), rows.Err()
 }
 
-func openCodeV2ToolCall(item openCodeV2Content, cwd string) (ParsedToolCall, error) {
+func openCodeV2ToolCall(ctx context.Context, item openCodeV2Content, cwd string) (ParsedToolCall, error) {
 	call := ParsedToolCall{
 		ToolUseID: item.ID, ToolName: item.Name, Category: NormalizeToolCategory(item.Name),
 		InputJSON: string(item.State.Input),
@@ -346,7 +347,7 @@ func openCodeV2ToolCall(item openCodeV2Content, cwd string) (ParsedToolCall, err
 	if item.Name == "skill" {
 		call.SkillName = gjson.Get(call.InputJSON, "name").Str
 	} else {
-		call.SkillName = inferOpenCodeSkillName(item.Name, call.InputJSON, cwd)
+		call.SkillName = inferOpenCodeSkillName(ctx, item.Name, call.InputJSON, cwd)
 	}
 	if item.State.Status == "completed" || item.State.Status == "error" {
 		var texts []string
@@ -413,6 +414,15 @@ func openCodeV2ToolCall(item openCodeV2Content, cwd string) (ParsedToolCall, err
 			ToolUseID: item.ID, Status: status, Content: content,
 			Timestamp: millisToTime(item.Time.Completed),
 		}}
+		if item.Time.Ran > 0 && item.Time.Completed >= item.Time.Ran {
+			call.ResultEvents = append([]ParsedToolResultEvent{{
+				ToolUseID: item.ID,
+				Source:    "tool_execution",
+				Status:    "started",
+				Timestamp: millisToTime(item.Time.Ran),
+			}}, call.ResultEvents...)
+			call.ResultEvents[1].Source = "tool_execution"
+		}
 	}
 	return call, nil
 }

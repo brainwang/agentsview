@@ -25,6 +25,22 @@ var CodebuffCompanionFilenames = []string{
 	"chat-meta.json",
 }
 
+// Session file names read by parseCodebuffSession.
+const (
+	codebuffPrimaryTranscriptName = "chat-messages.json"
+	codebuffRunStateName          = "run-state.json"
+	codebuffChatMetaName          = "chat-meta.json"
+)
+
+// codebuffDataFilenames are the session files that feed stored data. Other
+// files in a session directory (log.jsonl, trace.jsonl, atomic-write .tmp
+// siblings) cannot change a session, so watch events on them are dropped.
+var codebuffDataFilenames = map[string]struct{}{
+	codebuffPrimaryTranscriptName: {},
+	codebuffRunStateName:          {},
+	codebuffChatMetaName:          {},
+}
+
 // CodebuffCompanionMtime returns the max of chatInfo.ModTime() and
 // sibling companion files declared in CodebuffCompanionFilenames. The
 // engine's warm pre-check uses it to align the skip-cache MTimeNS key
@@ -69,14 +85,14 @@ func newCodebuffProviderFactory(def AgentDef) ProviderFactory {
 						return codebuffClassifyPath(root, path, allowMissing)
 					},
 				),
-				WithFileLookup(func(root, rawID string) (singleFileMatch, bool) {
+				WithFileLookup(func(_ context.Context, root, rawID string) (singleFileMatch, bool) {
 					return codebuffFindFile(root, rawID)
 				}),
-				WithFileFingerprint(func(src singleFileSource) (SourceFingerprint, error) {
-					return codebuffFingerprintSource(src)
+				WithFileFingerprint(func(ctx context.Context, src singleFileSource) (SourceFingerprint, error) {
+					return codebuffFingerprintSource(ctx, src)
 				}),
-				WithFileParse(func(src singleFileSource, req ParseRequest) ([]ParseResult, []string, error) {
-					return codebuffParseFile(src, req)
+				WithFileParse(func(ctx context.Context, src singleFileSource, req ParseRequest) ([]ParseResult, []string, error) {
+					return codebuffParseFile(ctx, src, req)
 				}),
 			)
 			return codebuffSourceSet{inner}
@@ -166,7 +182,7 @@ func (s codebuffSourceSet) Parse(
 // The on-disk layout is <root>/<project>/chats/<timestamp>/. Recursive
 // watching ensures changes inside timestamp subdirectories are observed.
 // The PeriodicReconcile flag on the Codebuff agent def handles newly
-// created projects, and the recursiveWatchBudget mechanism handles
+// created projects, and the watcher's resource-exhaustion fallback handles
 // inotify exhaustion by degrading to polling.
 func codebuffWatchRoots(roots []string) []WatchRoot {
 	out := make([]WatchRoot, 0, len(roots))
@@ -179,6 +195,36 @@ func codebuffWatchRoots(roots []string) []WatchRoot {
 		})
 	}
 	return out
+}
+
+// ChangedPathRelevance implements ChangedPathRelevanceProvider so the watch
+// prefilter can drop debug-log and temp-file events without reparsing the
+// transcript.
+func (s codebuffSourceSet) ChangedPathRelevance(
+	ctx context.Context, req ChangedPathRequest,
+) (ChangedPathRelevance, error) {
+	if err := ctx.Err(); err != nil {
+		return ChangedPathUnclassified, err
+	}
+	if req.WatchRoot == "" {
+		return ChangedPathUnclassified, nil
+	}
+	root := filepath.Clean(req.WatchRoot)
+	clean := filepath.Clean(req.Path)
+	if !isWithinRoot(root, clean) || clean == root {
+		return ChangedPathUnclassified, nil
+	}
+	if _, ok := codebuffDataFilenames[filepath.Base(clean)]; ok {
+		return ChangedPathDataBearing, nil
+	}
+	// Any other direct child of <project>/chats/<timestamp>/ is a debug log
+	// or temp file. Directory events stay unclassified because a new
+	// session's directory mtime also drives reconcile.
+	rel, err := filepath.Rel(root, clean)
+	if err == nil && len(strings.Split(rel, string(filepath.Separator))) == 4 {
+		return ChangedPathNonData, nil
+	}
+	return ChangedPathUnclassified, nil
 }
 
 // codebuffClassifyPath maps a changed path back to its source
@@ -207,6 +253,12 @@ func codebuffClassifyPath(
 	sessionID := parts[2]
 	sessionDir := filepath.Join(root, projectName, "chats", sessionID)
 	chatPath := filepath.Join(sessionDir, "chat-messages.json")
+
+	// Direct SyncPaths callers bypass the watch prefilter, so non-data
+	// siblings must not map to the transcript here either.
+	if _, ok := codebuffDataFilenames[filepath.Base(path)]; !ok {
+		return singleFileMatch{}, false
+	}
 
 	if allowMissing {
 		return singleFileMatch{
@@ -245,7 +297,9 @@ func isWithinRoot(root, path string) bool {
 
 // codebuffFindFile finds a session by raw session ID under the root.
 // The rawID may be either "project:timestamp" (new format) or just
-// "timestamp" (legacy compatibility). For the new format, it searches
+// "timestamp" (legacy compatibility). A subagent ID
+// "project:timestamp__subagent__<key>" resolves to the parent transcript
+// that holds it. For the new format, it searches
 // the specific project directory. For legacy format, it searches all
 // project subdirectories.
 //
@@ -260,6 +314,13 @@ func codebuffFindFile(root, rawID string) (singleFileMatch, bool) {
 	if len(parts) == 2 {
 		projectName := parts[0]
 		timestamp := parts[1]
+		// A subagent session ID resolves to the transcript that holds it.
+		if before, key, found := strings.Cut(timestamp, codebuffSubagentIDSep); found {
+			if key == "" {
+				return singleFileMatch{}, false
+			}
+			timestamp = before
+		}
 		// Reject traversal: project and timestamp must each be a single
 		// safe path component so filepath.Join does not escape root.
 		if !isSafeSinglePathComponent(projectName) ||
@@ -319,7 +380,7 @@ func codebuffFindFile(root, rawID string) (singleFileMatch, bool) {
 // computed when this function runs (for the skip cache key), but the
 // engine's providerSourceFreshBeforeFingerprint check ensures this
 // function is only called for sources that may have changed.
-func codebuffFingerprintSource(src singleFileSource) (SourceFingerprint, error) {
+func codebuffFingerprintSource(ctx context.Context, src singleFileSource) (SourceFingerprint, error) {
 	info, err := os.Stat(src.Path)
 	if err != nil {
 		return SourceFingerprint{}, fmt.Errorf("stat %s: %w", src.Path, err)
@@ -351,7 +412,7 @@ func codebuffFingerprintSource(src singleFileSource) (SourceFingerprint, error) 
 	// skip without reading transcript bytes.
 	h := sha256.New()
 	if err := addSiblingMetadataFingerprintPart(
-		h, "chat-messages", src.Path, info,
+		ctx, h, "chat-messages", src.Path, info,
 	); err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -359,7 +420,7 @@ func codebuffFingerprintSource(src singleFileSource) (SourceFingerprint, error) 
 		companion := filepath.Join(dir, name)
 		if ci, err := os.Stat(companion); err == nil {
 			if err := addSiblingMetadataFingerprintPart(
-				h, name, companion, ci,
+				ctx, h, name, companion, ci,
 			); err != nil {
 				return SourceFingerprint{}, err
 			}
@@ -370,9 +431,11 @@ func codebuffFingerprintSource(src singleFileSource) (SourceFingerprint, error) 
 	return fingerprint, nil
 }
 
-// codebuffParseFile parses a single session from chat-messages.json.
+// codebuffParseFile parses a session from chat-messages.json plus one
+// linked child session per nested subagent, all sharing the transcript's
+// source identity.
 func codebuffParseFile(
-	src singleFileSource, req ParseRequest,
+	ctx context.Context, src singleFileSource, req ParseRequest,
 ) ([]ParseResult, []string, error) {
 	dir := filepath.Dir(src.Path)
 
@@ -381,8 +444,8 @@ func codebuffParseFile(
 		projectHint = codebuffProjectFromPath(src.Path)
 	}
 
-	sess, msgs, err := parseCodebuffSession(
-		dir, projectHint, req.Machine,
+	sess, msgs, children, err := parseCodebuffSession(
+		ctx, dir, projectHint, req.Machine,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -391,22 +454,28 @@ func codebuffParseFile(
 		return nil, nil, nil
 	}
 
-	// Apply fingerprint metadata.
-	if req.Fingerprint.Size > 0 {
-		sess.File.Size = req.Fingerprint.Size
-	}
-	if req.Fingerprint.MTimeNS > 0 {
-		sess.File.Mtime = req.Fingerprint.MTimeNS
-	}
-	if req.Fingerprint.Hash != "" {
-		sess.File.Hash = req.Fingerprint.Hash
-	}
-
-	return []ParseResult{{
+	results := make([]ParseResult, 0, 1+len(children))
+	results = append(results, ParseResult{
 		Session:     *sess,
 		Messages:    msgs,
 		UsageEvents: sess.UsageEvents,
-	}}, nil, nil
+	})
+	results = append(results, children...)
+
+	// Apply fingerprint metadata.
+	for i := range results {
+		file := &results[i].Session.File
+		if req.Fingerprint.Size > 0 {
+			file.Size = req.Fingerprint.Size
+		}
+		if req.Fingerprint.MTimeNS > 0 {
+			file.Mtime = req.Fingerprint.MTimeNS
+		}
+		if req.Fingerprint.Hash != "" {
+			file.Hash = req.Fingerprint.Hash
+		}
+	}
+	return results, nil, nil
 }
 
 func codebuffProviderCapabilities() Capabilities {
@@ -415,6 +484,10 @@ func codebuffProviderCapabilities() Capabilities {
 	// so force full message replacement to avoid stale ordinals and
 	// missed in-place block updates.
 	caps.ForceReplaceOnParse = CapabilitySupported
+	// One transcript holds the root session and a linked session per
+	// nested subagent. The engine must treat trash, stale-row cleanup, and
+	// missing members per session ID rather than per file path.
+	caps.MultiSessionSource = CapabilitySupported
 	// The Codebuff source layout folds chat-messages.json with its
 	// sibling companions run-state.json and chat-meta.json, so the
 	// engine's stat-only freshness gate must consult the per-component
@@ -424,6 +497,10 @@ func codebuffProviderCapabilities() Capabilities {
 	// passes would fall back to the composite, missing same-size
 	// sibling rewrites whose mtime stays below the existing max.
 	caps.MultiFileStatHash = CapabilitySupported
+	// Freebuff writes log.jsonl and trace.jsonl into live session
+	// directories; classifying them as non-data avoids reparsing the
+	// transcript on every debug-log write.
+	caps.ChangedPathRelevance = CapabilitySupported
 	// Content-hash freshness is the per-fingerprint safety net that
 	// catches a sibling rewrite whose SHA-256 changes while size
 	// and mtime stay identical. The legacy size/mtime composite and
@@ -453,9 +530,12 @@ func codebuffProviderCapabilities() Capabilities {
 			ToolResults:          CapabilitySupported,
 			Model:                CapabilityNotApplicable,
 			AggregateUsageEvents: CapabilitySupported,
-			Relationships:        CapabilityNotApplicable,
-			TerminationStatus:    CapabilityNotApplicable,
-			MalformedLineCount:   CapabilityNotApplicable,
+			// Nested agent blocks become linked subagent sessions.
+			Relationships: CapabilitySupported,
+			// No stop reason is recorded, so only tool_call_pending and
+			// clean are reported.
+			TerminationStatus:  CapabilitySupported,
+			MalformedLineCount: CapabilityNotApplicable,
 		},
 		Sync: ProviderSyncSemantics{
 			FingerprintHashRequiredForFreshness: true,

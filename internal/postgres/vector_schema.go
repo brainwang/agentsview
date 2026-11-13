@@ -3,8 +3,11 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json/v2"
 	"fmt"
 	"log"
+
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // vectorBaseDDL creates the backend-agnostic vector tables. Chunk tables
@@ -19,6 +22,7 @@ CREATE TABLE IF NOT EXISTS vector_generations (
     fingerprint TEXT NOT NULL UNIQUE,
     model       TEXT NOT NULL,
     dimension   INTEGER NOT NULL,
+    params      JSONB,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS vector_generation_machines (
@@ -192,6 +196,41 @@ CREATE TABLE IF NOT EXISTS %s (
 	return nil
 }
 
+// ensureVectorRecipeColumn adds vector_generations.params for writers whose
+// tables predate recipe publication. It runs only on the push path, never in
+// serve-side schema preparation.
+func ensureVectorRecipeColumn(ctx context.Context, pg *sql.DB) error {
+	existing, err := loadExistingColumns(ctx, pg, nil, "vector_generations")
+	if err != nil {
+		return fmt.Errorf("checking vector recipe column: %w", err)
+	}
+	if _, err := ensureColumns(ctx, pg, existing, []columnMigration{{
+		table: "vector_generations", column: "params", def: "params JSONB",
+	}}); err != nil {
+		return fmt.Errorf("adding vector recipe column: %w", err)
+	}
+	return nil
+}
+
+// publishVectorRecipe records params for fingerprint's generation when the
+// row has none. Stored params are never overwritten: a fingerprint names
+// one immutable recipe.
+func publishVectorRecipe(
+	ctx context.Context, pg *sql.DB, fingerprint string, params map[string]string,
+) error {
+	encoded, err := json.Marshal(params, json.Deterministic(true))
+	if err != nil {
+		return fmt.Errorf("encoding vector recipe: %w", err)
+	}
+	if _, err := pg.ExecContext(ctx, `
+UPDATE vector_generations SET params = $2::jsonb
+WHERE fingerprint = $1 AND params IS NULL`,
+		fingerprint, string(encoded)); err != nil {
+		return fmt.Errorf("publishing vector recipe: %w", err)
+	}
+	return nil
+}
+
 // ensureVectorGeneration registers fingerprint's generation, returning its
 // id. Machines with matching embedding configs share one generation.
 func ensureVectorGeneration(
@@ -259,16 +298,19 @@ func VectorChunkTableExists(
 	return present, nil
 }
 
-// ListVectorGenerationFingerprints returns every registered generation's
-// fingerprint ordered by id (oldest first), for pg serve's startup notice
-// when no generation matches the local config. A missing vector_generations
-// table (SQLSTATE 42P01) yields an empty slice, not an error, matching
-// LookupVectorGeneration's tolerance for a database without pgvector.
-func ListVectorGenerationFingerprints(
+// ListVectorGenerationInfo returns every registered generation's identity
+// and published recipe ordered by id (oldest first), for recipe adoption and
+// the serve startup notice when no generation matches the local config. A
+// missing vector_generations table (SQLSTATE 42P01) yields an empty slice,
+// not an error, matching LookupVectorGeneration's tolerance for a database
+// without pgvector. Reading params through to_jsonb tolerates tables that
+// predate the params column, so read-only servers need no migration.
+func ListVectorGenerationInfo(
 	ctx context.Context, pg *sql.DB,
-) ([]string, error) {
+) ([]storage.VectorGenerationInfo, error) {
 	rows, err := pg.QueryContext(ctx,
-		`SELECT fingerprint FROM vector_generations ORDER BY id`)
+		`SELECT fingerprint, model, dimension, to_jsonb(g)->>'params'
+		 FROM vector_generations g ORDER BY id`)
 	if isUndefinedTable(err) {
 		return nil, nil
 	}
@@ -277,16 +319,23 @@ func ListVectorGenerationFingerprints(
 	}
 	defer func() { _ = rows.Close() }()
 
-	var fingerprints []string
+	var gens []storage.VectorGenerationInfo
 	for rows.Next() {
-		var fp string
-		if err := rows.Scan(&fp); err != nil {
-			return nil, fmt.Errorf("scanning vector generation fingerprint: %w", err)
+		var g storage.VectorGenerationInfo
+		var params sql.NullString
+		if err := rows.Scan(&g.Fingerprint, &g.Model, &g.Dimension, &params); err != nil {
+			return nil, fmt.Errorf("scanning vector generation: %w", err)
 		}
-		fingerprints = append(fingerprints, fp)
+		// A recipe this build cannot decode is unsupported, not a read
+		// failure: the generation is listed without params.
+		if params.Valid &&
+			json.Unmarshal([]byte(params.String), &g.Params) != nil {
+			g.Params = nil
+		}
+		gens = append(gens, g)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating vector generations: %w", err)
 	}
-	return fingerprints, nil
+	return gens, nil
 }

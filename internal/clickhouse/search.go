@@ -5,13 +5,12 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/secrets"
 )
 
 // embeddableMessagePredicate matches messages the search surfaces: not
@@ -21,10 +20,59 @@ func embeddableMessagePredicate(alias string) string {
 		db.ClickHouseSystemPrefixSQL(alias+".content", alias+".role")
 }
 
+const systemPrefixSettings = " SETTINGS short_circuit_function_evaluation = 'force_enable'"
+
 // toolCallMessageJoin joins tool calls to their message on the mirror's
 // stable (session_id, ordinal) key.
 const toolCallMessageJoin = `JOIN messages m ON m.session_id = tc.session_id
 			AND m.ordinal = tc.message_ordinal`
+
+// imageTextCallJoin and imageTextEventJoin attach image text to the tool
+// call result or result event that held the image. The small image table
+// is the join's build side.
+const imageTextCallJoin = `JOIN image_text it ON it.session_id = tc.session_id
+			AND it.message_ordinal = tc.message_ordinal AND it.call_index = tc.call_index`
+
+const imageTextEventJoin = `JOIN image_text it ON it.session_id = tre.session_id
+			AND it.message_ordinal = tre.tool_call_message_ordinal
+			AND it.call_index = tre.call_index AND it.event_index = tre.event_index`
+
+// imageTextResultBranches returns the tool_result rows for image text: one
+// branch for tool call results and one for result events, each with its
+// scope placeholders followed by the predicate's. Rows sort after the text
+// of the same source and, as in SQLite, repeat once per distinct text.
+func imageTextResultBranches(f db.ContentSearchFilter, scopeWhere, callPredicate, eventPredicate, extra string) []string {
+	return []string{
+		`
+				SELECT DISTINCT it.session_id AS session_id, s.project AS project, s.agent AS agent,
+					'tool_result' AS location, 'assistant' AS role, tc.tool_name AS tool_name,
+					m.ordinal AS ordinal, m.timestamp AS ts,
+					it.text AS body,
+					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
+					5 AS src, tc.message_id AS row_id,
+					tc.call_index AS call_index, toInt64(0) AS event_index` + extra + `
+				FROM tool_calls tc ` + imageTextCallJoin + `
+				JOIN sessions s ON s.id = tc.session_id
+				` + toolCallMessageJoin + `
+				WHERE it.source_kind = 'tool_call' AND it.push_version >= s.push_version
+					AND ` + toolCallWithoutEvents + `
+					AND it.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` +
+			db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()) + callPredicate, `
+				SELECT DISTINCT it.session_id AS session_id, s.project AS project, s.agent AS agent,
+					'tool_result' AS location, 'assistant' AS role, '' AS tool_name,
+					tre.tool_call_message_ordinal AS ordinal, tre.timestamp AS ts,
+					it.text AS body,
+					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
+					6 AS src, 0 AS row_id,
+					tre.call_index AS call_index, tre.event_index AS event_index` + extra + `
+				FROM tool_result_events tre ` + imageTextEventJoin + `
+				JOIN sessions s ON s.id = tre.session_id
+				` + db.LexicalEventAnchorJoinSQL(f.Scope) + `
+				WHERE it.source_kind = 'event' AND it.push_version >= s.push_version
+					AND it.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` +
+			db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()) + eventPredicate,
+	}
+}
 
 // toolCallWithoutEvents excludes tool calls whose result events are stored
 // separately, so a result is not reported twice.
@@ -55,11 +103,16 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	args := []any{firstTerm, firstTerm}
 
 	termClauses := make([]string, len(terms))
+	imageClauses := make([]string, len(terms))
+	termArgs := make([]any, len(terms))
 	for i, t := range terms {
 		termClauses[i] = "m.content ILIKE ?"
-		args = append(args, "%"+db.EscapeLikePattern(t)+"%")
+		imageClauses[i] = "it.text ILIKE ?"
+		termArgs[i] = "%" + db.EscapeLikePattern(t) + "%"
 	}
+	args = append(args, termArgs...)
 	msgTermPredicate := strings.Join(termClauses, "\n\t\t\t\tAND ")
+	imageTermPredicate := strings.Join(imageClauses, " AND ")
 	if f.Project != "" {
 		project = "AND s.project = ?"
 		args = append(args, f.Project)
@@ -77,47 +130,100 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	nameProject += nameProjectDates.String()
 	project += projectDates.String()
 	args = append(args, dateBuilder.Args()...)
-	args = append(args, namePattern, namePattern, namePattern, namePattern)
+	// image_candidates, then image_ranked with the message branch's filters.
+	args = append(args, termArgs...)
+	args = append(args, firstTerm)
+	args = append(args, termArgs...)
 	if f.Project != "" {
 		args = append(args, f.Project)
 	}
 	args = append(args, dateBuilder.Args()...)
+	args = append(args, namePattern, namePattern)
+	if f.Project != "" {
+		args = append(args, f.Project)
+	}
+	args = append(args, dateBuilder.Args()...)
+	args = append(args, namePattern, namePattern)
 	orderBy := "match_priority ASC, match_pos ASC, session_ended_at DESC, session_id ASC"
 	if f.Sort == "recency" {
 		orderBy = "session_ended_at DESC, session_id ASC"
 	}
 	args = append(args, f.Limit+1, f.Cursor)
+	// The name branch scopes its embeddable-message and msg_grouped checks
+	// to name_candidates. Unscoped, ClickHouse runs the system-prefix regex
+	// over every message and recomputes the inlined msg_grouped CTE over the
+	// whole table.
 	rows, err := s.queryContext(ctx, `
-		WITH msg_ranked AS (
-			SELECT m.session_id AS session_id, s.project AS project, s.agent AS agent,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
-				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
-				m.ordinal AS ordinal, substringUTF8(m.content, 1, 200) AS snippet,
-				1.0 AS rank, 1 AS match_priority,
-				positionCaseInsensitiveUTF8(m.content, ?) AS match_pos,
-				ROW_NUMBER() OVER (
-					PARTITION BY m.session_id
-					ORDER BY positionCaseInsensitiveUTF8(m.content, ?) ASC,
-						m.ordinal ASC, m.id ASC
-				) AS rn
-			FROM messages m
-			JOIN sessions s ON s.id = m.session_id
+		WITH msg_grouped AS (
+			SELECT m.session_id AS session_id,
+				argMin(
+					tuple(m.ordinal, substringUTF8(m.content, 1, 200), positionCaseInsensitiveUTF8(m.content, ?),
+						s.project, s.agent, s.machine, COALESCE(s.display_name, s.session_name, s.first_message, ''),
+						COALESCE(s.ended_at, s.started_at, s.created_at)),
+					tuple(positionCaseInsensitiveUTF8(m.content, ?), m.ordinal, m.id)
+				) AS winner
+			FROM messages m JOIN sessions s ON s.id = m.session_id
 			WHERE `+msgTermPredicate+`
-				AND s.deleted_at IS NULL
 				AND `+embeddableMessagePredicate("m")+`
-				`+project+`
+				AND s.deleted_at IS NULL `+project+`
+			GROUP BY m.session_id
 		),
 		msg_matches AS (
-			SELECT session_id, project, agent, name, session_ended_at,
-				ordinal, snippet, rank, match_priority, match_pos
-			FROM msg_ranked
-			WHERE rn = 1
+			SELECT g.session_id AS session_id, g.winner.4 AS project, g.winner.5 AS agent, g.winner.6 AS machine,
+				g.winner.7 AS name, g.winner.8 AS session_ended_at,
+				g.winner.1 AS ordinal, g.winner.2 AS snippet,
+				1.0 AS rank, 1 AS match_priority, g.winner.3 AS match_pos
+			FROM msg_grouped g
 		),
-		name_matches AS (
-			SELECT s.id AS session_id, s.project AS project, s.agent AS agent,
+		image_candidates AS (
+			SELECT DISTINCT it.session_id AS session_id FROM image_text it WHERE `+imageTermPredicate+`
+		),
+		-- Sessions that only image text matches rank with name matches,
+		-- anchored at the visible message holding the image's tool call.
+		image_ranked AS (
+			SELECT it.session_id AS session_id, s.project AS project, s.agent AS agent, s.machine AS machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
-				toInt64(-1) AS ordinal,
+				it.message_ordinal AS ordinal, substringUTF8(it.text, greatest(1, positionCaseInsensitiveUTF8(it.text, ?) - 100), 200) AS snippet,
+				1.0 AS rank, 2 AS match_priority, 0 AS match_pos,
+				ROW_NUMBER() OVER (
+					PARTITION BY it.session_id
+					ORDER BY it.message_ordinal ASC, it.call_index ASC, it.event_index ASC,
+						it.image_index ASC, it.source_kind ASC, it.processor ASC
+				) AS rn
+			FROM image_text it
+			JOIN sessions s ON s.id = it.session_id
+			WHERE `+imageTermPredicate+` AND it.push_version >= s.push_version
+				AND s.deleted_at IS NULL
+				AND (it.session_id, it.message_ordinal) IN (
+					SELECT mx.session_id, mx.ordinal FROM messages mx
+					WHERE mx.session_id IN (SELECT session_id FROM image_candidates)
+						AND `+embeddableMessagePredicate("mx")+`
+				)
+				AND it.session_id NOT IN (
+					SELECT session_id FROM msg_matches
+					WHERE session_id IN (SELECT session_id FROM image_candidates)
+				)
+				`+project+`
+		),
+		image_matches AS (
+			SELECT session_id, project, agent, machine, name, session_ended_at,
+				ordinal, snippet, rank, match_priority, match_pos
+			FROM image_ranked
+			WHERE rn = 1
+		),
+		name_candidates AS (
+			SELECT s.id AS id FROM sessions s
+			WHERE (COALESCE(s.display_name, s.session_name) ILIKE ?
+				OR s.first_message ILIKE ?)
+				AND s.deleted_at IS NULL
+				`+nameProject+`
+		),
+		name_matches AS (
+			SELECT s.id AS session_id, s.project AS project, s.agent AS agent, s.machine AS machine,
+				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
+				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
+				-1 AS ordinal,
 				CASE
 					WHEN COALESCE(s.display_name, s.session_name) ILIKE ?
 						THEN COALESCE(s.display_name, s.session_name, '')
@@ -125,27 +231,34 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 						THEN COALESCE(s.first_message, '')
 					ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
 				END AS snippet,
-				1.0 AS rank, 2 AS match_priority, toUInt64(0) AS match_pos
+				1.0 AS rank, 2 AS match_priority, 0 AS match_pos
 			FROM sessions s
-			WHERE (COALESCE(s.display_name, s.session_name) ILIKE ?
-				OR s.first_message ILIKE ?)
-				AND s.deleted_at IS NULL
+			WHERE s.id IN (SELECT id FROM name_candidates)
 				AND s.id IN (
 					SELECT mx.session_id FROM messages mx
-					WHERE `+embeddableMessagePredicate("mx")+`
+					WHERE mx.session_id IN (SELECT id FROM name_candidates)
+						AND `+embeddableMessagePredicate("mx")+`
 				)
-				AND s.id NOT IN (SELECT session_id FROM msg_matches)
-				`+nameProject+`
+				AND s.id NOT IN (
+					SELECT session_id FROM msg_grouped
+					WHERE session_id IN (SELECT id FROM name_candidates)
+				)
+				AND s.id NOT IN (
+					SELECT session_id FROM image_matches
+					WHERE session_id IN (SELECT id FROM name_candidates)
+				)
 		)
-		SELECT session_id, project, agent, name,
+		SELECT session_id, project, agent, machine, name,
 			session_ended_at, ordinal, snippet, rank
 		FROM (
 			SELECT * FROM msg_matches
 			UNION ALL
+			SELECT * FROM image_matches
+			UNION ALL
 			SELECT * FROM name_matches
 		) AS combined
 		ORDER BY `+orderBy+`
-		LIMIT ? OFFSET ?`, args...)
+		LIMIT ? OFFSET ?`+systemPrefixSettings, args...)
 	if err != nil {
 		return db.SearchPage{}, fmt.Errorf("clickhouse search: %w", err)
 	}
@@ -154,7 +267,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	for rows.Next() {
 		var r db.SearchResult
 		var ended any
-		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Name,
+		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Machine, &r.Name,
 			&ended, &r.Ordinal, &r.Snippet, &r.Rank); err != nil {
 			return db.SearchPage{}, fmt.Errorf("scanning clickhouse search result: %w", err)
 		}
@@ -192,7 +305,7 @@ func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]i
 			AND (m.content ILIKE ?
 				OR tc.result_content ILIKE ?
 				OR tre.content ILIKE ?)
-		ORDER BY m.ordinal ASC`,
+		ORDER BY m.ordinal ASC`+systemPrefixSettings,
 		sessionID, pattern, pattern, pattern)
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse session search: %w", err)
@@ -222,14 +335,26 @@ func (s *Store) SearchContent(ctx context.Context, f db.ContentSearchFilter) (db
 		if err := db.ValidateSemanticFilter(f); err != nil {
 			return db.ContentSearchPage{}, err
 		}
-		return db.ContentSearchPage{}, db.NewSemanticUnavailableError(
-			"semantic search is not supported by the ClickHouse backend")
+		if s.getVectorSearcher() == nil && (f.Mode != "hybrid" || !f.KeywordOnly) {
+			return db.ContentSearchPage{}, s.semanticUnavailableError()
+		}
+		if f.Mode == "hybrid" {
+			return s.searchContentHybrid(ctx, f)
+		}
+		return s.searchContentSemantic(ctx, f)
 	}
+	if err := db.ValidateContentSearchScope(f.Scope); err != nil {
+		return db.ContentSearchPage{}, err
+	}
+
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
+		if f.Mode == "" || f.Mode == "substring" || f.Mode == "regex" {
+			f.Sources = append(f.Sources, "thinking")
+		}
 	}
 	for _, source := range f.Sources {
-		if source != "messages" && source != "tool_input" && source != "tool_result" {
+		if source != "messages" && source != "thinking" && source != "tool_input" && source != "tool_result" {
 			return db.ContentSearchPage{},
 				&db.SearchInputError{Msg: fmt.Sprintf("search: unknown source %q", source)}
 		}
@@ -289,6 +414,8 @@ func contentSearchPredicate(column string, f db.ContentSearchFilter, args *[]any
 func (s *Store) collectContentSubstringMatches(
 	ctx context.Context, f db.ContentSearchFilter,
 ) ([]db.ContentMatch, error) {
+	eventAnchorJoin := db.LexicalEventAnchorJoinSQL(f.Scope)
+
 	scopeWhere, scopeArgs := contentScope(f)
 	var branches []string
 	var args []any
@@ -304,19 +431,42 @@ func (s *Store) collectContentSubstringMatches(
 			if f.ExcludeSystem {
 				sysPred = embeddableMessagePredicate("m")
 			}
-			contentPred := addSearchArgs("m.content")
+			contentPred := addSearchArgs("COALESCE(m.dialogue_text, m.content)")
 			branches = append(branches, `
 				SELECT m.session_id AS session_id, s.project AS project, s.agent AS agent,
 					'message' AS location, m.role AS role, '' AS tool_name, m.ordinal AS ordinal,
 					m.timestamp AS ts,
-					m.content AS body,
+					COALESCE(m.dialogue_text, m.content) AS body,
 					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 					0 AS src, m.id AS row_id,
 					toInt64(0) AS call_index, toInt64(0) AS event_index
 				FROM messages m JOIN sessions s ON s.id = m.session_id
 				WHERE `+contentPred+`
 					AND `+sysPred+`
-					AND m.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`)`)
+					AND m.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`) AND `+db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()))
+		case "thinking":
+			sysPred := "true"
+			if f.ExcludeSystem {
+				sysPred = embeddableMessagePredicate("m")
+			}
+			contentPred := contentSearchPredicate("m.thinking_text", f, &args)
+			if slices.Contains(f.Sources, "messages") {
+				legacyPred := contentSearchPredicate("m.content", f, &args)
+				contentPred += " AND (m.dialogue_text IS NOT NULL OR NOT (" + legacyPred + "))"
+			}
+			args = append(args, scopeArgs...)
+			branches = append(branches, `
+				SELECT m.session_id AS session_id, s.project AS project, s.agent AS agent,
+					'thinking' AS location, m.role AS role, '' AS tool_name, m.ordinal AS ordinal,
+					m.timestamp AS ts,
+					m.thinking_text AS body,
+					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
+					4 AS src, m.id AS row_id,
+					toInt64(0) AS call_index, toInt64(0) AS event_index
+				FROM messages m JOIN sessions s ON s.id = m.session_id
+				WHERE `+contentPred+`
+					AND `+sysPred+`
+					AND m.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`) AND `+db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()))
 		case "tool_input":
 			inputPred := addSearchArgs("tc.input_json")
 			branches = append(branches, `
@@ -331,7 +481,7 @@ func (s *Store) collectContentSubstringMatches(
 				FROM tool_calls tc JOIN sessions s ON s.id = tc.session_id
 				`+toolCallMessageJoin+`
 				WHERE `+inputPred+`
-					AND tc.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`)`)
+					AND tc.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`) AND `+db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()))
 		case "tool_result":
 			contentPred := addSearchArgs("tc.result_content")
 			branches = append(branches, `
@@ -342,12 +492,12 @@ func (s *Store) collectContentSubstringMatches(
 					tc.result_content AS body,
 					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 					2 AS src, tc.message_id AS row_id,
-					tc.call_index AS call_index, toInt64(0) AS event_index
+					tc.call_index AS call_index, 0 AS event_index
 				FROM tool_calls tc JOIN sessions s ON s.id = tc.session_id
 				`+toolCallMessageJoin+`
 				WHERE `+contentPred+`
 					AND `+toolCallWithoutEvents+`
-					AND tc.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`)`)
+					AND tc.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`) AND `+db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()))
 			eventPred := addSearchArgs("tre.content")
 			branches = append(branches, `
 				SELECT tre.session_id AS session_id, s.project AS project, s.agent AS agent,
@@ -356,12 +506,18 @@ func (s *Store) collectContentSubstringMatches(
 					tre.timestamp AS ts,
 					tre.content AS body,
 					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
-					3 AS src, toInt64(0) AS row_id,
+					3 AS src, 0 AS row_id,
 					tre.call_index AS call_index,
 					tre.event_index AS event_index
 				FROM tool_result_events tre JOIN sessions s ON s.id = tre.session_id
+				`+eventAnchorJoin+`
 				WHERE `+eventPred+`
-					AND tre.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`)`)
+					AND tre.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`) AND `+db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()))
+			args = append(args, scopeArgs...)
+			callImagePred := " AND " + contentSearchPredicate("it.text", f, &args)
+			args = append(args, scopeArgs...)
+			eventImagePred := " AND " + contentSearchPredicate("it.text", f, &args)
+			branches = append(branches, imageTextResultBranches(f, scopeWhere, callImagePred, eventImagePred, "")...)
 		default:
 			return nil, &db.SearchInputError{Msg: fmt.Sprintf("search: unknown source %q", source)}
 		}
@@ -374,9 +530,12 @@ func (s *Store) collectContentSubstringMatches(
 			ordinal, ts, body
 		FROM (` + strings.Join(branches, " UNION ALL ") + `) AS matches
 		ORDER BY sort_ts DESC, session_id ASC, ordinal ASC,
-			src ASC, row_id ASC, call_index ASC, event_index ASC
+			src ASC, row_id ASC, call_index ASC, event_index ASC, body ASC
 		LIMIT ? OFFSET ?`
 	args = append(args, f.Limit+1, f.Cursor)
+	if f.ExcludeSystem && (slices.Contains(f.Sources, "messages") || slices.Contains(f.Sources, "thinking")) {
+		query += systemPrefixSettings
+	}
 	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse content search: %w", err)
@@ -384,14 +543,14 @@ func (s *Store) collectContentSubstringMatches(
 	return scanContentRows(rows, func(body string) string {
 		if f.Mode == "fts" {
 			start, end := db.FTSSnippetRange(f.Pattern, body)
-			return contentSnippet(f, body, start, end)
+			return f.BuildSnippet(body, start, end)
 		}
 		start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
-		return contentSnippet(f, body, start, end)
+		return f.BuildSnippet(body, start, end)
 	})
 }
 
-// collectContentRegexMatches loads every in-scope body for the requested
+// collectContentRegexMatches loads in-scope regex candidates for the requested
 // sources, filters with Go's regexp, and pages the sorted result.
 func (s *Store) collectContentRegexMatches(
 	ctx context.Context, f db.ContentSearchFilter,
@@ -400,10 +559,11 @@ func (s *Store) collectContentRegexMatches(
 	if err != nil {
 		return nil, &db.SearchInputError{Msg: fmt.Sprintf("search: invalid regex: %v", err)}
 	}
+	prefix, _ := re.LiteralPrefix()
 	scopeWhere, scopeArgs := contentScope(f)
 	var all []contentCandidate
 	for _, source := range f.Sources {
-		candidates, err := s.collectContentSource(ctx, source, scopeWhere, scopeArgs, f)
+		candidates, err := s.collectContentSource(ctx, source, scopeWhere, scopeArgs, prefix, f)
 		if err != nil {
 			return nil, err
 		}
@@ -412,12 +572,22 @@ func (s *Store) collectContentRegexMatches(
 	filtered := all[:0]
 	for _, m := range all {
 		if loc := re.FindStringIndex(m.body); loc != nil {
-			m.match.Snippet = contentSnippet(f, m.body, loc[0], loc[1])
+			m.match.Snippet = f.BuildSnippet(m.body, loc[0], loc[1])
 			filtered = append(filtered, m)
 		}
 	}
 	all = filtered
 	sortContentCandidates(all)
+	// Deduplicate legacy thinking before applying the page cursor.
+	var dedupe db.LegacyThinkingDedupe
+	filtered = all[:0]
+	for _, m := range all {
+		if dedupe.Suppress(m.match, m.legacyThinking) {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	all = filtered
 	if f.Cursor > 0 {
 		if f.Cursor >= len(all) {
 			return nil, nil
@@ -435,23 +605,48 @@ func (s *Store) collectContentRegexMatches(
 }
 
 func (s *Store) collectContentSource(
-	ctx context.Context, source, scopeWhere string, scopeArgs []any, f db.ContentSearchFilter,
+	ctx context.Context, source, scopeWhere string, scopeArgs []any, prefix string, f db.ContentSearchFilter,
 ) ([]contentCandidate, error) {
+	eventAnchorJoin := db.LexicalEventAnchorJoinSQL(f.Scope)
+
 	var query string
 	args := append([]any{}, scopeArgs...)
+	// Call prefixFilter in SQL text order: its argument follows the
+	// placeholders already in args.
+	prefixFilter := func(col string) string {
+		b := db.NewQueryBuilder(db.ClickHouseQueryDialect(), 0)
+		filter := b.RegexPrefixFilter(col, prefix)
+		args = append(args, b.Args()...)
+		return filter
+	}
 	switch source {
 	case "messages":
 		query = `SELECT m.session_id, s.project, s.agent, 'message',
 			m.role, '', m.ordinal, m.timestamp,
-			m.content,
+			COALESCE(m.dialogue_text, m.content),
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 			0 AS src, m.id AS row_id,
-			toInt64(0) AS call_index, toInt64(0) AS event_index
+			toInt64(0) AS call_index, toInt64(0) AS event_index, false AS legacy_thinking
 			FROM messages m JOIN sessions s ON s.id = m.session_id
-			WHERE m.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `)`
+			WHERE m.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` + db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect())
 		if f.ExcludeSystem {
 			query += " AND " + embeddableMessagePredicate("m")
 		}
+		query += prefixFilter("COALESCE(m.dialogue_text, m.content)")
+		query += " ORDER BY m.session_id, m.ordinal, m.id"
+	case "thinking":
+		query = `SELECT m.session_id, s.project, s.agent, 'thinking',
+			m.role, '', m.ordinal, m.timestamp,
+			m.thinking_text,
+			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
+			4 AS src, m.id AS row_id,
+			toInt64(0) AS call_index, toInt64(0) AS event_index, m.dialogue_text IS NULL AS legacy_thinking
+			FROM messages m JOIN sessions s ON s.id = m.session_id
+			WHERE m.thinking_text <> '' AND m.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` + db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect())
+		if f.ExcludeSystem {
+			query += " AND " + embeddableMessagePredicate("m")
+		}
+		query += prefixFilter("m.thinking_text")
 		query += " ORDER BY m.session_id, m.ordinal, m.id"
 	case "tool_input":
 		query = `SELECT tc.session_id, s.project, s.agent, 'tool_input',
@@ -459,14 +654,23 @@ func (s *Store) collectContentSource(
 			tc.input_json,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 			1 AS src, tc.message_id AS row_id,
-			tc.call_index AS call_index, toInt64(0) AS event_index
+			tc.call_index AS call_index, toInt64(0) AS event_index, false AS legacy_thinking
 			FROM tool_calls tc JOIN sessions s ON s.id = tc.session_id
 			` + toolCallMessageJoin + `
-			WHERE tc.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `)
+			WHERE tc.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` + db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()) +
+			prefixFilter("tc.input_json") + `
 			ORDER BY tc.session_id, m.ordinal, tc.message_id, tc.call_index`
 	case "tool_result":
+		resultFilter := prefixFilter("tc.result_content")
+		args = append(args, scopeArgs...)
+		eventFilter := prefixFilter("tre.content")
+		args = append(args, scopeArgs...)
+		callImageFilter := prefixFilter("it.text")
+		args = append(args, scopeArgs...)
+		eventImageFilter := prefixFilter("it.text")
+		images := imageTextResultBranches(f, scopeWhere, callImageFilter, eventImageFilter, ", false AS legacy_thinking")
 		query = `SELECT session_id, project, agent, location, role,
-			tool_name, ordinal, ts, body, sort_ts, src, row_id, call_index, event_index
+			tool_name, ordinal, ts, body, sort_ts, src, row_id, call_index, event_index, legacy_thinking
 			FROM (
 				SELECT tc.session_id AS session_id, s.project AS project, s.agent AS agent,
 					'tool_result' AS location, 'assistant' AS role, tc.tool_name AS tool_name,
@@ -474,26 +678,31 @@ func (s *Store) collectContentSource(
 					tc.result_content AS body,
 					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 					2 AS src, tc.message_id AS row_id,
-					tc.call_index AS call_index, toInt64(0) AS event_index
+					tc.call_index AS call_index, 0 AS event_index, false AS legacy_thinking
 				FROM tool_calls tc JOIN sessions s ON s.id = tc.session_id
 				` + toolCallMessageJoin + `
-				WHERE tc.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `)
-					AND ` + toolCallWithoutEvents + `
+				WHERE tc.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` + db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()) + `
+					AND ` + toolCallWithoutEvents + resultFilter + `
 				UNION ALL
 				SELECT tre.session_id AS session_id, s.project AS project, s.agent AS agent,
 					'tool_result' AS location, 'assistant' AS role, '' AS tool_name,
 					tre.tool_call_message_ordinal AS ordinal, tre.timestamp AS ts,
 					tre.content AS body,
 					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
-					3 AS src, toInt64(0) AS row_id,
-					tre.call_index AS call_index, tre.event_index AS event_index
+					3 AS src, 0 AS row_id,
+					tre.call_index AS call_index, tre.event_index AS event_index, false AS legacy_thinking
 				FROM tool_result_events tre JOIN sessions s ON s.id = tre.session_id
-				WHERE tre.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `)
+				` + eventAnchorJoin + `
+				WHERE tre.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` + db.LexicalAnchorScopeSQL(f, "s", "m", db.ClickHouseQueryDialect()) + eventFilter + `
+				UNION ALL` + images[0] + `
+				UNION ALL` + images[1] + `
 			) AS results
 			ORDER BY session_id, ordinal, src, row_id, call_index, event_index`
-		args = append(args, scopeArgs...)
 	default:
 		return nil, &db.SearchInputError{Msg: fmt.Sprintf("search: unknown source %q", source)}
+	}
+	if f.ExcludeSystem && (source == "messages" || source == "thinking") {
+		query += systemPrefixSettings
 	}
 	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
@@ -502,35 +711,16 @@ func (s *Store) collectContentSource(
 	return scanContentCandidateRows(rows)
 }
 
-func contentSnippet(f db.ContentSearchFilter, body string, start, end int) string {
-	lo, hi := snippetBounds(body, start, end, 60)
-	if f.RevealSecrets {
-		return body[lo:hi]
-	}
-	return secrets.RedactWindow(body, lo, hi)
-}
-
-func snippetBounds(text string, start, end, radius int) (int, int) {
-	lo := max(start-radius, 0)
-	hi := min(end+radius, len(text))
-	for lo < start && !utf8.RuneStart(text[lo]) {
-		lo++
-	}
-	for hi > end && hi < len(text) && !utf8.RuneStart(text[hi]) {
-		hi--
-	}
-	return lo, hi
-}
-
 type contentCandidate struct {
-	match      db.ContentMatch
-	body       string
-	sortTime   time.Time
-	hasSort    bool
-	sourceRank int
-	rowID      int64
-	callIndex  int
-	eventIndex int
+	match          db.ContentMatch
+	body           string
+	sortTime       time.Time
+	hasSort        bool
+	sourceRank     int
+	rowID          int64
+	callIndex      int
+	eventIndex     int
+	legacyThinking bool
 }
 
 func sortContentCandidates(all []contentCandidate) {
@@ -612,7 +802,7 @@ func scanContentCandidateRows(rows *sql.Rows) ([]contentCandidate, error) {
 			&candidate.match.Role, &candidate.match.ToolName,
 			&candidate.match.Ordinal, &ts,
 			&candidate.body, &sortTS, &candidate.sourceRank,
-			&candidate.rowID, &candidate.callIndex, &candidate.eventIndex,
+			&candidate.rowID, &candidate.callIndex, &candidate.eventIndex, &candidate.legacyThinking,
 		); err != nil {
 			return nil, fmt.Errorf("scanning clickhouse content candidate: %w", err)
 		}

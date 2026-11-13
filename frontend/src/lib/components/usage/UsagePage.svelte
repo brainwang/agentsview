@@ -1,19 +1,19 @@
 <script lang="ts">
+  import { modelPickerItems } from "../../utils/model-groups.js";
   import { Card } from "@kenn-io/kit-ui";
   import { onDestroy, onMount, tick, untrack } from "svelte";
+  import { usage, type UsageMode } from "../../stores/usage.svelte.js";
   import {
-    usage,
     buildUsageUrlParams,
     mergeUsageAndSessionUrlParams,
     parseWindowDays,
-    type UsageMode,
-  } from "../../stores/usage.svelte.js";
+  } from "../../stores/usageUrl.js";
+  import { sessions } from "../../stores/sessions.svelte.js";
+  import { filtersToParams, parseFiltersFromParams, splitExcludeProjectParam } from "../../stores/sessionFilters.js";
   import {
-    sessions,
-    filtersToParams,
-    parseFiltersFromParams,
-    splitExcludeProjectParam,
-  } from "../../stores/sessions.svelte.js";
+    SESSION_LABEL_PARAM,
+    SESSION_PR_PARAM,
+  } from "../../stores/sessionRouteParams.js";
   import { events } from "../../stores/events.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
@@ -51,26 +51,68 @@
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
   import { m } from "../../i18n/index.js";
-  import { usageChartColorMaps } from "../../utils/usageChartColors.js";
+  import { usageChartStyleMaps } from "../../utils/usageChartStyles.js";
+  import { localDateStr } from "../../utils/dates.js";
+  import { resolveRootColor } from "../../utils/calmSeriesColor.js";
+  import { ui } from "../../stores/ui.svelte.js";
 
   let mounted = false;
   let unsubEvents: (() => void) | undefined;
-
-  const chartColorMaps = $derived(
-    usageChartColorMaps(
-      usage.timeSeriesSummary,
-      settings.chartPalette,
-    ),
+  let pendingRefresh = false;
+  let visible = $state(!document.hidden);
+  let urlInitRan = $state(false);
+  let urlWritebackReady = $state(false);
+  const refreshReady = $derived(
+    visible && urlInitRan && urlWritebackReady && !sessions.machineFilterPending,
   );
+
+  function refreshUsage(): void {
+    if (!refreshReady) {
+      pendingRefresh = true;
+      return;
+    }
+    pendingRefresh = false;
+    void usage.fetchAll({ preserveTimeRange: true });
+  }
+
+  function onVisibilityChange(): void {
+    visible = !document.hidden;
+    if (document.hidden) {
+      if (usage.isQuerying) {
+        pendingRefresh = true;
+        usage.cancelInFlightReads();
+      }
+    } else {
+      if (pendingRefresh) refreshUsage();
+      else usage.markNewData();
+    }
+  }
+
+  $effect(() => {
+    if (!usage.hasNewData || !refreshReady || usage.isQuerying) return;
+    const timer = setTimeout(refreshUsage, Math.max(0, usage.lastFetchStartedAt + 60_000 - performance.now()));
+    return () => clearTimeout(timer);
+  });
+
+  // Series colors are calmed per theme, so reading the theme re-resolves
+  // the palette variables when it changes. High contrast keeps exact colors.
+  const chartStyleMaps = $derived.by(() => {
+    void ui.theme;
+    return usageChartStyleMaps(usage.colorSummary, settings.chartPalette, {
+      resolveColor: resolveRootColor,
+      calm: !ui.highContrast,
+      dark: ui.theme === "dark",
+    });
+  });
 
   // Keep projects already returned by the summary so a project remains
   // available after filtering removes it or the page is remounted.
 
   $effect(() => {
-    const fromSummary = usage.summary?.projectTotals ?? [];
+    const fromSummary = (usage.attributionSummary ?? usage.summary)?.projectTotals ?? [];
     const counts = usage.isTimeRangeSummaryProvisional
       ? {}
-      : usage.summary?.sessionCounts.byProject ?? {};
+      : (usage.attributionSummary ?? usage.summary)?.sessionCounts.byProject ?? {};
     untrack(() => usage.mergeKnownProjects(fromSummary, counts));
   });
 
@@ -82,14 +124,31 @@
       : 0,
   );
 
-  const agentItems = $derived(
-    sessions.agents.map((a) => ({
-      name: a.name,
-      count: a.session_count,
-    })),
-  );
+  $effect(() => {
+    const summaryAgents = ((usage.attributionSummary ?? usage.summary)?.agentTotals ?? [])
+      .map((agent) => ({ name: agent.agent }));
+    const sessionAgents = sessions.agents.map((agent) => ({
+      name: agent.name, count: agent.session_count,
+    }));
+    const filteredAgents = [usage.excludedAgents, sessions.filters.agent]
+      .flatMap((csv) => csv.split(",").filter(Boolean).map((name) => ({ name })));
+    untrack(() => {
+      const agents = new Map(usage.knownAgents.map((agent) => [agent.name, agent]));
+      for (const agent of [...summaryAgents, ...sessionAgents, ...filteredAgents]) {
+        agents.set(agent.name, { ...agents.get(agent.name), ...agent });
+      }
+      usage.knownAgents = [...agents.values()].sort((a, b) => a.name.localeCompare(b.name));
+    });
+  });
 
-  const earliestSession = $derived(sync.stats?.earliest_session ?? null);
+  const agentItems = $derived(usage.knownAgents);
+
+  const earliestUsage = $derived(
+    [sync.stats?.earliest_session, sync.stats?.earliest_account_usage]
+      .filter((timestamp): timestamp is string => !!timestamp)
+      .map((timestamp) => localDateStr(new Date(timestamp)))
+      .sort()[0] ?? null,
+  );
 
   const rangeSelection = $derived(
     selectionFromWindow({
@@ -97,7 +156,7 @@
       windowDays: usage.windowDays,
       from: usage.from,
       to: usage.to,
-      earliestSession,
+      earliestSession: earliestUsage,
     }),
   );
 
@@ -109,7 +168,7 @@
         windowDays: sel.days,
       }));
     } else {
-      const range = resolveRange(sel, earliestSession);
+      const range = resolveRange(sel, earliestUsage);
       usage.setDateRange(range.from, range.to);
       updateYokeFromUsage(panelDateState(range.from, range.to, {
         mode: "fixed",
@@ -117,8 +176,7 @@
     }
   }
 
-  // Track every model we've seen in any summary response or
-  // model filter — never remove one. This keeps the model
+  // Track models from summary rows and applied filters. This keeps the model
   // dropdown usable when landing on a shared filtered URL.
   let knownModels: string[] = $state([]);
 
@@ -139,22 +197,18 @@
 
   // Seed from the filtered summary response.
   $effect(() => {
-    const fromSummary = (usage.summary?.modelTotals ?? [])
-      .map((m) => m.model);
+    const fromSummary = ((usage.attributionSummary ?? usage.summary)?.modelTotals ?? [])
+      .map((model) => model.model);
     untrack(() => mergeIntoKnownModels(fromSummary));
   });
 
-  // Seed from URL/local model filters before a response arrives.
   $effect(() => {
-    const filtered = usage.excludedModels;
-    untrack(() => {
-      if (!filtered) return;
-      mergeIntoKnownModels(filtered.split(","));
-    });
+    const filtered = usage.excludedModels.split(",").filter(Boolean);
+    untrack(() => mergeIntoKnownModels(filtered));
   });
 
   const modelItems = $derived(
-    knownModels.map((m) => ({ name: m })),
+    modelPickerItems(knownModels, usage.excludedModels, usage.modelAliases),
   );
   const unsupportedUsageMessage = $derived.by(() => {
     const kind = usage.isTimeRangeSummaryProvisional
@@ -226,8 +280,6 @@
     return supported;
   }
 
-  let urlInitRan = $state(false);
-  let urlWritebackReady = $state(false);
   let initialFetchDone = $state(false);
 
   function selectUsageMode(mode: UsageMode): void {
@@ -335,17 +387,24 @@
         return;
       }
       if (hasSessionFilterKeys) {
-        const nextSessionParams = filtersToParams(
-          parseFiltersFromParams(supportedSessionParams),
-        );
         const currentSessionParams = filtersToParams(
           sessions.filters,
+        );
+        // Usage URLs carry only shared filters; keep the session list's
+        // own label and pull request filters across the hydration.
+        const hydratedParams = { ...supportedSessionParams };
+        for (const key of [SESSION_LABEL_PARAM, SESSION_PR_PARAM]) {
+          const value = currentSessionParams[key];
+          if (value) hydratedParams[key] = value;
+        }
+        const nextSessionParams = filtersToParams(
+          parseFiltersFromParams(hydratedParams),
         );
         if (
           JSON.stringify(nextSessionParams) !==
           JSON.stringify(currentSessionParams)
         ) {
-          sessions.initFromParams(supportedSessionParams);
+          sessions.initFromParams(hydratedParams);
           sessionChanged = true;
         }
       }
@@ -417,7 +476,7 @@
 
   $effect(() => {
     const signature = sessionFilterSignature;
-    const ready = urlInitRan && urlWritebackReady;
+    const ready = urlInitRan && urlWritebackReady && !sessions.machineFilterPending;
     untrack(() => {
       if (!ready || !signature || router.route !== "usage" || !mounted) {
         return;
@@ -425,18 +484,16 @@
       if (!initialFetchDone) {
         initialFetchDone = true;
       }
-      usage.fetchAll();
+      refreshUsage();
     });
   });
 
   onMount(() => {
     mounted = true;
+    document.addEventListener("visibilitychange", onVisibilityChange);
     // The Agent dropdown reads sessions.agents, which is otherwise loaded
     // lazily by the sidebar filter control; a direct /usage visit needs it too.
     sessions.loadAgents();
-    // SSE events only flag new data; RefreshControl owns the periodic refresh
-    // and the manual button. The initial and filter-change fetches run from the
-    // effects above once URL/filter state is hydrated.
     unsubEvents = events.subscribe(() => usage.markNewData());
     tick().then(() => {
       urlWritebackReady = true;
@@ -444,6 +501,7 @@
   });
 
   onDestroy(() => {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
     usage.cancelInFlightReads();
     unsubEvents?.();
   });
@@ -468,6 +526,7 @@
         <SessionFilterControl
           showDisplay={false}
           showStarred={false}
+          showLabelFilters={false}
           align="left"
           extraActive={usage.hasActiveFilters || !!sessions.filters.project}
           onClearExtra={() => {
@@ -480,12 +539,13 @@
       <RangePicker
         selection={rangeSelection}
         busy={usage.isQuerying}
-        {earliestSession}
+        earliestSession={earliestUsage}
         onSelect={applyRange}
       />
 
       <FilterDropdown
         label={m.analytics_col_project()}
+        selectedLabel={usage.selectedProjectKey ? usage.focusLabel : ""}
         items={projectItems}
         excludedCsv={usage.excludedProjectKeys}
         unlistedExcludedCount={legacyExcludedProjectCount}
@@ -507,8 +567,10 @@
 
       <FilterDropdown
         label={m.usage_model()}
+        selectedLabel={usage.selectedModel}
         items={modelItems}
-        excludedCsv={usage.excludedModels}
+        excludedCsv={usage.displayedModels}
+        unlistedExcludedCount={usage.partlyExcludedModelCount}
         onToggle={(name) => usage.toggleModel(name)}
         onSelectAll={() => usage.selectAllModels()}
         onDeselectAll={() =>
@@ -519,8 +581,9 @@
         lastUpdatedAt={usage.lastUpdatedAt}
         queryDurationMs={usage.lastQueryDurationMs}
         querySteps={usage.lastQuerySteps}
+        liveQuery={usage.liveQuery}
         busy={usage.isQuerying}
-        onRefresh={() => usage.fetchAll({ preserveTimeRange: true })}
+        onRefresh={(reason) => reason === "manual" ? refreshUsage() : usage.markNewData()}
         label={m.usage_refresh()}
         title={m.shared_refresh()}
       />
@@ -528,10 +591,12 @@
     </div>
   </div>
 
+  <!-- Clear all also resets session filters, whose change effect does the one refresh. -->
   <SessionActiveFilters
-    onClearProjects={() => usage.selectAllProjects()}
-    onClearAgents={() => usage.selectAllAgents()}
-    onClearModels={() => usage.selectAllModels()}
+    onClearProjects={() => {
+      usage.clearTimeRange(false);
+      usage.clearFilters(false);
+    }}
   />
 
   <div
@@ -555,13 +620,13 @@
 
     <Card level="default" padding="none" class="chart-panel wide">
       <CostTimeSeriesChart
-        colorMap={chartColorMaps[usage.toggles.timeSeries.groupBy]}
+        styleMap={chartStyleMaps[usage.toggles.timeSeries.groupBy]}
       />
     </Card>
 
     <Card level="default" padding="none" class="chart-panel wide">
       <AttributionPanel
-        colorMap={chartColorMaps[usage.toggles.attribution.groupBy]}
+        styleMap={chartStyleMaps[usage.toggles.attribution.groupBy]}
       />
     </Card>
 
@@ -612,6 +677,18 @@
     align-items: center;
   }
 
+  /* In this chip row the filter button is the one funnel for the group,
+     so it gets the same framing as the Project/Agent/Model chips beside
+     it instead of floating as a bare glyph. */
+  .usage-filter-anchor :global(.filter-btn) {
+    width: var(--filter-chip-height);
+    height: var(--filter-chip-height);
+    background: var(--bg-raised, var(--bg-inset));
+    border: var(--border-width, 1px) solid var(--border-muted);
+    box-shadow: var(--shadow-raised, none);
+    border-radius: var(--kit-control-radius, var(--radius-sm));
+  }
+
   .usage-content {
     flex: 1;
     overflow-y: auto;
@@ -626,6 +703,8 @@
   .usage-content :global(.usage-note) {
     padding: 12px 14px;
     border-left: 4px solid var(--accent-blue);
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
     color: var(--text-secondary);
   }
 

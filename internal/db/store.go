@@ -67,6 +67,7 @@ type Store interface {
 	GetActiveProjectLabels(ctx context.Context) ([]string, error)
 	GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]AgentInfo, error)
 	GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error)
+	GetMatchingMachineIDs(ctx context.Context, candidates []string) ([]string, error)
 	GetMachineLabels(ctx context.Context) (map[string]string, error)
 	GetMachineAliases(ctx context.Context) (map[string]string, error)
 	GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]BranchInfo, error)
@@ -87,6 +88,7 @@ type Store interface {
 	GetAnalyticsProjects(ctx context.Context, f AnalyticsFilter) (ProjectsAnalyticsResponse, error)
 	GetAnalyticsHourOfWeek(ctx context.Context, f AnalyticsFilter) (HourOfWeekResponse, error)
 	GetAnalyticsSessionShape(ctx context.Context, f AnalyticsFilter) (SessionShapeResponse, error)
+	// Tools, Velocity, and Signals reports may be shared; callers must not modify them.
 	GetAnalyticsTools(ctx context.Context, f AnalyticsFilter) (ToolsAnalyticsResponse, error)
 	GetAnalyticsSkills(ctx context.Context, f AnalyticsFilter, granularity string) (SkillsAnalyticsResponse, error)
 	GetAnalyticsVelocity(ctx context.Context, f AnalyticsFilter) (VelocityResponse, error)
@@ -102,7 +104,9 @@ type Store interface {
 	GetTopSessionsByCost(ctx context.Context, f UsageFilter, limit int) ([]TopSessionEntry, error)
 	GetUsageSessionCounts(ctx context.Context, f UsageFilter) (UsageSessionCounts, error)
 	GetUsageMatchingSessionCount(ctx context.Context, f UsageFilter) (int, error)
+	GetPlanUsageSessionCounts(ctx context.Context, f UsageFilter) (PlanUsageSessionCounts, error)
 	GetSessionUsage(ctx context.Context, sessionID string, includeBreakdown bool) (*SessionUsage, error)
+	GetSessionPlanUsage(ctx context.Context, sessionID string) (*SessionPlanUsage, error)
 
 	// Stars.
 	StarSession(ctx context.Context, sessionID string) (bool, error)
@@ -125,6 +129,9 @@ type Store interface {
 	// RecallEntries.
 	ListRecallEntries(ctx context.Context, q RecallQuery) ([]RecallEntry, error)
 	GetRecallEntry(ctx context.Context, id string) (*RecallEntry, error)
+	ReviewRecallEntry(
+		ctx context.Context, id string, action RecallReviewAction,
+	) (RecallEntry, error)
 	QueryRecallEntries(ctx context.Context, q RecallQuery) (RecallPage, error)
 	RecordRecallQueryEvent(
 		ctx context.Context, event RecallQueryEvent,

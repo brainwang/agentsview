@@ -3,25 +3,32 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/shirou/gopsutil/v4/process"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/kit/daemon"
+	"go.kenn.io/kit/safefileio"
 )
 
 const (
@@ -35,6 +42,8 @@ const (
 	runtimePort            = "port"
 	runtimeExplicitPort    = "explicit_port"
 	runtimeRequireAuth     = "require_auth"
+	runtimePersistent      = "persistent"
+	runtimeIdleTimeout     = "idle_timeout"
 	runtimeNoSync          = "no_sync"
 	runtimeAPIVersion      = "api_version"
 	runtimeDataVersion     = "data_version"
@@ -56,6 +65,7 @@ func startProbeTick() time.Duration {
 // DaemonRuntime is the agentsview-specific view of a kit daemon runtime record.
 type DaemonRuntime struct {
 	Record           daemon.RuntimeRecord
+	BackfillError    string
 	Host             string
 	BrowserURL       string
 	BasePath         string
@@ -64,6 +74,8 @@ type DaemonRuntime struct {
 	ReadOnly         bool
 	RequireAuth      bool
 	RequireAuthKnown bool
+	Persistent       bool
+	IdleTimeout      *time.Duration
 	NoSync           bool
 	API              int
 	Data             int
@@ -71,8 +83,67 @@ type DaemonRuntime struct {
 	RuntimeError     string
 }
 
-func runtimeStore(dataDir string) daemon.RuntimeStore {
-	return daemon.RuntimeStore{Dir: dataDir}
+type daemonRuntimeStore struct {
+	daemon.RuntimeStore
+	legacyDir string
+}
+
+func runtimeStore(dataDir string) daemonRuntimeStore {
+	dir := config.RuntimeDir(dataDir)
+	if dir != dataDir && safefileio.ValidatePrivateDir(dataDir) != nil {
+		// Kit no longer makes the data dir private on every call. Restrict it
+		// only when needed so later commands leave archive metadata alone.
+		_ = safefileio.EnsurePrivateDir(dataDir)
+	}
+	return daemonRuntimeStore{
+		Dir:       dir,
+		legacyDir: dataDir,
+	}
+}
+
+func (s daemonRuntimeStore) List() ([]daemon.RuntimeRecord, error) {
+	records, err := s.RuntimeStore.List()
+	if err != nil || s.Dir == s.legacyDir {
+		return records, err
+	}
+	legacy, err := s.legacyRecords()
+	if err != nil {
+		return nil, err
+	}
+	records = append(records, legacy...)
+	slices.SortFunc(records, func(a, b daemon.RuntimeRecord) int {
+		if order := a.StartedAt.Compare(b.StartedAt); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.PID, b.PID)
+	})
+	return records, nil
+}
+
+func (s daemonRuntimeStore) legacyRecords() ([]daemon.RuntimeRecord, error) {
+	// Remove this bridge once upgrades from 0.45.x and earlier are unsupported.
+	entries, err := os.ReadDir(s.legacyDir)
+	if err != nil {
+		return nil, fmt.Errorf("read legacy runtime dir: %w", err)
+	}
+	var records []daemon.RuntimeRecord
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "daemon.") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "daemon."), ".json"))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		path := filepath.Join(s.legacyDir, name)
+		rec, err := s.Read(path)
+		if err != nil || rec.PID != pid || rec.Address == "" {
+			continue
+		}
+		records = append(records, rec)
+	}
+	return records, nil
 }
 
 // WriteDaemonRuntime writes a shared kit daemon runtime record for the running
@@ -92,14 +163,19 @@ func WriteDaemonRuntimeWithAuth(
 	dataDir string, host string, port int, version, browserURL string,
 	readOnly bool, requireAuth bool, caddyPID ...int,
 ) (string, error) {
-	return WriteDaemonRuntimeWithAuthAndNoSync(
+	return WriteDaemonRuntimeWithAuthAndNoSync(nil,
 		dataDir, host, port, version, browserURL, readOnly, requireAuth, false,
 		nil, caddyPID...,
 	)
 }
 
+type daemonLifetime struct {
+	Persistent  bool
+	IdleTimeout time.Duration
+}
+
 func WriteDaemonRuntimeWithAuthAndNoSync(
-	dataDir string, host string, port int, version, browserURL string,
+	lifetime *daemonLifetime, dataDir string, host string, port int, version, browserURL string,
 	readOnly bool, requireAuth bool, noSync bool, explicitPort *int, caddyPID ...int,
 ) (string, error) {
 	ep := daemon.Endpoint{
@@ -117,13 +193,16 @@ func WriteDaemonRuntimeWithAuthAndNoSync(
 		runtimeAPIVersion:  strconv.Itoa(daemonAPIVersion),
 		runtimeDataVersion: strconv.Itoa(db.CurrentDataVersion()),
 	}
+	if !readOnly && lifetime != nil {
+		rec.Metadata[runtimePersistent] = strconv.FormatBool(lifetime.Persistent)
+		rec.Metadata[runtimeIdleTimeout] = lifetime.IdleTimeout.String()
+	}
 	if explicitPort != nil {
 		rec.Metadata[runtimeExplicitPort] = strconv.Itoa(*explicitPort)
 	}
-	// Persist this process's OS create time so `serve stop` can confirm a
-	// PID still belongs to the recorded daemon (and was not reused) by
-	// matching create times exactly. Best-effort: if it cannot be read, stop
-	// falls back to ping confirmation only.
+	// Persist the OS create time for compatibility with older runtime records
+	// and platforms without the stronger Kit process identity. Best-effort: if
+	// it cannot be read, stop falls back to the other identity evidence.
 	if ct, ok := processCreateTimeMillis(os.Getpid()); ok {
 		rec.Metadata[runtimeCreateTime] = strconv.FormatInt(ct, 10)
 	}
@@ -140,9 +219,7 @@ func WriteDaemonRuntimeWithAuthAndNoSync(
 	path, err := runtimeStore(dataDir).Write(rec)
 	if err != nil {
 		if !readOnly {
-			publishStartupStateFallback(
-				dataDir, host, port, browserURL, requireAuth, noSync, explicitPort, caddy, err,
-			)
+			publishStartupStateFallback(dataDir, host, port, browserURL, requireAuth, noSync, explicitPort, caddy, err)
 		}
 		return "", err
 	}
@@ -192,6 +269,22 @@ func processCreateTimeStateForPID(
 	return compareProcessCreateTime(recorded, live, ok)
 }
 
+func runtimeRecordIdentityState(rec daemon.RuntimeRecord) processCreateTimeState {
+	if rec.ProcessIdentityV2 != "" {
+		switch daemon.CompareRuntimeProcessIdentity(rec) {
+		case daemon.ProcessIdentityMatch:
+			return processCreateTimeMatch
+		case daemon.ProcessIdentityMismatch:
+			return processCreateTimeMismatch
+		default:
+			return processCreateTimeUnknown
+		}
+	}
+	return processCreateTimeStateForPID(
+		rec.PID, rec.Metadata[runtimeCreateTime],
+	)
+}
+
 // RemoveDaemonRuntime removes the current process's kit daemon runtime record.
 func RemoveDaemonRuntime(dataDir string) {
 	path, err := runtimeStore(dataDir).Path(os.Getpid())
@@ -200,7 +293,7 @@ func RemoveDaemonRuntime(dataDir string) {
 	}
 }
 
-var listDaemonRuntimeRecords = func(store daemon.RuntimeStore) ([]daemon.RuntimeRecord, error) {
+var listDaemonRuntimeRecords = func(store daemonRuntimeStore) ([]daemon.RuntimeRecord, error) {
 	return store.List()
 }
 
@@ -231,10 +324,10 @@ func FindDaemonRuntime(dataDir string, authToken ...string) *DaemonRuntime {
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
-		if runtimeRecordHasMismatchedCreateTime(store, rec) {
+		if runtimeRecordHasMismatchedIdentity(store, rec) {
 			continue
 		}
 		if !daemonRuntimeFromRecord(rec).ReadOnly {
@@ -248,6 +341,7 @@ func FindDaemonRuntime(dataDir string, authToken ...string) *DaemonRuntime {
 			continue
 		}
 		rt := daemonRuntimeFromRecord(rec)
+		rt.BackfillError = info.BackfillError
 		if daemonRuntimeCompatibilityError(rt) != nil {
 			continue
 		}
@@ -292,9 +386,7 @@ func writableDaemonRecordsWithFallback(
 	hasWritable := false
 	for _, rec := range records {
 		rt := daemonRuntimeFromRecord(rec)
-		if !rt.ReadOnly && processCreateTimeStateForPID(
-			rec.PID, rec.Metadata[runtimeCreateTime],
-		) == processCreateTimeMismatch {
+		if !rt.ReadOnly && runtimeRecordIdentityState(rec) == processCreateTimeMismatch {
 			continue
 		}
 		filtered = append(filtered, rec)
@@ -340,6 +432,8 @@ func findStartupStateFallback(dataDir, authToken string) *DaemonRuntime {
 		Address: net.JoinHostPort(probeHostForDial(st.Host), strconv.Itoa(st.Port)),
 	})
 	rec.PID = st.PID
+	rec.ProcessIdentity = ""
+	rec.ProcessIdentityV2 = ""
 	rec.StartedAt = st.StartedAt
 	rec.Metadata = map[string]string{
 		runtimeHost:        st.Host,
@@ -355,6 +449,10 @@ func findStartupStateFallback(dataDir, authToken string) *DaemonRuntime {
 	}
 	if st.RequireAuthKnown {
 		rec.Metadata[runtimeRequireAuth] = strconv.FormatBool(st.RequireAuth)
+	}
+	rec.Metadata[runtimePersistent] = strconv.FormatBool(st.Persistent)
+	if st.IdleTimeout != "" {
+		rec.Metadata[runtimeIdleTimeout] = st.IdleTimeout
 	}
 	if st.NoSyncKnown {
 		rec.Metadata[runtimeNoSync] = strconv.FormatBool(st.NoSync)
@@ -372,6 +470,7 @@ func findStartupStateFallback(dataDir, authToken string) *DaemonRuntime {
 	}
 	rec.Version = info.Version
 	rt := daemonRuntimeFromRecord(rec)
+	rt.BackfillError = info.BackfillError
 	rt.RuntimeFallback = true
 	rt.RuntimeError = st.RuntimeError
 	return rt
@@ -420,10 +519,10 @@ func findIncompatibleDaemonRuntime(
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
-		if runtimeRecordHasMismatchedCreateTime(store, rec) {
+		if runtimeRecordHasMismatchedIdentity(store, rec) {
 			continue
 		}
 		if !daemonRuntimeFromRecord(rec).ReadOnly {
@@ -463,53 +562,68 @@ func firstAuthToken(tokens []string) string {
 	return tokens[0]
 }
 
+type runtimePing struct {
+	daemon.PingInfo
+	BackfillError string
+}
+
 func probeRuntime(
 	ctx context.Context,
 	rec daemon.RuntimeRecord,
 	authToken string,
 	opts daemon.ProbeOptions,
-) (daemon.PingInfo, error) {
+) (runtimePing, error) {
 	ep := rec.Endpoint()
 	if opts.Path == "" {
 		opts.Path = daemon.DefaultPingPath
 	}
 	opts.Path = daemonRuntimeFromRecord(rec).BasePath + opts.Path
-	if authToken == "" {
-		return daemon.Probe(ctx, ep, opts)
-	}
 	timeout := opts.Timeout
 	if timeout == 0 {
 		timeout = time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
 	client := ep.HTTPClient(daemon.HTTPClientOptions{
 		Timeout:           timeout,
 		DisableKeepAlives: true,
 	})
-	client.Transport = bearerAuthTransport{
-		token: authToken,
-		base:  client.Transport,
+	var body bytes.Buffer
+	client.Transport = runtimeProbeTransport{base: client.Transport, token: authToken, body: &body}
+	info, err := daemon.ProbeHTTP(ctx, client, ep.BaseURL(), opts)
+	if err != nil {
+		return runtimePing{}, err
 	}
-	return daemon.ProbeHTTP(ctx, client, ep.BaseURL(), opts)
+	var details struct {
+		BackfillError string `json:"project_identity_backfill_error"`
+	}
+	if err := json.Unmarshal(body.Bytes(), &details); err != nil {
+		return runtimePing{}, fmt.Errorf("decode daemon ping: %w", err)
+	}
+	return runtimePing{PingInfo: info, BackfillError: details.BackfillError}, nil
 }
 
-type bearerAuthTransport struct {
-	token string
+type runtimeProbeTransport struct {
 	base  http.RoundTripper
+	token string
+	body  *bytes.Buffer
 }
 
-func (t bearerAuthTransport) RoundTrip(
-	req *http.Request,
-) (*http.Response, error) {
-	clone := req.Clone(req.Context())
-	clone.Header.Set("Authorization", "Bearer "+t.token)
+func (t runtimeProbeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.token != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set("Authorization", "Bearer "+t.token)
+	}
 	base := t.base
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return base.RoundTrip(clone)
+	resp, err := base.RoundTrip(req)
+	if err == nil {
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.TeeReader(resp.Body, t.body), resp.Body}
+	}
+	return resp, err
 }
 
 func daemonRuntimeFromRecord(rec daemon.RuntimeRecord) *DaemonRuntime {
@@ -551,7 +665,13 @@ func daemonRuntimeFromRecord(rec daemon.RuntimeRecord) *DaemonRuntime {
 		apiVersion, _ = strconv.Atoi(rec.Metadata[runtimeAPIVersion])
 		dataVersion, _ = strconv.Atoi(rec.Metadata[runtimeDataVersion])
 	}
+	var idleTimeout *time.Duration
+	if parsed, err := time.ParseDuration(rec.Metadata[runtimeIdleTimeout]); err == nil {
+		idleTimeout = &parsed
+	}
+	persistent, _ := strconv.ParseBool(rec.Metadata[runtimePersistent])
 	return &DaemonRuntime{
+		Persistent: persistent, IdleTimeout: idleTimeout,
 		Record:           rec,
 		Port:             port,
 		ExplicitPort:     explicitPort,
@@ -588,8 +708,9 @@ func daemonRuntimeCompatibilityError(rt *DaemonRuntime) error {
 }
 
 // liveDaemonRecords returns runtime records for agentsview daemons in dataDir
-// whose process is still alive. Unlike FindDaemonRuntime it does not require a
-// successful ping, so it can target a hung-but-alive server (e.g. for stop).
+// whose process may still be alive. Unlike FindDaemonRuntime it does not require
+// a successful ping, so it can target a hung server (e.g. for stop) and retain
+// records whose process identity cannot be checked from this PID namespace.
 func liveDaemonRecords(dataDir string) []daemon.RuntimeRecord {
 	migrateLegacyDaemonRuntimes(dataDir)
 
@@ -604,7 +725,7 @@ func liveDaemonRecords(dataDir string) []daemon.RuntimeRecord {
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
 		alive = append(alive, rec)
@@ -617,8 +738,9 @@ type daemonRuntimeRecordStore interface {
 	List() ([]daemon.RuntimeRecord, error)
 }
 
-// writableDaemonRecords returns every live writable agentsview runtime record.
-// It does not probe the daemon, so callers can recover or stop a hung process.
+// writableDaemonRecords returns writable agentsview records whose processes may
+// still be alive. It does not probe the daemon, so callers can recover or stop a
+// hung process without overlooking an owner in another PID namespace.
 func writableDaemonRecords(
 	dataDir string, authToken string,
 ) ([]daemon.RuntimeRecord, error) {
@@ -642,12 +764,10 @@ func writableDaemonRecordsFromStore(
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
-		if processCreateTimeStateForPID(
-			rec.PID, rec.Metadata[runtimeCreateTime],
-		) == processCreateTimeMismatch {
+		if runtimeRecordIdentityState(rec) == processCreateTimeMismatch {
 			if rec.SourcePath != "" {
 				if err := os.Remove(rec.SourcePath); err != nil &&
 					!errors.Is(err, os.ErrNotExist) {
@@ -680,10 +800,10 @@ func hasLiveDaemonRuntime(dataDir string, authToken ...string) bool {
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
-		if runtimeRecordHasMismatchedCreateTime(store, rec) {
+		if runtimeRecordHasMismatchedIdentity(store, rec) {
 			continue
 		}
 		return true
@@ -796,10 +916,10 @@ func hasLiveWritableDaemonRuntime(dataDir string, authToken ...string) bool {
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
-		if runtimeRecordHasMismatchedCreateTime(store, rec) {
+		if runtimeRecordHasMismatchedIdentity(store, rec) {
 			continue
 		}
 		if !daemonRuntimeFromRecord(rec).ReadOnly {
@@ -809,13 +929,11 @@ func hasLiveWritableDaemonRuntime(dataDir string, authToken ...string) bool {
 	return false
 }
 
-func runtimeRecordHasMismatchedCreateTime(
-	store daemon.RuntimeStore,
+func runtimeRecordHasMismatchedIdentity(
+	store daemonRuntimeStore,
 	rec daemon.RuntimeRecord,
 ) bool {
-	if processCreateTimeStateForPID(
-		rec.PID, rec.Metadata[runtimeCreateTime],
-	) != processCreateTimeMismatch {
+	if runtimeRecordIdentityState(rec) != processCreateTimeMismatch {
 		return false
 	}
 	path := rec.SourcePath
@@ -893,6 +1011,21 @@ func isDaemonStarting(dataDir string) bool {
 }
 
 func daemonStartingWithLockProbe(dataDir string, external bool) bool {
+	if config.RuntimeDir(dataDir) != dataDir {
+		// Remove this bridge once upgrades from 0.45.x and earlier are unsupported.
+		path := filepath.Join(dataDir, "daemon.lock")
+		if _, err := os.Stat(path); err == nil {
+			lock := flock.New(path)
+			defer lock.Close()
+			acquired, err := lock.TryLock()
+			if err == nil {
+				if !acquired {
+					return true
+				}
+				_ = lock.Unlock()
+			}
+		}
+	}
 	path, err := runtimeStore(dataDir).LockPath()
 	if err != nil {
 		return false
@@ -902,7 +1035,7 @@ func daemonStartingWithLockProbe(dataDir string, external bool) bool {
 	if _, ok := startLocks.Load(path); ok {
 		return !external
 	}
-	release, locked, err := tryAcquireStartLock(runtimeStore(dataDir), context.Background())
+	release, locked, err := tryAcquireStartLock(runtimeStore(dataDir).RuntimeStore, context.Background())
 	if err == nil {
 		if locked {
 			release()
@@ -921,7 +1054,7 @@ func daemonStartingWithLockProbe(dataDir string, external bool) bool {
 	if !orphanedStartupState(dataDir, orphanedStartupStateNow()) {
 		return true
 	}
-	release, recoveryLocked, recoveryErr := tryAcquireStartLock(runtimeStore(dataDir), context.Background())
+	release, recoveryLocked, recoveryErr := tryAcquireStartLock(runtimeStore(dataDir).RuntimeStore, context.Background())
 	if recoveryErr != nil || !recoveryLocked {
 		return true
 	}
@@ -1020,16 +1153,8 @@ func IsLocalDaemonActive(dataDir string, authToken ...string) bool {
 		IsDaemonStarting(dataDir)
 }
 
-// WaitForDaemonStartup polls until the daemon start lock clears or a running daemon is
-// detected, up to the given timeout.
-func WaitForDaemonStartup(
-	dataDir string, timeout time.Duration, authToken ...string,
-) bool {
-	return WaitForDaemonStartupContext(
-		context.Background(), dataDir, timeout, authToken...,
-	)
-}
-
+// WaitForDaemonStartupContext polls until the daemon start lock clears or a
+// running daemon is detected, up to the given timeout or until ctx ends.
 func WaitForDaemonStartupContext(
 	ctx context.Context,
 	dataDir string,
@@ -1038,7 +1163,7 @@ func WaitForDaemonStartupContext(
 ) bool {
 	started := time.Now()
 	deadline := started.Add(timeout)
-	progress := daemonLaunchProgressWriter{w: os.Stderr}
+	progress := daemonLaunchProgressWriter{w: daemonProgressWriter(ctx)}
 	var lastUpdate time.Time
 	for time.Now().Before(deadline) {
 		if FindDaemonRuntime(dataDir, authToken...) != nil {
@@ -1076,4 +1201,28 @@ func probeHostForDial(host string) string {
 	default:
 		return host
 	}
+}
+
+func publishPersistentDaemon(dataDir string) error {
+	store := runtimeStore(dataDir)
+	path, err := store.Path(os.Getpid())
+	if err != nil {
+		return err
+	}
+	rec, err := store.Read(path)
+	if err != nil {
+		st := readStartupState(dataDir)
+		if st == nil || st.PID != os.Getpid() || st.RuntimeError == "" {
+			return err
+		}
+		st.Persistent, st.IdleTimeout = true, "0s"
+		data, err := json.Marshal(st)
+		if err != nil {
+			return err
+		}
+		return writeStartupState(dataDir, data)
+	}
+	rec.Metadata[runtimePersistent], rec.Metadata[runtimeIdleTimeout] = "true", "0s"
+	_, err = store.Write(rec)
+	return err
 }

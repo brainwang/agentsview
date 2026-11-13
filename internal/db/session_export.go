@@ -18,6 +18,7 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 const sessionExportOrder = "last_activity_at DESC, id ASC"
@@ -92,7 +93,12 @@ type SessionSummaryRow struct {
 	PeakContextTokens     int                          `json:"peak_context_tokens"`
 	HasTotalOutputTokens  bool                         `json:"has_total_output_tokens"`
 	HasPeakContextTokens  bool                         `json:"has_peak_context_tokens"`
-	lastActivitySort      float64
+	// PlanUsage and CaptureCoverage are the session's codex-cloud plan
+	// usage and live capture coverage. A session with only plan usage has
+	// no model_usage, so it exports no token or cost figures.
+	PlanUsage        *PlanUsageView       `json:"plan_usage,omitempty"`
+	CaptureCoverage  *CaptureCoverageView `json:"capture_coverage,omitempty"`
+	lastActivitySort float64
 }
 
 type SessionModelUsage struct {
@@ -180,7 +186,6 @@ type sessionExportUsageAccum struct {
 	authoritativeCost        *money.Money
 	contributing             bool
 	allPriced                bool
-	seen                     map[usageDedupToken]struct{}
 }
 
 type sessionExportModelUsageAccum struct {
@@ -445,6 +450,9 @@ func (db *DB) exportSessionSummariesTx(
 		return SessionExportResult{}, err
 	}
 	if err := db.attachSessionExportWorktrees(ctx, tx, resultRows); err != nil {
+		return SessionExportResult{}, err
+	}
+	if err := attachSessionExportPlanUsage(ctx, tx, resultRows); err != nil {
 		return SessionExportResult{}, err
 	}
 	sessionIDs := make([]string, len(resultRows))
@@ -828,8 +836,8 @@ SELECT
 	 FROM messages m
 	 WHERE m.session_id = sessions.id
 	   AND m.role = 'assistant'
-	   AND COALESCE(m.is_system, 0) = 0) AS assistant_message_count,
-	COALESCE(sessions.is_automated, 0) AS is_automated,
+	   AND m.is_system = 0) AS assistant_message_count,
+	sessions.is_automated AS is_automated,
 	sessions.parent_session_id,
 	sessions.relationship_type,
 	sessions.total_output_tokens,
@@ -937,17 +945,63 @@ func (db *DB) attachSessionExportUsage(
 	for i := range rows {
 		accum[rows[i].ID] = newSessionExportUsageAccum()
 	}
-
-	query, args := sessionExportUsageQuery(sessionExportIDs(rows))
-	usageRows, err := querySessionExportUsageRows(ctx, q, query, args)
-	if err != nil {
+	if err := forEachSessionUsageCredit(ctx, q, sessionExportIDs(rows), resolver,
+		func(credit sessionUsageCredit) error {
+			a, ok := accum[credit.owner]
+			if !ok {
+				return nil
+			}
+			return a.add(credit)
+		}); err != nil {
 		return nil, err
 	}
-	peers, err := sessionExportClaudeSnapshotPeers(
-		ctx, q, usageRows, sessionExportIDs(rows),
-	)
+	for i := range rows {
+		if a, ok := accum[rows[i].ID]; ok {
+			rows[i].ModelUsage = a.modelUsage()
+		}
+	}
+	block, err := resolver.BuildBlock()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("building pricing block: %w", err)
+	}
+	return &block, nil
+}
+
+// sessionUsageCredit is one deduplicated, priced usage row and the session
+// whose totals it counts toward. Claude snapshot peers can credit a row to a
+// session other than the one that stored it.
+type sessionUsageCredit struct {
+	owner                    string
+	row                      usageScanRow
+	inputTokens              int
+	outputTokens             int
+	cacheCreationInputTokens int
+	cacheReadInputTokens     int
+	reasoningTokens          int
+	cost                     money.Money
+	priced                   bool
+	contributes              bool
+	// reported is set when the row's own cost was used.
+	reported bool
+	// authoritative is a reported session total that replaces every
+	// computed row cost of the owner.
+	authoritative *money.Money
+}
+
+// forEachSessionUsageCredit applies session export's usage deduplication and
+// pricing to the given sessions and passes each surviving row to fn.
+func forEachSessionUsageCredit(
+	ctx context.Context, q sessionExportQuerier, sessionIDs []string,
+	resolver *export.PricingResolver, fn func(sessionUsageCredit) error,
+) error {
+	query, args := sessionExportUsageQuery(sessionIDs)
+	usageRows, err := querySessionExportUsageRows(ctx, q, query, args)
+	if err != nil {
+		return err
+	}
+	peers, err := sessionExportClaudeSnapshotPeers(ctx, q, usageRows, sessionIDs)
+	if err != nil {
+		return err
 	}
 	usageRows = append(usageRows, peers...)
 
@@ -969,87 +1023,101 @@ func (db *DB) attachSessionExportUsage(
 		}
 	}
 	snapshotMask, snapshotAttribution, snapshotWebSearchRequests := activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	seen := make(map[string]map[activity.UsageDedupToken]struct{}, len(sessionIDs))
+	for _, id := range sessionIDs {
+		seen[id] = make(map[activity.UsageDedupToken]struct{})
+	}
 	for i, r := range usageRows {
 		if !snapshotMask[i] {
 			continue
 		}
-		a := accum[snapshotAttribution[i]]
-		if a == nil {
+		owner := snapshotAttribution[i]
+		ownerSeen, ok := seen[owner]
+		if !ok {
 			continue
 		}
-		if key, ok := usageDedupTokenForRow(
-			r.usageSource, r.agent, r.claudeMessageID,
-			r.claudeRequestID, r.sourceUUID, r.usageDedupKey,
-		); ok {
-			if _, dup := a.seen[key]; dup {
-				continue
-			}
-			a.seen[key] = struct{}{}
+		if !activity.KeepSessionUsageRow(ownerSeen, r.UsageIdentity()) {
+			continue
 		}
-		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok := sessionExportUsageTokens(r)
+		credit := sessionUsageCredit{owner: owner, row: r}
+		credit.inputTokens, credit.outputTokens, credit.cacheCreationInputTokens,
+			credit.cacheReadInputTokens, credit.reasoningTokens = sessionExportUsageTokens(r)
 		costRow := r
-		authoritative := r.costSource == CopilotReportedCostSource &&
-			r.cost.Valid
-		if authoritative {
-			v := money.Money{Microdollars: r.cost.Int64}
-			a.authoritativeCost = &v
+		if r.costSource == CopilotReportedCostSource && r.cost.Valid {
+			credit.authoritative = &money.Money{Microdollars: r.cost.Int64}
 			costRow.cost = sql.NullInt64{}
 			resolver.RecordUnattributedReported()
 		}
-		cost, priced, contributes, priceErr := sessionRowCostWithWebSearchRequests(
+		costRow.cost = ReportedCostForPricing(costRow.cost, costRow.costStatus,
+			catalogPricesAt(resolver, costRow.model, costRow.pricingTS))
+		credit.cost, credit.priced, credit.contributes, err = sessionRowCostWithWebSearchRequests(
 			costRow, snapshotWebSearchRequests[i], resolver)
-		if priceErr != nil {
-			return nil, priceErr
+		if err != nil {
+			return err
 		}
-		if !contributes {
-			continue
-		}
-		a.contributing = true
-		a.models[r.model] = struct{}{}
-		a.inputTokens += inputTok
-		a.outputTokens += outputTok
-		a.cacheCreationInputTokens += cacheCrTok
-		a.cacheReadInputTokens += cacheRdTok
-		a.reasoningTokens += reasoningTok
-		if priced {
-			a.cost, priceErr = money.Add(a.cost, cost)
-			if priceErr != nil {
-				return nil, fmt.Errorf(
-					"summing session export cost: %w", priceErr)
-			}
-		} else {
-			a.allPriced = false
-		}
-		ma := a.byModel[r.model]
-		if ma == nil {
-			ma = &sessionExportModelUsageAccum{allPriced: true}
-			a.byModel[r.model] = ma
-		}
-		ma.contributing = true
-		ma.inputTokens += inputTok
-		ma.outputTokens += outputTok
-		ma.cacheCreationInputTokens += cacheCrTok
-		ma.cacheReadInputTokens += cacheRdTok
-		ma.reasoningTokens += reasoningTok
-		if costRow.cost.Valid {
-			ma.reported = true
-		} else {
-			ma.computed = true
-		}
-		if priced {
-			ma.cost, priceErr = money.Add(ma.cost, cost)
-			if priceErr != nil {
-				return nil, fmt.Errorf(
-					"summing session export model cost: %w", priceErr)
-			}
-		} else {
-			ma.allPriced = false
+		credit.reported = costRow.cost.Valid
+		if err := fn(credit); err != nil {
+			return err
 		}
 	}
-	for _, a := range accum {
-		if a == nil || a.authoritativeCost == nil {
-			continue
+	return nil
+}
+
+func (a *sessionExportUsageAccum) add(credit sessionUsageCredit) error {
+	if credit.authoritative != nil {
+		a.authoritativeCost = credit.authoritative
+	}
+	if !credit.contributes {
+		return nil
+	}
+	model := credit.row.model
+	a.contributing = true
+	a.models[model] = struct{}{}
+	a.inputTokens += credit.inputTokens
+	a.outputTokens += credit.outputTokens
+	a.cacheCreationInputTokens += credit.cacheCreationInputTokens
+	a.cacheReadInputTokens += credit.cacheReadInputTokens
+	a.reasoningTokens += credit.reasoningTokens
+	var err error
+	if credit.priced {
+		a.cost, err = money.Add(a.cost, credit.cost)
+		if err != nil {
+			return fmt.Errorf("summing session export cost: %w", err)
 		}
+	} else {
+		a.allPriced = false
+	}
+	ma := a.byModel[model]
+	if ma == nil {
+		ma = &sessionExportModelUsageAccum{allPriced: true}
+		a.byModel[model] = ma
+	}
+	ma.contributing = true
+	ma.inputTokens += credit.inputTokens
+	ma.outputTokens += credit.outputTokens
+	ma.cacheCreationInputTokens += credit.cacheCreationInputTokens
+	ma.cacheReadInputTokens += credit.cacheReadInputTokens
+	ma.reasoningTokens += credit.reasoningTokens
+	if credit.reported {
+		ma.reported = true
+	} else {
+		ma.computed = true
+	}
+	if credit.priced {
+		ma.cost, err = money.Add(ma.cost, credit.cost)
+		if err != nil {
+			return fmt.Errorf("summing session export model cost: %w", err)
+		}
+	} else {
+		ma.allPriced = false
+	}
+	return nil
+}
+
+// modelUsage settles a reported session total across models and returns the
+// session's usage summary.
+func (a *sessionExportUsageAccum) modelUsage() *SessionModelUsage {
+	if a.authoritativeCost != nil {
 		type modelAllocation struct {
 			model string
 			usage *sessionExportModelUsageAccum
@@ -1075,29 +1143,17 @@ func (db *DB) attachSessionExportUsage(
 		a.cost = *a.authoritativeCost
 		a.allPriced = true
 	}
-
-	for i := range rows {
-		a := accum[rows[i].ID]
-		if a == nil {
-			continue
-		}
-		rows[i].ModelUsage = &SessionModelUsage{
-			Models:                   sortedSetKeys(a.models),
-			InputTokens:              a.inputTokens,
-			OutputTokens:             a.outputTokens,
-			CacheCreationInputTokens: a.cacheCreationInputTokens,
-			CacheReadInputTokens:     a.cacheReadInputTokens,
-			ReasoningTokens:          a.reasoningTokens,
-			Cost:                     a.cost,
-			HasCost:                  a.authoritativeCost != nil || (a.contributing && a.allPriced),
-			ByModel:                  sessionExportModelUsageBreakdowns(a.byModel),
-		}
+	return &SessionModelUsage{
+		Models:                   SortedKeys(a.models),
+		InputTokens:              a.inputTokens,
+		OutputTokens:             a.outputTokens,
+		CacheCreationInputTokens: a.cacheCreationInputTokens,
+		CacheReadInputTokens:     a.cacheReadInputTokens,
+		ReasoningTokens:          a.reasoningTokens,
+		Cost:                     a.cost,
+		HasCost:                  a.authoritativeCost != nil || (a.contributing && a.allPriced),
+		ByModel:                  sessionExportModelUsageBreakdowns(a.byModel),
 	}
-	block, err := resolver.BuildBlock()
-	if err != nil {
-		return nil, fmt.Errorf("building pricing block: %w", err)
-	}
-	return &block, nil
 }
 
 func sessionExportUsageQuery(sessionIDs []string) (string, []any) {
@@ -1148,7 +1204,7 @@ func sessionExportClaudeSnapshotPeers(
 	}
 	keySet := make(map[snapshotKey]struct{})
 	for _, row := range pageRows {
-		if row.claudeMessageID == "" || row.claudeRequestID == "" {
+		if row.claudeMessageID == "" {
 			continue
 		}
 		keySet[snapshotKey{
@@ -1183,7 +1239,7 @@ func sessionExportClaudeSnapshotPeers(
 		}
 		rowsSQL := usageRowsSQLWithWhere(
 			usageMessageEligibility+
-				" AND m.claude_message_id != '' AND m.claude_request_id != ''"+
+				" AND m.claude_message_id != ''"+
 				" AND (m.claude_message_id, m.claude_request_id) IN (VALUES "+
 				strings.Join(tuples, ", ")+")",
 			usageEventEligibility+" AND 1 = 0")
@@ -1210,7 +1266,7 @@ func sessionExportUsageTokens(
 	if r.usageSource == "message" {
 		return clampedUsageTokenCountersWithReasoning(r.tokenJSON)
 	}
-	inputTok, outputTok, cacheCrTok, cacheRdTok = usageEventRowTokens(
+	inputTok, outputTok, cacheCrTok, cacheRdTok = UsageEventRowTokens(
 		r.usageSource,
 		r.inputTokens,
 		r.outputTokens,
@@ -1220,13 +1276,69 @@ func sessionExportUsageTokens(
 	return inputTok, outputTok, cacheCrTok, cacheRdTok, r.reasoningTokens
 }
 
+func attachSessionExportPlanUsage(
+	ctx context.Context, q sessionExportQuerier, rows []SessionSummaryRow,
+) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	ids := sessionExportIDs(rows)
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	planRows, err := q.QueryContext(ctx,
+		`SELECT session_id, `+SessionPlanUsageColumns+` FROM session_plan_usage
+		WHERE session_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")+`)`,
+		args...,
+	)
+	if err != nil {
+		return fmt.Errorf("querying session export plan usage: %w", err)
+	}
+	defer planRows.Close()
+	byID := make(map[string]*SessionPlanUsage, len(rows))
+	for planRows.Next() {
+		sessionID, p, err := scanSessionIDAndPlanUsage(planRows)
+		if err != nil {
+			return fmt.Errorf("scanning session export plan usage: %w", err)
+		}
+		byID[sessionID] = p
+	}
+	if err := planRows.Err(); err != nil {
+		return fmt.Errorf("iterating session export plan usage: %w", err)
+	}
+	for i := range rows {
+		p := byID[rows[i].ID]
+		rows[i].PlanUsage = p.PlanUsageView()
+		rows[i].CaptureCoverage = p.CaptureCoverageView()
+		// A codex-cloud session without usage events is billed as plan
+		// usage, so it has no token or cost figures to export, not zero
+		// ones. That holds before its first plan usage row is stored too.
+		planOnly := p != nil || rows[i].Agent == string(parser.AgentCodexCloud)
+		if planOnly && rows[i].ModelUsage != nil && len(rows[i].ModelUsage.Models) == 0 {
+			rows[i].ModelUsage = nil
+		}
+	}
+	return nil
+}
+
+// scanSessionIDAndPlanUsage reads one row selected as session_id followed
+// by SessionPlanUsageColumns.
+func scanSessionIDAndPlanUsage(rows *sql.Rows) (string, *SessionPlanUsage, error) {
+	var sessionID string
+	p, err := ScanSessionPlanUsage(func(dest ...any) error {
+		return rows.Scan(append([]any{&sessionID}, dest...)...)
+	})
+	return sessionID, p, err
+}
+
 func (db *DB) attachSessionExportWorktrees(
 	ctx context.Context, q sessionExportQuerier, rows []SessionSummaryRow,
 ) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	labels := sortedSetKeys(sessionExportProjectLabels(rows))
+	labels := SortedKeys(sessionExportProjectLabels(rows))
 	observations, err := db.listProjectIdentityObservationsFrom(ctx, q, labels)
 	if err != nil {
 		return err
@@ -1380,7 +1492,7 @@ func canonicalSessionExportFilter(f SessionFilter) SessionFilter {
 		f.Timezone = strings.TrimSpace(f.Timezone)
 	}
 	f.ActiveSince = strings.TrimSpace(f.ActiveSince)
-	f.AutomatedScope = normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
+	f.AutomatedScope = NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
 	f.ExcludeAutomated = false
 	f.Outcome = canonicalStringSliceFilter(f.Outcome)
 	f.HealthGrade = canonicalStringSliceFilter(f.HealthGrade)
@@ -1477,7 +1589,6 @@ func newSessionExportUsageAccum() *sessionExportUsageAccum {
 		models:    make(map[string]struct{}),
 		byModel:   make(map[string]*sessionExportModelUsageAccum),
 		allPriced: true,
-		seen:      make(map[usageDedupToken]struct{}),
 	}
 }
 

@@ -1,17 +1,21 @@
 <script lang="ts">
+  import { fileReferences } from "../../stores/file-references.svelte.js";
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { onDestroy, tick, untrack } from "svelte";
+  import { SvelteSet } from "svelte/reactivity";
   import { Button, EmptyState } from "@kenn-io/kit-ui";
   // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
   import { messages } from "../../stores/messages.svelte.js";
-  import { ui } from "../../stores/ui.svelte.js";
+  import { ui, type ScrollCall } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { settings } from "../../stores/settings.svelte.js";
   import { readProgress } from "../../stores/read-progress.svelte.js";
   import { CircleQuestionMarkIcon, MessageSquareIcon } from "../../icons.js";
-  import { createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
+  import { cancelScrollReconcile, createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
   import MessageContent from "./MessageContent.svelte";
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
+  import EmptyMessagesRow from "./EmptyMessagesRow.svelte";
   import SystemBoundaryCard from "../system/SystemBoundaryCard.svelte";
   import ToolCallGroup from "./ToolCallGroup.svelte";
   import type { DbMessage as Message } from "../../api/generated/index.js";
@@ -30,6 +34,7 @@
   } from "./message-scroll.js";
   import { m } from "../../i18n/index.js";
   import { settleVirtualScroll } from "./staged-scroll.js";
+  import { toolCallFingerprint } from "../../utils/tool-call-fingerprint.js";
   import { revealMatch } from "../../search/reveal.js";
   import type { Match } from "../../search/session-index.js";
   import {
@@ -37,7 +42,39 @@
     projectSessionScope,
   } from "../../search/session-scope.js";
 
+  $effect(() => {
+    const id = messages.sessionId;
+    const revision = messages.loadedRevision;
+    if (fileReferences.enabled) untrack(() => void fileReferences.track(id, revision));
+  });
+
+  onDestroy(() => fileReferences.reset());
+
   let containerRef: HTMLDivElement | undefined = $state(undefined);
+
+  // Classic scrollbars take width from the transcript, which moves its
+  // centered reading column left by half their width. Publish that width
+  // on the content column so the session header above can center its
+  // title and stats on the same column.
+  $effect(() => {
+    const scroller = containerRef;
+    // SessionFindView wraps the scroller; its parent holds the header too.
+    const column = scroller?.closest(".find-viewport")?.parentElement;
+    if (!scroller || !column) return;
+    const publish = () => {
+      const width = scroller.offsetWidth - scroller.clientWidth;
+      column.style.setProperty("--transcript-scrollbar", `${width}px`);
+    };
+    publish();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(publish);
+    observer.observe(scroller);
+    return () => {
+      observer.disconnect();
+      column.style.removeProperty("--transcript-scrollbar");
+    };
+  });
+  let containerScrollTop = $state(0);
   let scrollRaf: number | null = null;
   let lastScrollRequest = 0;
   let destroyed = false;
@@ -107,6 +144,9 @@
         if (!item) return `${sid}-${index}`;
         if (item.kind === "tool-group") {
           return `${sid}-tg-${item.ordinals[0]}`;
+        }
+        if (item.kind === "empty-group") {
+          return `${sid}-eg-${item.ordinals[0]}`;
         }
         return `${sid}-m-${item.message.ordinal}`;
       },
@@ -214,7 +254,12 @@
         continue;
       }
 
-      for (const ordinal of visibleToolGroupOrdinals(row.index)) {
+      // A closed empty row stands for all its members; an open one has a
+      // card per member, so only cards on screen count as read.
+      const groupOrdinals = item.kind === "empty-group" && !emptyGroupOpen(item)
+        ? item.ordinals
+        : visibleToolGroupOrdinals(row.index);
+      for (const ordinal of groupOrdinals) {
         visibleOrdinals.add(ordinal);
         maxVisibleOrdinal = maxVisibleOrdinal === null
           ? ordinal
@@ -374,6 +419,7 @@
 
   function handleScroll() {
     if (!containerRef) return;
+    containerScrollTop = containerRef.scrollTop;
     if (scrollRaf !== null) return;
     scrollRaf = requestAnimationFrame(() => {
       scrollRaf = null;
@@ -406,7 +452,7 @@
   }
 
   function handleManualScrollIntent() {
-    lastScrollRequest++;
+    endScrollOwnership();
     if (ui.followLatest) {
       cancelFollowLatestWork();
       ui.setFollowLatest(false);
@@ -458,7 +504,7 @@
 
   onDestroy(() => {
     destroyed = true;
-    lastScrollRequest++;
+    endScrollOwnership();
     if (visibleProgressRaf !== null) {
       cancelAnimationFrame(visibleProgressRaf);
       visibleProgressRaf = null;
@@ -482,7 +528,7 @@
       activeFollowScrollRequest !== null &&
       activeFollowScrollRequest === lastScrollRequest
     ) {
-      lastScrollRequest += 1;
+      endScrollOwnership(activeFollowScrollRequest);
     }
     activeFollowScrollRequest = null;
     if (followingScrollRaf !== null) {
@@ -495,18 +541,25 @@
     }
   }
 
+  function requestIsCurrent(reqId: number, sessionId: string | null): boolean {
+    return !destroyed && reqId === lastScrollRequest &&
+      messages.sessionId === sessionId && sessions.activeSessionId === sessionId;
+  }
+
   function scrollToDisplayIndex(
-    index: number,
+    getIndex: () => number,
     waitFrames = 0,
     scrollRetries = 0,
     reqId = lastScrollRequest,
     align: ScrollAlign = "start",
+    stillValid: () => boolean = () => true,
   ): Promise<boolean> {
+    const sessionId = messages.sessionId;
     return settleVirtualScroll({
-      index, align, waitFrames, scrollRetries,
+      getIndex, align, waitFrames, scrollRetries,
       getVirtualizer: () => virtualizer.instance,
       getCount: () => displayItemsAsc.length,
-      isCurrent: () => !destroyed && reqId === lastScrollRequest,
+      isCurrent: () => requestIsCurrent(reqId, sessionId) && stillValid(),
       nextFrame: raf,
     });
   }
@@ -515,48 +568,193 @@
     return new Promise((r) => requestAnimationFrame(() => r()));
   }
 
-  async function scrollToOrdinalInternal(ordinal: number) {
-    const reqId = ++lastScrollRequest;
-    activeFollowScrollRequest = null;
+  // Ordinals of empty messages whose collapsed row is open. Ordinals are
+  // per session, so a session change closes every row.
+  const openEmptyOrdinals = new SvelteSet<number>();
+  $effect(() => {
+    void messages.sessionId;
+    untrack(() => openEmptyOrdinals.clear());
+  });
 
-    const idxAsc = displayItemsAsc.findIndex((item) =>
-      item.ordinals.includes(ordinal),
-    );
-    if (idxAsc >= 0) {
-      const idx = ui.sortNewestFirst
-        ? displayItemsAsc.length - 1 - idxAsc
-        : idxAsc;
-      scrollToDisplayIndex(idx, 0, 0, reqId);
-      return;
+  function setEmptyGroupOpen(ordinals: number[], open: boolean) {
+    for (const ordinal of ordinals) {
+      if (open) openEmptyOrdinals.add(ordinal);
+      else openEmptyOrdinals.delete(ordinal);
     }
-
-    await messages.ensureOrdinalLoaded(ordinal);
-    if (reqId !== lastScrollRequest) return;
-
-    // Let Svelte re-derive displayItemsAsc and the
-    // virtualizer update its count after loading.
-    // Two frames: one for Svelte reactivity, one for
-    // virtualizer resize observation.
-    await raf();
-    await raf();
-    if (reqId !== lastScrollRequest) return;
-
-    const loadedIdxAsc = displayItemsAsc.findIndex(
-      (item) => item.ordinals.includes(ordinal),
-    );
-    if (loadedIdxAsc < 0) return;
-    const loadedIdx = ui.sortNewestFirst
-      ? displayItemsAsc.length - 1 - loadedIdxAsc
-      : loadedIdxAsc;
-    scrollToDisplayIndex(loadedIdx, 0, 0, reqId);
   }
 
-  export function scrollToOrdinal(ordinal: number) {
-    void scrollToOrdinalInternal(ordinal);
+  function emptyGroupOpen(item: DisplayItem): boolean {
+    return item.ordinals.some((ordinal) => openEmptyOrdinals.has(ordinal));
+  }
+
+  // A click on a card inside an open empty row selects that card's message.
+  function clickedEmptyMemberOrdinal(
+    item: DisplayItem,
+    target: EventTarget | null,
+  ): number | undefined {
+    if (item.kind !== "empty-group" || !(target instanceof Element)) return undefined;
+    const card = target.closest<HTMLElement>("[data-message-ordinal]");
+    const ordinal = Number(card?.dataset.messageOrdinal);
+    return item.ordinals.includes(ordinal) ? ordinal : undefined;
+  }
+
+  // Distance from the top of a display row to the card of `ordinal` inside an
+  // open empty row, so a jump lands on that card instead of the row's top.
+  function emptyMemberOffset(index: number, ordinal: number): number {
+    const item = itemAt(index);
+    if (!containerRef || item?.kind !== "empty-group") return 0;
+    const row = containerRef.querySelector<HTMLElement>(`.virtual-row[data-index="${index}"]`);
+    const card = row?.querySelector<HTMLElement>(`[data-message-ordinal="${ordinal}"]`);
+    if (!row || !card) return 0;
+    return card.getBoundingClientRect().top - row.getBoundingClientRect().top;
+  }
+
+  function displayIndexOf(ordinal: number): number {
+    const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(ordinal));
+    if (ascIndex < 0) return -1;
+    return ui.sortNewestFirst ? displayItemsAsc.length - 1 - ascIndex : ascIndex;
+  }
+
+  // Updating until must re-arm the expiry timer, so this object uses deep reactive state.
+  let ordinalJump: {
+    reqId: number;
+    ordinal: number;
+    sessionId: string | null;
+    until: number;
+    offset?: number;
+    sawLoadingOlder: boolean;
+    targetHolds: () => boolean;
+  } | null = $state(null);
+
+  let ordinalJumpIndex = $derived.by(() => ordinalJump ? displayIndexOf(ordinalJump.ordinal) : -1);
+
+  $effect(() => {
+    const jump = ordinalJump;
+    if (!jump || messages.loadingOlder) return;
+    const timer = setTimeout(() => {
+      if (ordinalJump !== jump) return;
+      endScrollOwnership(jump.reqId);
+    }, Math.max(0, jump.until - performance.now()));
+    return () => clearTimeout(timer);
+  });
+
+  $effect(() => {
+    const jump = ordinalJump;
+    if (!jump) return;
+    // TanStack may not notify when scrolling stays within the same visible rows.
+    void containerScrollTop;
+    const items = displayItemsAsc;
+    const loadingOlder = messages.loadingOlder;
+    const instance = virtualizer.instance;
+    const now = performance.now();
+    const targetHolds = jump.targetHolds();
+    if (!requestIsCurrent(jump.reqId, jump.sessionId) || !targetHolds) {
+      endScrollOwnership(jump.reqId);
+      return;
+    }
+    if (loadingOlder) {
+      jump.sawLoadingOlder = true;
+    } else if (jump.sawLoadingOlder) {
+      jump.until = now + 5000;
+      jump.sawLoadingOlder = false;
+    }
+    const index = ordinalJumpIndex;
+    if (index < 0 || index >= items.length) {
+      endScrollOwnership(jump.reqId);
+      return;
+    }
+    if (!instance) return;
+    // getOffsetForIndex reads a measurement cache that stays stale after a count change until
+    // TanStack's private getMeasurements() rebuilds it; getTotalSize() runs that rebuild publicly.
+    // getOffsetForIndex also initializes scrollOffset through TanStack's private getter.
+    instance.getTotalSize();
+    const rowOffset = instance.getOffsetForIndex(index, "start")?.[0];
+    if (rowOffset === undefined) return;
+    const memberOffset = emptyMemberOffset(index, jump.ordinal);
+    const offset = rowOffset + memberOffset;
+    const previousOffset = untrack(() => jump.offset);
+    jump.offset = offset;
+    if (Math.abs(offset - (instance.scrollOffset ?? 0)) <= 1) return;
+    if (previousOffset === offset) {
+      // The viewport moved without a layout change, including focus and browser-find scrolling.
+      endScrollOwnership(jump.reqId);
+      return;
+    }
+    if (memberOffset > 0) instance.scrollToOffset(offset);
+    else instance.scrollToIndex(index, { align: "start" });
+  });
+
+  function endScrollOwnership(reqId = lastScrollRequest): number {
+    if (reqId !== lastScrollRequest) return lastScrollRequest;
+    cancelScrollReconcile(untrack(() => virtualizer.instance));
+    ordinalJump = null;
+    return ++lastScrollRequest;
+  }
+
+  async function scrollToOrdinalInternal(ordinal: number, call?: ScrollCall) {
+    const reqId = endScrollOwnership();
+    const sessionId = messages.sessionId;
+    const isCurrent = () => requestIsCurrent(reqId, sessionId);
+    activeFollowScrollRequest = null;
+    const abandon = () => {
+      if (isCurrent() && ui.selectedOrdinal === ordinal) ui.selectedOrdinal = null;
+      return false;
+    };
+    // A rewrite can renumber messages, so a jump to a tool call stops once its ordinal holds a different message.
+    const targetHolds = () => {
+      if (call === undefined) return true;
+      // Without a tool ID, a position can name another call after a rewrite, so the revision must still match.
+      if (!call.toolUseId && call.revision !== undefined && messages.loadedRevision !== call.revision) {
+        return abandon();
+      }
+      if (call.index === undefined) return true;
+      const message = messages.messages.find((m) => m.ordinal === ordinal);
+      if (message === undefined) return true;
+      const held = message.tool_calls?.[call.index];
+      if (held === undefined || (held.tool_use_id ?? "") !== call.toolUseId) return abandon();
+      // Some agents derive tool IDs from the call's position, so a rewrite can reuse one for another call.
+      return (call.fingerprint === undefined ||
+        toolCallFingerprint(held.tool_name, held.input_json ?? "") === call.fingerprint) || abandon();
+    };
+    if (!isCurrent() || !targetHolds()) return endScrollOwnership(reqId);
+
+    if (!messages.messages.some((message) => message.ordinal === ordinal)) {
+      await messages.ensureOrdinalLoaded(ordinal);
+      if (!isCurrent() || !targetHolds()) return endScrollOwnership(reqId);
+      // Loading needs one frame for Svelte and another for resize observation.
+      await raf();
+      if (!isCurrent()) return endScrollOwnership(reqId);
+      await raf();
+      if (!isCurrent() || !targetHolds()) return endScrollOwnership(reqId);
+    }
+
+    // A message inside a collapsed empty row has no card until the row opens.
+    const emptyGroup = displayItemsAsc.find(
+      (item) => item.kind === "empty-group" && item.ordinals.includes(ordinal),
+    );
+    if (emptyGroup && !emptyGroupOpen(emptyGroup)) {
+      setEmptyGroupOpen(emptyGroup.ordinals, true);
+      // Let the opened row render and be measured before the jump scrolls
+      // into it. A row that grows above the scroll position makes the
+      // virtualizer shift the scroll by the growth, past the target card.
+      await tick();
+      await raf();
+      if (!isCurrent()) return endScrollOwnership(reqId);
+      await raf();
+      if (!isCurrent() || !targetHolds()) return endScrollOwnership(reqId);
+    }
+
+    const settled = await scrollToDisplayIndex(() => displayIndexOf(ordinal), 0, 0, reqId, "start", targetHolds);
+    if (!isCurrent() || !targetHolds() || !settled) return endScrollOwnership(reqId);
+    ordinalJump = { reqId, ordinal, sessionId, targetHolds, until: performance.now() + 5000, sawLoadingOlder: false };
+  }
+
+  export function scrollToOrdinal(ordinal: number, call?: ScrollCall) {
+    void scrollToOrdinalInternal(ordinal, call);
   }
 
   function scrollToLatestInternal() {
-    const reqId = ++lastScrollRequest;
+    const reqId = endScrollOwnership();
     activeFollowScrollRequest = reqId;
     const idx = getLatestDisplayIndex(
       displayItemsAsc.length,
@@ -564,7 +762,7 @@
     );
     if (idx < 0) return;
     scrollToDisplayIndex(
-      idx,
+      () => idx,
       0,
       0,
       reqId,
@@ -618,7 +816,7 @@
   function latestDisplaySignature(): string {
     const item = displayItemsAsc[displayItemsAsc.length - 1];
     if (!item) return "";
-    if (item.kind === "tool-group") {
+    if (item.kind !== "message") {
       return item.messages
         .map((m) => `${m.ordinal}:${m.content_length}:${m.timestamp}`)
         .join("|");
@@ -673,21 +871,25 @@
     return match ? `${match.ordinal}:${match.blockKey}:${match.occurrence}` : "";
   });
 
+  // Row of the current match in ascending display order. The reveal effect
+  // re-runs when the match moves within the rendered rows (filters, mode,
+  // history loading in front of it), not when a live refresh adds rows: that
+  // must leave the user's scroll position alone. A $derived is needed so the
+  // effect sees the number, not the rebuilt items array.
+  let searchMatchRow = $derived.by(() => {
+    const ordinal = inSessionSearch.resolvedCurrent?.ordinal;
+    if (ordinal === undefined) return -1;
+    return displayItemsAsc.findIndex((item) => item.ordinals.includes(ordinal));
+  });
+
   async function revealSearchMatch(match: Match, sessionId: string, reqId: number): Promise<boolean> {
     return revealMatch({
       ordinal: match.ordinal,
       blockKey: match.blockKey,
       getContainer: () => containerRef,
-      isCurrent: () => !destroyed && reqId === lastScrollRequest &&
-        messages.sessionId === sessionId && sessions.activeSessionId === sessionId &&
-        inSessionSearch.isActive,
+      isCurrent: () => requestIsCurrent(reqId, sessionId) && inSessionSearch.isActive,
       ensureLoaded: (ordinal) => messages.ensureOrdinalLoaded(ordinal),
-      mountMessage: () => {
-        const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(match.ordinal));
-        if (ascIndex < 0) return Promise.resolve(false);
-        const index = ui.sortNewestFirst ? displayItemsAsc.length - 1 - ascIndex : ascIndex;
-        return scrollToDisplayIndex(index, 0, 0, reqId);
-      },
+      mountMessage: () => scrollToDisplayIndex(() => displayIndexOf(match.ordinal), 0, 0, reqId),
       scrollToOffset: (offset) => virtualizer.instance?.scrollToOffset(
         Math.round(offset), { align: "start" },
       ),
@@ -700,30 +902,27 @@
     const request = inSessionSearch.navigationRevision;
     const key = searchRevealKey;
     const sessionId = messages.sessionId;
-    const count = displayItemsAsc.length;
+    const matchRow = searchMatchRow;
     const newestFirst = ui.sortNewestFirst;
-    if (!inSessionSearch.isActive || !sessionId || !containerRef) return;
-    if (!key) {
-      // Active query without a renderable occurrence: drop any pending reveal
-      // so a filtered-out block cannot be mounted or scrolled into view.
-      lastScrollRequest++;
-      return;
-    }
+    if (!inSessionSearch.isActive || !key || !sessionId || !containerRef) return;
     void request;
-    void count;
+    void matchRow;
     void newestFirst;
     return untrack(() => {
       const match = inSessionSearch.resolvedCurrent;
       if (!match) return;
-      const reqId = ++lastScrollRequest;
+      const reqId = endScrollOwnership();
       activeFollowScrollRequest = null;
       ui.selectOrdinal(match.ordinal);
       ui.setFollowLatest(false);
-      void revealSearchMatch(match, sessionId, reqId).catch((error: unknown) => {
+      void revealSearchMatch(match, sessionId, reqId).then((revealed) => {
+        if (!revealed) endScrollOwnership(reqId);
+      }).catch((error: unknown) => {
         if (reqId === lastScrollRequest) console.warn("Could not reveal search occurrence", error);
+        endScrollOwnership(reqId);
       });
       return () => {
-        if (reqId === lastScrollRequest) lastScrollRequest++;
+        endScrollOwnership(reqId);
       };
     });
   });
@@ -799,17 +998,19 @@
 {:else if messages.loading && messages.messages.length === 0}
   <EmptyState title={m.message_list_loading()} />
 {:else if sessions.activeSessionNotFound && messages.messages.length === 0}
-  <EmptyState
-    title={m.message_list_session_not_found()}
-    description={m.message_list_session_not_found_hint()}
-  >
-    {#snippet icon()}
-      <CircleQuestionMarkIcon size="36" strokeWidth="1.5" aria-hidden="true" />
-    {/snippet}
-    <Button size="sm" onclick={() => void sessions.retryActiveSession()}>
-      {m.message_list_session_not_found_retry()}
-    </Button>
-  </EmptyState>
+  <div class="missing-session" {@attach errorTelemetry("session")}>
+    <EmptyState
+      title={m.message_list_session_not_found()}
+      description={m.message_list_session_not_found_hint()}
+    >
+      {#snippet icon()}
+        <CircleQuestionMarkIcon size="36" strokeWidth="1.5" aria-hidden="true" />
+      {/snippet}
+      <Button size="sm" onclick={() => void sessions.retryActiveSession()}>
+        {m.message_list_session_not_found_retry()}
+      </Button>
+    </EmptyState>
+  </div>
 {:else}
   <SessionFindView
     items={displayItemsAsc}
@@ -841,10 +1042,10 @@
             data-index={row.index}
             style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({row.start}px);"
             use:measureElement={virtualizer.instance}
-            onclick={() => {
+            onclick={(event) => {
               const sel = window.getSelection();
               if (sel && sel.toString().length > 0) return;
-              ui.selectOrdinal(item.ordinals[0]!);
+              ui.selectOrdinal(clickedEmptyMemberOrdinal(item, event.target) ?? item.ordinals[0]!);
             }}
           >
             {#if item.kind !== "tool-group" && readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)}
@@ -861,6 +1062,12 @@
                 divider={readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)
                   ? readProgressDivider
                   : undefined}
+              />
+            {:else if item.kind === "empty-group"}
+              <EmptyMessagesRow
+                messages={item.messages}
+                open={emptyGroupOpen(item)}
+                onToggle={(open) => setEmptyGroupOpen(item.ordinals, open)}
               />
             {:else if item.message.is_compact_boundary}
               <CompactBoundaryDivider message={item.message} />
@@ -885,11 +1092,15 @@
 {/if}
 
 <style>
+  .missing-session {
+    display: contents;
+  }
+
   .message-list-scroll {
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
-    padding: 8px 0;
+    padding: 4px 0 8px;
     overflow-anchor: none;
   }
 
@@ -898,9 +1109,17 @@
     overflow-anchor: none;
   }
 
+  /* One reading column for every layout: cards, tool rows, and their
+     timestamps share both edges. The find bar, SignalPanel, and
+     ToolSequencesPanel align their content to the same shared column. */
+  .virtual-row > :global(*) {
+    max-width: var(--reading-column);
+    margin-inline: auto;
+  }
+
   .virtual-row.selected > :global(*) {
-    outline: 2px solid var(--accent-blue);
-    outline-offset: -2px;
+    outline: 1px solid color-mix(in srgb, var(--accent-blue) 65%, transparent);
+    outline-offset: -1px;
     border-radius: var(--radius-md, 6px);
   }
 
@@ -937,8 +1156,26 @@
 
   .layout-compact :global(.message) {
     padding: 6px 12px;
+    border-radius: 0;
+  }
+
+  /* Pattern mode keeps the full bar width, which the line patterns need. */
+  :global(:root:not([data-message-role-patterns])) .layout-compact :global(.message) {
     border-left-width: 2px;
     border-radius: 0;
+  }
+
+  .layout-compact :global(.tool-group) {
+    padding-inline: 12px;
+  }
+
+  /* Compact packs tool rows 2px tighter than the 24px Default rows (see
+     ToolBlock); the copy trim grows to match so the 26px hover button
+     still does not set the row height. */
+  .layout-compact :global(.tool-group-body),
+  .layout-compact :global(.pg-members) {
+    --tool-row-pad-block: 2px;
+    --tool-row-copy-trim: -2px;
   }
 
   .layout-compact :global(.message-header) {
@@ -959,9 +1196,13 @@
     font-weight: 700;
   }
 
+  /* Token and turn summaries match the timestamp: 11px, the smallest size
+     the transcript uses for text that is read, not just scanned. */
   .layout-compact :global(.timestamp),
-  .layout-compact :global(.group-timestamp) {
-    font-size: 10px;
+  .layout-compact :global(.group-timestamp),
+  .layout-compact :global(.message-tokens),
+  .layout-compact :global(.turn-summary) {
+    font-size: 11px;
   }
 
   .layout-compact :global(.text-content) {
@@ -974,8 +1215,10 @@
   }
 
   /* ── Stream layout ── */
+  /* Rows touch, but the first prompt keeps the same space under the
+     header as Default (list 4px + row 5px). */
   .layout-stream {
-    padding: 0;
+    padding: 9px 0 0;
   }
 
   .layout-stream .virtual-row {
@@ -983,15 +1226,30 @@
   }
 
   .layout-stream :global(.message) {
-    border-left: none;
     border-radius: 0;
     padding: 16px 24px;
   }
 
+  /* Stream hides the role header, so the role rail is the only role
+     marker: both roles keep the same thin rule as every other layout, and
+     pattern mode keeps its patterned bars. */
+  :global(:root:not([data-message-role-patterns])) .layout-stream :global(.message) {
+    border-left-width: 2px;
+    border-left-style: solid;
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
+  }
+
+  /* Light takes the Default user card tint, so the prompt reads the same
+     across layouts instead of a stronger gray-blue over the page. */
   .layout-stream :global(.message.is-user) {
+    background: var(--user-bg) !important;
+  }
+
+  :global(:root.dark) .layout-stream :global(.message.is-user) {
     background: color-mix(
       in srgb,
-      var(--accent-blue) 5%,
+      var(--role-user-accent) 9%,
       transparent
     ) !important;
   }
@@ -1002,6 +1260,10 @@
 
   .layout-stream :global(.message-header) {
     display: none;
+  }
+
+  .layout-stream :global(.tool-group) {
+    padding-inline: 24px;
   }
 
   .layout-stream :global(.text-content) {
@@ -1022,6 +1284,12 @@
     display: none;
   }
 
+  /* Skim rows touch, so rounded corners would leave notches between
+     neighboring cards; the run reads as one continuous stack. */
+  .layout-skim :global(.message) {
+    border-radius: 0;
+  }
+
   .layout-skim :global(.tool-block) {
     border-left: none;
     border-radius: 0;
@@ -1040,6 +1308,45 @@
     pointer-events: none;
   }
 
+  /* Every tool row, standalone or inside a message, is one full-width
+     band with its name on the prose edge (the message bar plus its 16px
+     padding). Rows inside a message bleed through the message's 16px
+     padding to its bar, so both kinds share one indent and one fill. */
+  .layout-skim .virtual-row > :global(:not(.message) .tool-header) {
+    padding-inline-start: calc(var(--role-assistant-bar-width) + 16px);
+  }
+
+  .layout-skim :global(.message .tool-block),
+  .layout-skim :global(.message .parallel-group) {
+    margin-inline: -16px;
+  }
+
+  /* A parallel group bleeds as a whole; its members then sit flush in it. */
+  .layout-skim :global(.message .parallel-group .tool-block) {
+    margin-inline: 0;
+  }
+
+  .layout-skim :global(.message .tool-header) {
+    padding-inline-start: 16px;
+  }
+
+  /* A standalone Thinking row puts its label on the same edge as the tool
+     names, with its chevron in the gutter before it. */
+  .layout-skim .virtual-row > :global(:not(.message) .thinking-header) {
+    padding-inline-start: calc(var(--role-assistant-bar-width) + 16px - 16px);
+  }
+
+  /* Skim is read by scanning tool names down the left. They keep the
+     calm tool ink and medium weight of the other layouts, so a long MCP
+     name is never the loudest text. Names take their own width and show
+     in full when they fit; only a name wider than most of the row ends in
+     an ellipsis instead of crowding out the command. */
+  .layout-skim :global(.tool-label) {
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .layout-skim :global(.tool-meta),
   .layout-skim :global(.tool-content),
   .layout-skim :global(.diff-view),
@@ -1055,10 +1362,12 @@
     display: none;
   }
 
+  /* Only the block margin is reset, so standalone tool runs keep the
+     reading column's auto inline margins and line up with the messages. */
   .layout-skim :global(.tool-group),
   .layout-skim :global(.parallel-group) {
     border: none;
-    margin: 0;
+    margin-block: 0;
     padding: 0;
     background: transparent;
   }

@@ -14,9 +14,6 @@ vi.mock("../api/generated/index", () => ({
     ),
   },
 }));
-vi.mock("../api/runtime.js", () => ({
-  isAbortError: (error: unknown) => error instanceof DOMException && error.name === "AbortError",
-}));
 vi.mock("./sessions.svelte.js", () => ({ sessions: { markActiveSessionMissing: vi.fn() } }));
 vi.mock("./read-progress.svelte.js", () => ({
   buildReadProgressToken: () => null,

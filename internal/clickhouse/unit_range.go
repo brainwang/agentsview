@@ -42,7 +42,7 @@ func (s *Store) scanUserBoundaryOrdinals(
 		WITH spans AS (` + strings.Join(parts, " UNION ALL ") + `)
 		SELECT sp.idx, m.ordinal
 		FROM spans sp JOIN messages m ON m.session_id = sp.session_id
-		WHERE ` + clickhouseEmbeddableUserSQL("m")
+		WHERE ` + clickhouseEmbeddableUserSQL("m") + systemPrefixSettings
 	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("querying clickhouse nearest user boundaries: %w", err)
@@ -190,6 +190,8 @@ type anchorKey struct {
 }
 
 type anchorMeta struct {
+	machine         string
+	displayName     *string
 	relationship    string
 	parentSessionID string
 	role            sql.NullString
@@ -226,6 +228,8 @@ func (s *Store) deriveLexicalUnits(
 	}
 	for i := range matches {
 		matches[i].OrdinalRange = ranges[i]
+		matches[i].Machine = metas[i].machine
+		matches[i].DisplayName = metas[i].displayName
 		matches[i].Relationship = metas[i].relationship
 		matches[i].ParentSessionID = metas[i].parentSessionID
 		matches[i].Sidechain = anchors[i].Sidechain
@@ -279,14 +283,14 @@ func (s *Store) lookupAnchorMetaChunk(
 	query := `
 		WITH refs AS (` + strings.Join(parts, " UNION ALL ") + `)
 		SELECT r.session_id, r.ordinal,
-			COALESCE(s.relationship_type, ''), COALESCE(s.parent_session_id, ''),
+			s.relationship_type, COALESCE(s.parent_session_id, ''), s.machine, COALESCE(s.display_name, s.session_name),
 			m.role, m.is_sidechain,
 			if(m.is_system = false AND ` +
 		db.ClickHouseSystemPrefixSQL("m.content", "m.role") +
 		`, true, false)
 		FROM refs r
 		JOIN sessions s ON s.id = r.session_id
-		LEFT JOIN messages m ON m.session_id = r.session_id AND m.ordinal = r.ordinal`
+		LEFT JOIN messages m ON m.session_id = r.session_id AND m.ordinal = r.ordinal` + systemPrefixSettings
 	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("looking up clickhouse match anchors: %w", err)
@@ -297,6 +301,7 @@ func (s *Store) lookupAnchorMetaChunk(
 		var meta anchorMeta
 		if err := rows.Scan(&key.sessionID, &key.ordinal,
 			&meta.relationship, &meta.parentSessionID,
+			&meta.machine, &meta.displayName,
 			&meta.role, &meta.sidechain, &meta.embeddable); err != nil {
 			return fmt.Errorf("scanning clickhouse match anchor: %w", err)
 		}

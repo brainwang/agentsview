@@ -19,22 +19,19 @@ func resetUserAutomationPatterns() {
 func TestIsAutomatedSessionMetadata(t *testing.T) {
 	tests := []struct {
 		name        string
-		agent       string
 		sessionKind string
 		want        bool
 	}{
-		{"GrokNonInteractive", "grok", parser.SessionKindNonInteractive, true},
-		{"CodexRoborev", "codex", parser.SessionKindRoborev, true},
-		{"EmptyKind", "codex", "", false},
-		{"ClaudeBackground", "claude", "bg", false},
-		{"GrokInteractive", "grok", "", false},
-		{"CodexExecWithoutTag", "codex", parser.SessionKindNonInteractive, true},
+		{"NonInteractive", parser.SessionKindNonInteractive, false},
+		{"Roborev", parser.SessionKindRoborev, true},
+		{"EmptyKind", "", false},
+		{"Background", "bg", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := IsAutomatedSessionMetadata(tt.agent, tt.sessionKind)
+			got := IsAutomatedSessionMetadata(tt.sessionKind)
 			assert.Equal(t, tt.want, got,
-				"IsAutomatedSessionMetadata(%q, %q)", tt.agent, tt.sessionKind)
+				"IsAutomatedSessionMetadata(%q)", tt.sessionKind)
 		})
 	}
 }
@@ -167,6 +164,35 @@ func TestIsAutomatedSession(t *testing.T) {
 			true,
 		},
 
+		// Roborev combiner for neutral (non-PR) review material
+		{
+			"RoborevNeutralCombiner",
+			"You are combining multiple review outputs into a combined review of the reviewed material.\nRules:\n- Merge findings that describe the same problem",
+			true,
+		},
+
+		// Roborev review types added after the original list
+		{
+			"RoborevTestValueReview",
+			"You are a test-value reviewer. Review every added or modified test in the code changes.",
+			true,
+		},
+		{
+			"RoborevLookaheadReview",
+			"You are a time-series correctness reviewer. Review the code changes for look-ahead bias.",
+			true,
+		},
+		{
+			"RoborevFixPlan",
+			"# Fix Plan Request\n\nAnalyze the review findings and relevant code without making changes.",
+			true,
+		},
+		{
+			"RoborevRebaseFix",
+			"# Rebase Fix Request\n\nA previous fix attempt produced a patch that no longer applies cleanly.",
+			true,
+		},
+
 		// Claude Code title generator (note leading "-\n" wrapper)
 		{
 			"ClaudeCodeTitleGenerator",
@@ -187,6 +213,16 @@ func TestIsAutomatedSession(t *testing.T) {
 		},
 
 		// Negative cases
+		{
+			"AskForTestValueReview",
+			"Act as a test-value reviewer for the tests in this branch",
+			false,
+		},
+		{
+			"CombiningReviewsByHand",
+			"You are combining these two review notes for me, please",
+			false,
+		},
 		{
 			"SimilarButNotReview",
 			"You are a code reviewer but I need help",

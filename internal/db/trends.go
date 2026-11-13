@@ -1,12 +1,15 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -52,18 +55,21 @@ func (db *DB) GetTrendsTerms(
 	terms []TrendTermInput,
 	granularity string,
 ) (TrendsTermsResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return TrendsTermsResponse{}, err
+	}
+	defer release()
 	if granularity == "" {
 		granularity = "week"
 	}
+	acc := NewTrendWorkers(ctx, f.From, f.To, granularity, terms)
+	defer func() {
+		if acc != nil {
+			_, _ = acc.Finish()
+		}
+	}()
 	loc := f.location()
-	buckets := TrendBucketRange(f.From, f.To, granularity)
-	bucketIndex := trendBucketIndex(buckets)
-	counts := make([][]int, len(terms))
-	for i := range counts {
-		counts[i] = make([]int, len(buckets))
-	}
-	messageCounts := make([]int, len(buckets))
-
 	sessionFilter := f
 	sessionFilter.From = ""
 	sessionFilter.To = ""
@@ -71,11 +77,36 @@ func (db *DB) GetTrendsTerms(
 	sessionFilter.Hour = nil
 	sessionFilter.Model = ""
 	where, args := sessionFilter.buildWhereWithDate("", false, "s.id")
-	flt := f.messageScopeFilter()
+	from, to := f.messageWindowBoundsUTC()
+	if sessionWindow, wargs := analyticsMessageWindowPred("COALESCE(NULLIF(started_at, ''), created_at)", from, to); sessionWindow != "" {
+		messageWindow, messageArgs := analyticsMessageWindowPred("wm.timestamp", from, to)
+		// Filter sessions before walking their messages.
+		where += " AND s.id IN (SELECT sessions.id FROM sessions WHERE (" + sessionWindow + " OR EXISTS (SELECT 1 FROM messages wm WHERE wm.session_id = sessions.id AND wm.timestamp != '' AND " + messageWindow + ")))"
+		args = append(args, wargs...)
+		args = append(args, messageArgs...)
+	}
+	flt := f.MessageScopeFilter()
 	modelFiltering := len(flt.Models) > 0
-	query := `SELECT m.session_id, m.ordinal, m.role, m.is_system,
-			COALESCE(m.model, ''), m.content, COALESCE(m.timestamp, ''),
-			COALESCE(s.started_at, ''), s.created_at
+	content := "m.content"
+	var selectArgs []any
+	effectiveTime := "COALESCE(NULLIF(m.timestamp, ''), NULLIF(s.started_at, ''), s.created_at)"
+	if inWindow, wargs := analyticsMessageWindowPred(effectiveTime, from, to); inWindow != "" {
+		rowWindow := inWindow
+		if modelFiltering {
+			content = "CASE WHEN " + inWindow + " THEN m.content ELSE '' END"
+			selectArgs = append(selectArgs, wargs...)
+			rowWindow = "(" + inWindow + " OR m.role = 'assistant')"
+		}
+		where += " AND " + rowWindow
+		args = append(args, wargs...)
+	}
+	args = append(selectArgs, args...)
+	columns := `m.content, agentsview_trend_timestamp(COALESCE(m.timestamp, ''), COALESCE(s.started_at, ''), COALESCE(s.created_at, ''))`
+	if modelFiltering {
+		columns = `m.session_id, m.ordinal, m.role, m.is_system,
+			m.model, ` + content + `, COALESCE(m.timestamp, ''), COALESCE(s.started_at, ''), s.created_at`
+	}
+	query := `SELECT ` + columns + `
 		FROM sessions s
 		JOIN messages m ON m.session_id = s.id
 		WHERE ` + where + `
@@ -100,46 +131,27 @@ func (db *DB) GetTrendsTerms(
 		startedAt string
 		createdAt string
 	}
-	processRow := func(row trendRow) {
-		msgTime, ok := trendMessageLocalTime(row.msgTS, row.startedAt, row.createdAt, loc)
-		if !ok {
-			return
-		}
-		msgDate := msgTime.Format("2006-01-02")
-		if !inDateRange(msgDate, f.From, f.To) {
-			return
-		}
-		bucketDate := trendBucketDate(msgTime, loc, granularity)
-		bucket, ok := bucketIndex[bucketDate]
-		if !ok {
-			return
-		}
-		messageCounts[bucket]++
-		for i, term := range terms {
-			count := countTrendOccurrences(row.content, term)
-			if count > 0 {
-				counts[i][bucket] += count
-			}
-		}
-	}
-	rowStartedAt := make(map[string]string)
-	rowCreatedAt := make(map[string]string)
 	emit := func(m ScopedMessage) {
-		processRow(trendRow{
-			sessionID: m.SessionID,
-			role:      m.Role,
-			isSystem:  m.IsSystem,
-			content:   m.Content,
-			msgTS:     m.Timestamp,
-			startedAt: rowStartedAt[m.SessionID],
-			createdAt: rowCreatedAt[m.SessionID],
-		})
+		if m.HasLocalTime {
+			acc.Add(m.Content, m.LocalTime)
+		}
 	}
 	reducer := NewScopeReducer(flt, emit)
 
 	for rows.Next() {
 		var row trendRow
 		var ordinal int
+		if !modelFiltering {
+			var timestamp string
+			if err := rows.Scan(&row.content, &timestamp); err != nil {
+				return TrendsTermsResponse{}, fmt.Errorf("scanning trends term row: %w", err)
+			}
+			local, ok := LocalTime(timestamp, loc)
+			if ok && flt.MatchesDayHour(local, true) {
+				acc.Add(row.content, local)
+			}
+			continue
+		}
 		if err := rows.Scan(
 			&row.sessionID, &ordinal, &row.role, &row.isSystem,
 			&row.model, &row.content, &row.msgTS, &row.startedAt,
@@ -147,15 +159,7 @@ func (db *DB) GetTrendsTerms(
 		); err != nil {
 			return TrendsTermsResponse{}, fmt.Errorf("scanning trends term row: %w", err)
 		}
-		if !modelFiltering {
-			msgTime, ok := trendMessageLocalTime(row.msgTS, row.startedAt, row.createdAt, loc)
-			if ok && flt.MatchesDayHour(msgTime, true) {
-				processRow(row)
-			}
-			continue
-		}
-		rowStartedAt[row.sessionID] = row.startedAt
-		rowCreatedAt[row.sessionID] = row.createdAt
+
 		msgTime, has := trendMessageLocalTime(row.msgTS, row.startedAt, row.createdAt, loc)
 		if err := reducer.Push(MessageInput{
 			SessionID:    row.sessionID,
@@ -175,9 +179,73 @@ func (db *DB) GetTrendsTerms(
 		return TrendsTermsResponse{}, fmt.Errorf("iterating trends term rows: %w", err)
 	}
 
+	response, err := acc.Finish()
+	acc = nil
+	return response, err
+}
+
+// TrendAccumulator counts term occurrences per trend bucket. Backends feed it
+// messages with their local timestamps; it owns date filtering and bucketing.
+type TrendAccumulator struct {
+	from, to, granularity string
+	terms                 []TrendTermInput
+	buckets               []TrendBucket
+	index                 map[string]int
+	counts                [][]int
+	messageCounts         []int
+	lower                 []byte
+	matchers              [][]trendMatcher
+}
+
+// NewTrendAccumulator returns an accumulator for the buckets spanning
+// [from, to] at the given granularity.
+func NewTrendAccumulator(
+	from, to, granularity string, terms []TrendTermInput,
+) *TrendAccumulator {
+	buckets := TrendBucketRange(from, to, granularity)
+	counts := make([][]int, len(terms))
+	for i := range counts {
+		counts[i] = make([]int, len(buckets))
+	}
+	matchers := make([][]trendMatcher, len(terms))
+	for i, term := range terms {
+		matchers[i] = prepareTrendMatchers(term)
+	}
+	return &TrendAccumulator{
+		matchers:      matchers,
+		from:          from,
+		to:            to,
+		granularity:   granularity,
+		terms:         terms,
+		buckets:       buckets,
+		index:         trendBucketIndex(buckets),
+		counts:        counts,
+		messageCounts: make([]int, len(buckets)),
+	}
+}
+
+// Add counts content in the bucket holding local's calendar date. Messages
+// whose local date falls outside [from, to] are ignored.
+func (a *TrendAccumulator) Add(content string, local time.Time) {
+	if !InDateRange(local.Format("2006-01-02"), a.from, a.to) {
+		return
+	}
+	bucket, ok := a.index[TrendBucketDate(local, local.Location(), a.granularity)]
+	if !ok {
+		return
+	}
+	a.messageCounts[bucket]++
+	a.lower = appendTrendLower(a.lower, content)
+	for i, matchers := range a.matchers {
+		a.counts[i][bucket] += countTrendOccurrences(a.lower, matchers)
+	}
+}
+
+// Response builds the trends response from the accumulated counts.
+func (a *TrendAccumulator) Response() TrendsTermsResponse {
 	return BuildTrendsTermsResponse(
-		f.From, f.To, granularity, buckets, terms, counts, messageCounts,
-	), nil
+		a.from, a.to, a.granularity, a.buckets, a.terms, a.counts, a.messageCounts,
+	)
 }
 
 func ParseTrendTerms(values []string) ([]TrendTermInput, error) {
@@ -281,32 +349,58 @@ type matchSpan struct {
 	end   int
 }
 
-func countTrendOccurrences(text string, term TrendTermInput) int {
-	return CountTrendOccurrences(text, term)
+type trendMatcher struct {
+	needle      []byte
+	wordBounded bool
+}
+
+func prepareTrendMatchers(term TrendTermInput) []trendMatcher {
+	var matchers []trendMatcher
+	for _, matcher := range term.Matchers {
+		matcher = strings.TrimSpace(matcher)
+		if matcher != "" {
+			matchers = append(matchers, trendMatcher{[]byte(strings.ToLower(matcher)), isSingleWordMatcher(matcher)})
+		}
+	}
+	return matchers
+}
+
+func appendTrendLower(dst []byte, text string) []byte {
+	dst = append(dst[:0], text...)
+	for i, c := range dst {
+		if c >= utf8.RuneSelf {
+			dst = dst[:0]
+			for _, r := range text {
+				dst = utf8.AppendRune(dst, unicode.ToLower(r))
+			}
+			return dst
+		}
+		if 'A' <= c && c <= 'Z' {
+			dst[i] = c + ('a' - 'A')
+		}
+	}
+	return dst
 }
 
 func CountTrendOccurrences(text string, term TrendTermInput) int {
-	spans := make([]matchSpan, 0)
-	for _, matcher := range term.Matchers {
-		matcher = strings.TrimSpace(matcher)
-		if matcher == "" {
-			continue
-		}
-		wordBounded := isSingleWordMatcher(matcher)
-		spans = append(spans, collectTrendSpans(text, matcher, wordBounded)...)
+	return countTrendOccurrences(appendTrendLower(nil, text), prepareTrendMatchers(term))
+}
+
+func countTrendOccurrences(haystack []byte, matchers []trendMatcher) int {
+	var spans []matchSpan
+	for _, matcher := range matchers {
+		spans = append(spans, collectTrendSpans(haystack, matcher.needle, matcher.wordBounded)...)
 	}
 	return mergeCountSpans(spans)
 }
 
-func collectTrendSpans(text string, matcher string, wordBounded bool) []matchSpan {
-	needle := strings.ToLower(matcher)
-	haystack := strings.ToLower(text)
-	if needle == "" || haystack == "" {
+func collectTrendSpans(haystack, needle []byte, wordBounded bool) []matchSpan {
+	if len(needle) == 0 || len(haystack) == 0 {
 		return nil
 	}
-	spans := make([]matchSpan, 0)
+	var spans []matchSpan
 	for offset := 0; offset < len(haystack); {
-		idx := strings.Index(haystack[offset:], needle)
+		idx := bytes.Index(haystack[offset:], needle)
 		if idx < 0 {
 			break
 		}
@@ -332,7 +426,7 @@ func isSingleWordMatcher(matcher string) bool {
 	return true
 }
 
-func hasWordBoundaries(text string, start, end int) bool {
+func hasWordBoundaries(text []byte, start, end int) bool {
 	if start > 0 && isWordByte(text[start-1]) {
 		return false
 	}
@@ -381,38 +475,29 @@ func trendMessageLocalTime(
 	loc *time.Location,
 ) (time.Time, bool) {
 	for _, ts := range []string{messageTS, startedAt, createdAt} {
-		if t, ok := localTime(ts, loc); ok {
+		if t, ok := LocalTime(ts, loc); ok {
 			return t, true
 		}
 	}
 	return time.Time{}, false
 }
 
-func trendBucketDate(t time.Time, loc *time.Location, granularity string) string {
-	return TrendBucketDate(t, loc, granularity)
-}
-
 func TrendBucketDate(t time.Time, loc *time.Location, granularity string) string {
 	local := t.In(loc)
+	// Calendar math runs in UTC because local midnight does not exist on some
+	// DST transition days, and time.Date would move it to the previous day.
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC)
 	switch granularity {
 	case "week":
-		weekday := int(local.Weekday())
+		weekday := int(day.Weekday())
 		if weekday == 0 {
 			weekday = 7
 		}
-		start := local.AddDate(0, 0, -(weekday - 1))
-		return time.Date(
-			start.Year(), start.Month(), start.Day(),
-			0, 0, 0, 0, loc,
-		).Format("2006-01-02")
+		day = day.AddDate(0, 0, -(weekday - 1))
 	case "month":
-		return time.Date(
-			local.Year(), local.Month(), 1,
-			0, 0, 0, 0, loc,
-		).Format("2006-01-02")
-	default:
-		return local.Format("2006-01-02")
+		day = day.AddDate(0, 0, 1-day.Day())
 	}
+	return day.Format("2006-01-02")
 }
 
 func TrendBucketRange(from, to, granularity string) []TrendBucket {
@@ -427,8 +512,8 @@ func TrendBucketRange(from, to, granularity string) []TrendBucket {
 	if err != nil {
 		return nil
 	}
-	startDate := trendBucketDate(start, time.UTC, granularity)
-	endDate := trendBucketDate(end, time.UTC, granularity)
+	startDate := TrendBucketDate(start, time.UTC, granularity)
+	endDate := TrendBucketDate(end, time.UTC, granularity)
 	cur, err := time.Parse("2006-01-02", startDate)
 	if err != nil {
 		return nil

@@ -1,4 +1,6 @@
-const SERVER_URL_KEY = "agentsview-server-url";
+export const SERVER_URL_KEY = "agentsview-server-url";
+/** Dispatched on window when this tab changes the selected server. */
+export const SERVER_URL_CHANGE_EVENT = "agentsview:server-url-change";
 const AUTH_TOKEN_KEY = "agentsview-auth-token";
 
 export function getGeneratedBase(): string {
@@ -16,20 +18,23 @@ export function getServerUrl(): string {
 }
 
 export function setServerUrl(url: string): void {
+  const previous = getServerUrl();
   if (url) {
     localStorage.setItem(SERVER_URL_KEY, url);
   } else {
     localStorage.removeItem(SERVER_URL_KEY);
   }
+  if (url !== previous) {
+    window.dispatchEvent(new Event(SERVER_URL_CHANGE_EVENT));
+  }
 }
 
-function authTokenKey(): string {
-  const server = getServerUrl();
+function authTokenKey(server = getServerUrl()): string {
   return server ? `${AUTH_TOKEN_KEY}::${server}` : AUTH_TOKEN_KEY;
 }
 
-export function getAuthToken(): string {
-  return localStorage.getItem(authTokenKey()) ?? "";
+export function getAuthToken(server = getServerUrl()): string {
+  return localStorage.getItem(authTokenKey(server)) ?? "";
 }
 
 export function setAuthToken(token: string): void {
@@ -54,6 +59,18 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+export class TransportError extends Error {
+  constructor(cause: TypeError) {
+    super(cause.message, { cause });
+    this.name = "TransportError";
+  }
+}
+
+function transportFailure(error: unknown): never {
+  if (!isAbortError(error) && error instanceof TypeError) throw new TransportError(error);
+  throw error;
 }
 
 function generatedHeaders(init?: HeadersInit): Headers {
@@ -104,10 +121,12 @@ export async function orvalRequest<T extends Response = Response>(
   options: ApiRequestOptions = {},
 ): Promise<T> {
   const { baseUrl, ...init } = options;
-  const response = await fetch(`${baseUrl ?? getGeneratedBase()}${url}`, {
+  const requestUrl = `${baseUrl ?? getGeneratedBase()}${url}`;
+  const requestOptions = {
     ...init,
     headers: baseUrl === undefined ? generatedHeaders(init.headers) : init.headers,
-  });
+  };
+  const response = await fetch(requestUrl, requestOptions).catch(transportFailure);
   if (response.ok) return response as T;
 
   const body = await response.text().catch(() => "");
@@ -153,7 +172,7 @@ export async function orvalFetch<T>(url: string, options: ApiRequestOptions): Pr
   const headersAt = performance.now();
   if ([204, 205, 304].includes(response.status)) return undefined as T;
 
-  const body = await response.text();
+  const body = await response.text().catch(transportFailure);
   const bodyAt = performance.now();
   if (!body) return undefined as T;
   if (response.headers.get("Content-Type")?.includes("json")) {
@@ -179,4 +198,12 @@ export function isAbortError(err: unknown): boolean {
     name?: unknown;
   };
   return candidate.name === "AbortError";
+}
+
+// A network failure or 5xx answer may succeed on a later try.
+export function isTransient(err: unknown): boolean {
+  return (
+    err instanceof TransportError ||
+    (err instanceof ApiError && err.status >= 500 && err.status < 600)
+  );
 }

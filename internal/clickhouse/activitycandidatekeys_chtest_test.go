@@ -13,6 +13,7 @@ import (
 
 // An older event can admit a key, but only its latest version may admit a session.
 func TestActivityCandidateKeysKeepLatestEventVersion(t *testing.T) {
+	t.Parallel()
 	store, _, _ := newPushedStore(t)
 	ctx := t.Context()
 	for _, statement := range []string{
@@ -45,7 +46,7 @@ func TestActivityCandidateKeysKeepLatestEventVersion(t *testing.T) {
 		db.AnalyticsFilter{Project: "terminal-key-fixture", Timezone: "UTC"},
 		"2026-01-10T00:00:00Z", "2026-01-11T00:00:00Z",
 	)
-	_, ids, err := store.activityReportSessions(ctx, where, args)
+	_, ids, _, err := store.activityReportSessions(ctx, where, args, false)
 	require.NoError(t, err)
 	slices.Sort(ids)
 	require.Equal(t, []string{"active", "newer"}, ids)

@@ -3,7 +3,8 @@
 package clickhouse
 
 import (
-	"context"
+	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,11 +12,14 @@ import (
 
 	"go.kenn.io/agentsview/internal/clickhouse/chtest"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
+	"go.kenn.io/agentsview/internal/testutil"
 )
 
 func TestStoreAnalyticsReads(t *testing.T) {
+	t.Parallel()
 	store, _, _ := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	filter := db.AnalyticsFilter{
 		From: "2026-01-01",
 		To:   "2026-01-31",
@@ -26,6 +30,7 @@ func TestStoreAnalyticsReads(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 3, summary.TotalSessions)
 		assert.Equal(t, 4, summary.TotalMessages)
+		assert.Equal(t, 1, summary.MedianMessages)
 	})
 
 	t.Run("activity_day_buckets", func(t *testing.T) {
@@ -107,55 +112,43 @@ func TestStoreAnalyticsReads(t *testing.T) {
 }
 
 func TestGetAnalyticsSummaryEmptyMedian(t *testing.T) {
-	ctx := context.Background()
-	filter := db.AnalyticsFilter{
-		From: "2026-01-01",
-		To:   "2026-01-31",
-	}
-
-	t.Run("empty_mirror", func(t *testing.T) {
-		dsn, database := chtest.FreshDatabase(t)
-		require.NoError(t, EnsureSchema(ctx, Target{URL: dsn, Database: database}))
-		store, err := NewStore(ctx, Target{URL: dsn, Database: database})
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-
-		summary, err := store.GetAnalyticsSummary(ctx, filter)
-		require.NoError(t, err)
-		assert.Equal(t, 0, summary.TotalSessions)
-		assert.Equal(t, 0, summary.TotalMessages)
-		assert.Equal(t, 0, summary.MedianMessages)
-		assert.Equal(t, 0.0, summary.AvgMessages)
-	})
-
-	t.Run("unmatched_filter", func(t *testing.T) {
-		store, _, _ := newPushedStore(t)
-		summary, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
-			From: "2025-01-01",
-			To:   "2025-01-31",
+	t.Parallel()
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name      string
+		populated bool
+		filter    db.AnalyticsFilter
+	}{
+		{"empty_mirror", false, db.AnalyticsFilter{From: "2026-01-01", To: "2026-01-31"}},
+		{"unmatched_filter", true, db.AnalyticsFilter{From: "2025-01-01", To: "2025-01-31"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var store *Store
+			if tc.populated {
+				store, _, _ = newPushedStore(t)
+			} else {
+				dsn, database := chtest.FreshDatabase(t)
+				require.NoError(t, EnsureSchema(ctx, Target{URL: dsn, Database: database}))
+				var err error
+				store, err = NewStore(ctx, Target{URL: dsn, Database: database})
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, store.Close()) })
+			}
+			summary, err := store.GetAnalyticsSummary(ctx, tc.filter)
+			require.NoError(t, err)
+			assert.Equal(t, 0, summary.TotalSessions)
+			assert.Equal(t, 0, summary.TotalMessages)
+			assert.Equal(t, 0, summary.MedianMessages)
+			assert.Equal(t, 0.0, summary.AvgMessages)
 		})
-		require.NoError(t, err)
-		assert.Equal(t, 0, summary.TotalSessions)
-		assert.Equal(t, 0, summary.TotalMessages)
-		assert.Equal(t, 0, summary.MedianMessages)
-		assert.Equal(t, 0.0, summary.AvgMessages)
-	})
-
-	t.Run("populated_median", func(t *testing.T) {
-		store, _, _ := newPushedStore(t)
-		summary, err := store.GetAnalyticsSummary(ctx, filter)
-		require.NoError(t, err)
-		assert.Equal(t, 3, summary.TotalSessions)
-		assert.Equal(t, 4, summary.TotalMessages)
-		// Sorted message counts: 1, 1, 2.
-		assert.Equal(t, 1, summary.MedianMessages)
-	})
+	}
 }
 
 // TestAnalyticsSessionSetQueriesMatchSQLite covers the reads that select
 // their sessions with a SQL subquery rather than an ID list: session shape
 // autonomy buckets and velocity messages and tool counts.
 func TestAnalyticsSessionSetQueriesMatchSQLite(t *testing.T) {
+	t.Parallel()
 	store, _, local := newPushedStore(t)
 	ctx := t.Context()
 	filter := db.AnalyticsFilter{
@@ -180,4 +173,155 @@ func TestAnalyticsSessionSetQueriesMatchSQLite(t *testing.T) {
 	assert.Equal(t, wantVelocity, gotVelocity)
 	assert.NotEmpty(t, gotVelocity.ByAgent,
 		"fixture sessions have paired user and assistant messages, so velocity must have data")
+}
+
+// TestAnalyticsActivityRoleSplitMatchesSQLite pins the user / assistant /
+// other split behind the stacked activity timeline on assistant-only,
+// system-only, and mixed days.
+func TestAnalyticsActivityRoleSplitMatchesSQLite(t *testing.T) {
+	t.Parallel()
+	local, target := seedFixture(t)
+	ctx := t.Context()
+	type row struct {
+		role, subtype string
+		system        bool
+	}
+	days := []struct {
+		id, date string
+		rows     []row
+	}{
+		{"ch-role-assistant", "2026-02-01", []row{{role: "assistant"}, {role: "assistant"}}},
+		{"ch-role-system", "2026-02-02", []row{{role: "user", system: true}, {role: "user", system: true}}},
+		{"ch-role-mixed", "2026-02-03", []row{
+			{role: "user"},
+			{role: "user", system: true},
+			{role: "user", subtype: "tool_result"},
+			{role: "assistant"},
+		}},
+	}
+	writes := make([]db.SessionBatchWrite, 0, len(days))
+	for _, day := range days {
+		ts := day.date + "T10:00:00.000Z"
+		msgs := make([]db.Message, 0, len(day.rows))
+		for i, r := range day.rows {
+			m := fixtureMessage(day.id, i, r.role, fmt.Sprintf("row %d", i), ts)
+			m.IsSystem = r.system
+			m.SourceSubtype = r.subtype
+			msgs = append(msgs, m)
+		}
+		writes = append(writes, db.SessionBatchWrite{
+			Session:         fixtureSession(day.id, "gamma", "row 0", ts, len(msgs)),
+			Messages:        msgs,
+			DataVersion:     1,
+			ReplaceMessages: true,
+		})
+	}
+	_, err := local.WriteSessionBatchAtomic(ctx, writes)
+	require.NoError(t, err)
+	syncer := newTestSync(t, local, target, storage.PusherOptions{})
+	_, err = syncer.Push(ctx, false, nil)
+	require.NoError(t, err)
+	store, err := NewStore(ctx, target)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	filter := db.AnalyticsFilter{From: "2026-02-01", To: "2026-02-03", Timezone: "UTC"}
+	want, err := local.GetAnalyticsActivity(ctx, filter, "day")
+	require.NoError(t, err)
+	got, err := store.GetAnalyticsActivity(ctx, filter, "day")
+	require.NoError(t, err)
+	require.Len(t, want.Series, 3)
+	require.Len(t, got.Series, 3)
+	for i, w := range want.Series {
+		g := got.Series[i]
+		assert.Equal(t, w.Date, g.Date)
+		assert.Equal(t, w.Messages, g.Messages, w.Date)
+		assert.Equal(t, w.UserMessages, g.UserMessages, w.Date)
+		assert.Equal(t, w.AssistantMessages, g.AssistantMessages, w.Date)
+	}
+	assert.Equal(t, 0, got.Series[0].UserMessages, "assistant-only day")
+	assert.Equal(t, 2, got.Series[0].AssistantMessages, "assistant-only day")
+	assert.Equal(t, 0, got.Series[1].UserMessages+got.Series[1].AssistantMessages, "system-only day")
+	assert.Equal(t, 2, got.Series[1].Messages, "system-only day")
+	assert.Equal(t, 1, got.Series[2].UserMessages, "mixed day")
+}
+
+// TestAnalyticsSummaryFromYearOne pins the year-one clamp on padded date
+// bounds. Unclamped, From=0001-01-01 pads to 0000-12-31T10:00:00Z, which
+// parseDateTime64BestEffort reads as a recent date and drops older sessions.
+func TestAnalyticsSummaryFromYearOne(t *testing.T) {
+	t.Parallel()
+	local, target := seedFixture(t)
+	ctx := t.Context()
+	const id = "ch-year-one"
+	ts := "2024-06-01T10:00:00.000Z"
+	_, err := local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
+		Session:         fixtureSession(id, "gamma", "old", ts, 1),
+		Messages:        []db.Message{fixtureMessage(id, 0, "user", "old", ts)},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+	syncer := newTestSync(t, local, target, storage.PusherOptions{})
+	_, err = syncer.Push(ctx, false, nil)
+	require.NoError(t, err)
+	store, err := NewStore(ctx, target)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	summary, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
+		From: "0001-01-01", To: "2024-12-31", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.TotalSessions)
+	assert.Equal(t, 1, summary.TotalMessages)
+}
+
+func TestTrendsTermsSessionWindowParity(t *testing.T) {
+	ctx := t.Context()
+	store, syncer, local := newPushedStore(t)
+	cases := testutil.TrendsSessionWindowCases()
+	for _, tc := range cases {
+		sess := fixtureSession(tc.Project, tc.Project, "seam", tc.Started, len(tc.Messages()))
+		if tc.Started == "" {
+			sess.StartedAt = nil
+			sess.EndedAt = nil
+		}
+		var msgs []db.Message
+		for ordinal, m := range tc.Messages() {
+			msg := fixtureMessage(tc.Project, ordinal, m.Role, m.Content, m.Timestamp)
+			msg.Model = m.Model
+			msgs = append(msgs, msg)
+		}
+		_, err := local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{Session: sess, Messages: msgs, DataVersion: 1, ReplaceMessages: true}})
+		require.NoError(t, err)
+		// Ingestion assigns creation time; pin the fixture's fallback date.
+		require.NoError(t, local.Update(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, "UPDATE sessions SET created_at = ? WHERE id = ?", tc.Created, tc.Project)
+			return err
+		}))
+	}
+	_, err := syncer.Push(ctx, false, nil)
+	require.NoError(t, err)
+	terms, err := db.ParseTrendTerms([]string{"seam"})
+	require.NoError(t, err)
+	for _, tc := range cases {
+		t.Run(tc.Project, func(t *testing.T) {
+			for _, dayHour := range []bool{false, true} {
+				f := db.AnalyticsFilter{From: "2024-06-05", To: "2024-06-05", Project: tc.Project, Timezone: tc.Timezone, Model: tc.Model}
+				if dayHour {
+					f.DayOfWeek = new(2)
+					f.Hour = new(tc.Hour)
+				}
+				got, err := store.GetTrendsTerms(ctx, f, terms, "day")
+				require.NoError(t, err)
+				assert.Equal(t, tc.Want, got.MessageCount)
+				require.Len(t, got.Series, 1)
+				assert.Equal(t, tc.Want, got.Series[0].Total)
+				want, err := local.GetTrendsTerms(ctx, f, terms, "day")
+				require.NoError(t, err)
+				assert.Equal(t, want, got)
+			}
+		})
+	}
 }

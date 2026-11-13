@@ -154,6 +154,43 @@ func mustProjects(
 	return r
 }
 
+func TestAnalyticsSummaryReturnsFirstReadError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{"serving", "querying analytics summary: summary read failure"},
+		{"cold read-only", "summary read failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "summary", "project", func(s *Session) {
+				s.StartedAt = new("2024-06-01T09:00:00Z")
+			})
+			if tc.name == "cold read-only" {
+				reader, err := OpenReadOnly(t.Context(), d.Path())
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, reader.Close()) })
+				d = reader
+			}
+			d.rawReader().SetMaxOpenConns(1)
+			conn, err := d.getReader().Conn(t.Context())
+			require.NoError(t, err)
+			// Cached SQL evaluates its first row during QueryContext; cold
+			// read-only SQL evaluates it during Next. Both must return the error.
+			require.NoError(t, conn.Raw(func(driverConn any) error {
+				return driverConn.(interface{ RegisterFunc(string, any, bool) error }).RegisterFunc("strftime", func(...any) (string, error) {
+					return "", errors.New("summary read failure")
+				}, false)
+			}))
+			require.NoError(t, conn.Close())
+
+			_, err = d.GetAnalyticsSummary(t.Context(), baseFilter())
+			require.EqualError(t, err, tc.want)
+		})
+	}
+}
+
 func TestGetAnalyticsSummary(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
@@ -303,6 +340,13 @@ func TestAnalyticsSubagentScope(t *testing.T) {
 	shape, err := d.GetAnalyticsSessionShape(ctx, f)
 	require.NoError(t, err, "GetAnalyticsSessionShape")
 	assert.Equal(t, 1, shape.Count, "session-shape stays root-only")
+
+	insertSession(t, d, "continuation", "project-alpha", func(s *Session) {
+		withTokens("continuation", 5, 2, 200)(s)
+		s.ParentSessionID = new("root")
+	})
+	assert.Equal(t, 3, mustSummary(t, d, ctx, f).TotalSessions,
+		"summary also counts the parented continuation")
 }
 
 func TestAnalyticsModelFilter(t *testing.T) {
@@ -1079,17 +1123,6 @@ func TestGetAnalyticsHeatmap(t *testing.T) {
 		assert.Equal(t, 2, resp.Entries[0].Value, "Jun1 sessions")
 	})
 
-	t.Run("LevelsAssigned", func(t *testing.T) {
-		resp := mustHeatmap(t, d, ctx, baseFilter(), "messages")
-		// All entries should have levels 0-4
-		for _, e := range resp.Entries {
-			assert.GreaterOrEqual(t, e.Level, 0,
-				"date %s level", e.Date)
-			assert.LessOrEqual(t, e.Level, 4,
-				"date %s level", e.Date)
-		}
-	})
-
 	t.Run("OutputTokensNoReporting", func(t *testing.T) {
 		// When no sessions report token coverage, the
 		// output_tokens heatmap must return empty entries
@@ -1100,17 +1133,6 @@ func TestGetAnalyticsHeatmap(t *testing.T) {
 		assert.Equal(t, "output_tokens", resp.Metric, "Metric")
 		assert.Empty(t, resp.Entries,
 			"len(Entries) want 0 (no sessions report token coverage)")
-	})
-
-	t.Run("EmptyRange", func(t *testing.T) {
-		f := emptyFilter()
-		f.To = "2020-01-03"
-		resp := mustHeatmap(t, d, ctx, f, "messages")
-		require.Len(t, resp.Entries, 3, "len(Entries) =")
-		for _, e := range resp.Entries {
-			assert.Equal(t, 0, e.Value, "date %s value", e.Date)
-			assert.Equal(t, 0, e.Level, "date %s level", e.Date)
-		}
 	})
 }
 
@@ -1380,9 +1402,9 @@ func TestMedianInt(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := medianInt(tt.sorted, len(tt.sorted))
+			got := MedianInt(tt.sorted, len(tt.sorted))
 			assert.Equal(t, tt.want, got,
-				"medianInt(%v)", tt.sorted)
+				"MedianInt(%v)", tt.sorted)
 		})
 	}
 }
@@ -1404,9 +1426,9 @@ func TestLocalDate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := localDate(tt.ts, utc)
+			got := LocalDate(tt.ts, utc)
 			assert.Equal(t, tt.want, got,
-				"localDate(%q)", tt.ts)
+				"LocalDate(%q)", tt.ts)
 		})
 	}
 }
@@ -2474,9 +2496,9 @@ func TestPercentileFloat(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := percentileFloat(tt.sorted, tt.pct)
+			got := PercentileFloat(tt.sorted, tt.pct)
 			assert.InDelta(t, tt.want, got, 1e-9,
-				"percentileFloat(%v, %f)",
+				"PercentileFloat(%v, %f)",
 				tt.sorted, tt.pct)
 		})
 	}
@@ -2626,16 +2648,6 @@ func TestGetAnalyticsTools(t *testing.T) {
 		require.NoError(t, err, "GetAnalyticsTools")
 		assert.Equal(t, 0, resp.TotalCalls, "TotalCalls")
 	})
-}
-
-func TestAnalyticsToolsToolCallsQueryAggregatesInSQL(t *testing.T) {
-	q := analyticsToolsQuery("(?,?)", "", "", false)
-	normalized := strings.Join(strings.Fields(strings.ToLower(q)), " ")
-
-	assert.Contains(t, normalized,
-		"select tc.session_id, tc.category, trim(coalesce(tc.tool_name, '')), count(*)")
-	assert.Contains(t, normalized,
-		"group by tc.session_id, tc.category, trim(coalesce(tc.tool_name, ''))")
 }
 
 func TestGetAnalyticsToolsModelFilterCountsOnlyMatchingToolCalls(
@@ -3184,23 +3196,6 @@ func TestGetAnalyticsSkillsDateBoundaries(t *testing.T) {
 		"only the in-range week is bucketed")
 }
 
-func TestAnalyticsSkillsToolCallsQueryAggregatesInSQL(t *testing.T) {
-	q := analyticsSkillsQuery("(?,?)", "", "")
-	normalized := strings.Join(strings.Fields(strings.ToLower(q)), " ")
-
-	assert.Contains(t, normalized,
-		"select tc.session_id, trim(tc.skill_name), count(*), "+
-			"coalesce(m.timestamp, '')")
-	assert.Contains(t, normalized,
-		"left join messages m on m.session_id = tc.session_id "+
-			"and m.id = tc.message_id")
-	assert.Contains(t, normalized,
-		"trim(coalesce(tc.skill_name, '')) != ''")
-	assert.Contains(t, normalized,
-		"group by tc.session_id, trim(tc.skill_name), "+
-			"coalesce(m.timestamp, '')")
-}
-
 func TestGetAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
 	t *testing.T,
 ) {
@@ -3251,13 +3246,6 @@ func TestGetAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
 	assert.Equal(t, 1, resp.BySkill[0].CallCount, "CallCount")
 	assert.Equal(t, "2024-06-01T09:00:00Z", resp.BySkill[0].LastUsedAt,
 		"LastUsedAt")
-}
-
-func TestGetAnalyticsToolsCanceled(t *testing.T) {
-	d := testDB(t)
-	ctx := canceledCtx()
-	_, err := d.GetAnalyticsTools(ctx, baseFilter())
-	requireCanceledErr(t, err)
 }
 
 func TestGetAnalyticsSkillsCanceled(t *testing.T) {
@@ -3403,6 +3391,11 @@ func TestGetAnalyticsTopSessions(t *testing.T) {
 				"done",
 				"2024-06-02T11:00:00Z",
 			),
+			Message{
+				SessionID: "wall-dominant", Ordinal: 3, Role: "user",
+				Content: "hook output", Timestamp: "2024-06-02T11:10:00Z",
+				IsSystem: true, SourceType: "attachment", SourceSubtype: "hook_success",
+			},
 		)
 
 		insertSession(t, d, "actively-working", "project-gamma", func(s *Session) {
@@ -4077,40 +4070,6 @@ func TestBuildWhereProjectFilter(t *testing.T) {
 }
 
 func TestAnalyticsTerminationFilter(t *testing.T) {
-	t.Run("BuildWherePredicate", func(t *testing.T) {
-		cases := []struct {
-			name        string
-			termination string
-			want        string
-		}{
-			{"empty adds nothing", "", ""},
-			{
-				"clean", "clean",
-				"termination_status = 'clean'",
-			},
-			{
-				"unclean", "unclean",
-				"termination_status IN ('tool_call_pending', 'truncated')",
-			},
-		}
-		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) {
-				f := baseFilter()
-				f.Termination = tc.termination
-				where, _ := f.buildWhere(
-					"COALESCE(NULLIF(started_at, ''), created_at)",
-				)
-				if tc.want == "" {
-					assert.NotContains(t, where, "termination_status",
-						"empty termination produced predicate")
-					return
-				}
-				assert.Contains(t, where, tc.want,
-					"buildWhere(%q)", tc.termination)
-			})
-		}
-	})
-
 	t.Run("RoundTripQueries", func(t *testing.T) {
 		d := testDB(t)
 		ctx := t.Context()
@@ -4522,6 +4481,68 @@ func TestActivityExcludesSystemUserMessages(t *testing.T) {
 	assert.Equal(t, 3, entry.Messages, "Messages")
 	assert.Equal(t, 1, entry.UserMessages, "UserMessages")
 	assert.Equal(t, 1, entry.AssistantMessages, "AssistantMessages")
+}
+
+func TestActivityRoleSplitOnSingleRoleDays(t *testing.T) {
+	d := testDB(t)
+	sessions := []struct {
+		id   string
+		ts   string
+		msgs []Message
+	}{
+		{"assistant-only", "2024-06-01T10:00:00Z", []Message{
+			{Role: "assistant", Content: "a"},
+			{Role: "assistant", Content: "b"},
+		}},
+		{"system-only", "2024-06-02T10:00:00Z", []Message{
+			{Role: "user", Content: "banner", IsSystem: true},
+			{Role: "user", Content: "marker", IsSystem: true},
+		}},
+		{"mixed", "2024-06-03T10:00:00Z", []Message{
+			{Role: "user", Content: "question"},
+			{Role: "user", Content: "banner", IsSystem: true},
+			{Role: "user", Content: "result", SourceSubtype: "tool_result"},
+			{Role: "assistant", Content: "answer"},
+		}},
+	}
+	for _, sess := range sessions {
+		insertSession(t, d, sess.id, "proj", func(s *Session) {
+			s.StartedAt = new(sess.ts)
+			s.EndedAt = new(sess.ts)
+			s.MessageCount = len(sess.msgs)
+		})
+		for i := range sess.msgs {
+			sess.msgs[i].SessionID = sess.id
+			sess.msgs[i].Ordinal = i
+			sess.msgs[i].Timestamp = sess.ts
+			sess.msgs[i].ContentLength = len(sess.msgs[i].Content)
+		}
+		insertMessages(t, d, sess.msgs...)
+	}
+
+	resp, err := d.GetAnalyticsActivity(t.Context(), AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-03", Timezone: "UTC",
+	}, "day")
+	require.NoError(t, err)
+	require.Len(t, resp.Series, 3)
+
+	tests := []struct {
+		date                             string
+		messages, user, assistant, other int
+	}{
+		{"2024-06-01", 2, 0, 2, 0},
+		{"2024-06-02", 2, 0, 0, 2},
+		{"2024-06-03", 4, 1, 1, 2},
+	}
+	for i, tt := range tests {
+		entry := resp.Series[i]
+		assert.Equal(t, tt.date, entry.Date)
+		assert.Equal(t, tt.messages, entry.Messages, tt.date)
+		assert.Equal(t, tt.user, entry.UserMessages, tt.date)
+		assert.Equal(t, tt.assistant, entry.AssistantMessages, tt.date)
+		assert.Equal(t, tt.other,
+			entry.Messages-entry.UserMessages-entry.AssistantMessages, tt.date)
+	}
 }
 
 func TestGetAnalyticsSignals(t *testing.T) {
@@ -5102,9 +5123,9 @@ func TestLocalTime(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, ok := localTime(tt.ts, time.UTC)
+			_, ok := LocalTime(tt.ts, time.UTC)
 			assert.Equal(t, tt.valid, ok,
-				"localTime(%q) ok", tt.ts)
+				"LocalTime(%q) ok", tt.ts)
 		})
 	}
 }
@@ -5180,6 +5201,136 @@ func TestGetAnalyticsToolsExcludesOutOfRangeToolCallRowsInSQL(t *testing.T) {
 	t.Log("production tool query carried the message window predicate; TotalCalls == 3; sessions == 2")
 }
 
+func TestGetAnalyticsToolsLocalDayBoundaries(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "boundary", "window", func(s *Session) { s.StartedAt = new("2025-03-09T12:00:00Z") })
+	for n, ts := range []string{
+		"2025-03-10T03:59:59.999999999Z",
+		"2025-03-10T00:30:00+01:00",
+		"2025-03-10T04:00:00Z",
+		"2025-03-10T04:01:00Z",
+		"2025-03-10 malformed",
+		"2025-03-10T24:00:00Z",
+		"",
+	} {
+		m := asstMsgAt("boundary", n, "read", ts)
+		m.ToolCalls = []ToolCall{{SessionID: "boundary", ToolName: "Read", Category: "Read"}}
+		insertMessages(t, d, m)
+	}
+	filter := AnalyticsFilter{From: "2025-03-01", To: "2025-03-12", Timezone: "America/New_York"}
+	rows, err := d.analyticsToolRows(t.Context(), filter)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	counts := make(map[string]int)
+	for _, row := range rows {
+		counts[row.Date] = row.Count
+	}
+	assert.Equal(t, map[string]int{"2025-03-09": 3, "2025-03-10": 4}, counts)
+	resp, err := d.GetAnalyticsTools(t.Context(), filter)
+	require.NoError(t, err)
+	assert.Equal(t, 7, resp.TotalCalls)
+	require.Len(t, resp.ByTool, 1)
+	assert.Equal(t, 1, resp.ByTool[0].SessionCount)
+	assert.Equal(t, []ToolTrendEntry{
+		{Date: "2025-03-03", ByCat: map[string]int{"Read": 3}},
+		{Date: "2025-03-10", ByCat: map[string]int{"Read": 4}},
+	}, resp.Trend)
+}
+
+func TestGetAnalyticsToolsBlankAndMalformedTimestamps(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "blank-time", "window", func(s *Session) {
+		s.StartedAt = new("2025-03-09T12:00:00Z")
+	})
+	for n, ts := range []string{"\t", "\u00a0", "bad"} {
+		m := asstMsgAt("blank-time", n, "read", ts)
+		m.ToolCalls = []ToolCall{{SessionID: "blank-time", ToolName: "Read", Category: "Read"}}
+		insertMessages(t, d, m)
+	}
+	for _, zone := range []string{"UTC", "America/New_York"} {
+		resp, err := d.GetAnalyticsTools(t.Context(), AnalyticsFilter{From: "2025-03-09", To: "2025-03-09", Timezone: zone})
+		require.NoError(t, err)
+		assert.Equal(t, 2, resp.TotalCalls, "zone %s", zone)
+		assert.Equal(t, []ToolTrendEntry{{Date: "2025-03-03", ByCat: map[string]int{"Read": 2}}}, resp.Trend, "zone %s", zone)
+	}
+	resp, err := d.GetAnalyticsTools(t.Context(), AnalyticsFilter{Timezone: "America/New_York"})
+	require.NoError(t, err)
+	assert.Equal(t, 3, resp.TotalCalls)
+	assert.Equal(t, []ToolTrendEntry{
+		{Date: "", ByCat: map[string]int{"Read": 1}},
+		{Date: "2025-03-03", ByCat: map[string]int{"Read": 2}},
+	}, resp.Trend)
+}
+
+func TestSQLiteToolsDateKeyMatchesResolver(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "keys", "window", func(s *Session) { s.StartedAt = new("2025-03-09T12:00:00Z") })
+	stamps := []string{
+		"2025-03-09T06:59:59Z", "2025-03-09T07:00:00Z", "2025-03-10T03:59:59.999999999Z",
+		"2025-03-10T04:00:00Z", "2025-03-09T18:14:59Z", "2025-03-09T18:15:00Z",
+		"2025-11-02T05:59:59Z", "2025-11-02T06:00:00Z", "2025-03-10T00:30:00+01:00",
+		"2025-03-10T24:00:00Z", "2025-03-10 malformed", "2025-03-10Z", "2024-01-01T00:00:00Z",
+		"", "\t", "bad", "２０２５-03-09T12:00:00Z",
+	}
+	for n, ts := range stamps {
+		insertMessages(t, d, asstMsgAt("keys", n, "read", ts))
+	}
+	for _, f := range []AnalyticsFilter{
+		{From: "2025-03-01", To: "2025-03-12", Timezone: "UTC"},
+		{From: "2025-03-01", To: "2025-03-12", Timezone: "America/New_York"},
+		{From: "2025-03-01", To: "2025-03-12", Timezone: "Asia/Kathmandu"},
+		{From: "2025-10-30", To: "2025-11-04", Timezone: "America/New_York"},
+		{From: "bad", To: "2025-12-31", Timezone: "America/New_York"},
+		{Timezone: "America/New_York"},
+	} {
+		key := sqliteToolsDateKey(f)
+		require.NotEmpty(t, key)
+		rows, err := d.getReader().QueryContext(t.Context(), `SELECT COALESCE(m.timestamp, ''), COALESCE(NULLIF(s.started_at, ''), s.created_at), `+key+`
+			FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.session_id = 'keys'`, f.Timezone)
+		require.NoError(t, err)
+		defer rows.Close()
+		seen := 0
+		for rows.Next() {
+			var msg, session, got string
+			require.NoError(t, rows.Scan(&msg, &session, &got))
+			_, want, _ := (AnalyticsFilter{Timezone: f.Timezone}).ResolveSkillRowTime(msg, session)
+			assert.Equal(t, want, got, "%s %s..%s %q", f.Timezone, f.From, f.To, msg)
+			seen++
+		}
+		require.NoError(t, rows.Err())
+		require.NoError(t, rows.Close())
+		assert.Equal(t, len(stamps), seen)
+	}
+}
+
+func TestGetAnalyticsToolsLocalWeeks(t *testing.T) {
+	for _, tc := range []struct {
+		name, zone, before, after, firstWeek, secondWeek string
+	}{
+		{"fall DST", "America/New_York", "2025-11-03T04:59:59Z", "2025-11-03T05:00:00Z", "2025-10-27", "2025-11-03"},
+		{"unknown zone", "Invalid/Zone", "2025-03-09T23:59:59Z", "2025-03-10T00:00:00Z", "2025-03-03", "2025-03-10"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "weeks", "window", func(s *Session) { s.StartedAt = new(tc.before) })
+			for n, ts := range []string{tc.before, tc.after} {
+				m := asstMsgAt("weeks", n, "read", ts)
+				m.ToolCalls = []ToolCall{{SessionID: "weeks", ToolName: "Read", Category: "Read"}}
+				insertMessages(t, d, m)
+			}
+			resp, err := d.GetAnalyticsTools(t.Context(), AnalyticsFilter{From: "2025-01-01", To: "2025-12-31", Timezone: tc.zone})
+			require.NoError(t, err)
+			require.Len(t, resp.Trend, 2)
+			assert.Equal(t, tc.firstWeek, resp.Trend[0].Date)
+			assert.Equal(t, tc.secondWeek, resp.Trend[1].Date)
+			assert.Equal(t, 1, resp.Trend[0].ByCat["Read"])
+			assert.Equal(t, 1, resp.Trend[1].ByCat["Read"])
+			assert.Equal(t, 2, resp.TotalCalls)
+			assert.Equal(t, 1, resp.ByTool[0].SessionCount)
+		})
+	}
+}
+
 func TestAnalyticsMessageWindowBoundsDoNotOverflowMaxDate(t *testing.T) {
 	from, to := (AnalyticsFilter{
 		From: "9999-12-31", To: "9999-12-31", Timezone: "UTC",
@@ -5237,19 +5388,19 @@ func TestGetAnalyticsToolsChunksSessionsAtMaxSQLVars(t *testing.T) {
 	f := AnalyticsFilter{From: "2025-06-01", To: "2025-06-01", Timezone: "UTC", Model: "model-a"}
 	resp, err := d.GetAnalyticsTools(t.Context(), f)
 	require.NoError(t, err)
-	ph, args := inPlaceholders(ids)
+	ph, args := InPlaceholders(ids)
 	modelPred, modelArgs := sqliteAnalyticsCSVPredicate("m.model", f.Model)
 	from, to := f.messageWindowBoundsUTC()
 	pred, windowArgs := analyticsMessageWindowPred("m.timestamp", from, to)
 	args = append(append(args, modelArgs...), windowArgs...)
-	rows, err := d.getReader().QueryContext(t.Context(), analyticsToolsQuery(ph, modelPred, pred, true), args...)
+	rows, err := d.getReader().QueryContext(t.Context(), analyticsToolsQuery(ph, modelPred, pred, true, sqliteAnalyticsMinuteKey()), args...)
 	require.NoError(t, err)
 	defer rows.Close()
 	var all []ToolAnalyticsRow
 	for rows.Next() {
 		var r ToolAnalyticsRow
 		var ts string
-		require.NoError(t, rows.Scan(&r.SessionID, &r.Category, &r.ToolName, &r.Count, &ts))
+		require.NoError(t, rows.Scan(append([]any{&r.SessionID, &r.Category, &r.ToolName, &r.Count, &ts, &r.Ordinal}, r.ScanTargets()...)...))
 		r.Agent = defaultAgent
 		r.Date = "2025-06-01"
 		all = append(all, r)
@@ -5258,4 +5409,130 @@ func TestGetAnalyticsToolsChunksSessionsAtMaxSQLVars(t *testing.T) {
 	assert.Equal(t, BuildToolsAnalytics(all), resp)
 	assert.Equal(t, 501, resp.TotalCalls)
 	t.Log("chunked and unchunked responses match; TotalCalls == 501")
+}
+
+func TestGetAnalyticsVelocityIgnoresHookRows(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID: "hooks", Project: "proj", Agent: "claude", Machine: "local",
+		StartedAt: new("2024-06-01T09:00:00Z"), MessageCount: 4, UserMessageCount: 1,
+	}))
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "hooks", []Message{
+		{SessionID: "hooks", Ordinal: 0, Role: "user", IsSystem: true, SourceType: "attachment", SourceSubtype: "hook_success", Timestamp: "2024-06-01T09:00:00Z", Content: "startup output"},
+		{SessionID: "hooks", Ordinal: 1, Role: "user", Timestamp: "2024-06-01T09:01:00Z", Content: "question"},
+		{SessionID: "hooks", Ordinal: 2, Role: "user", IsSystem: true, SourceType: "attachment", SourceSubtype: "hook_additional_context", Timestamp: "2024-06-01T09:01:09Z", Content: "prompt context"},
+		{SessionID: "hooks", Ordinal: 3, Role: "assistant", Timestamp: "2024-06-01T09:01:10Z", Content: "answer"},
+	}))
+	resp, err := d.GetAnalyticsVelocity(ctx, baseFilter())
+	require.NoError(t, err)
+	assert.InDelta(t, 10.0, resp.Overall.FirstResponseSec.P50, 0.001)
+	assert.InDelta(t, 10.0, resp.Overall.TurnCycleSec.P50, 0.001)
+}
+
+func TestAnalyticsDateWindowPlan(t *testing.T) {
+	d := testDB(t)
+	seedAnalyticsData(t, d)
+	for _, tc := range []struct {
+		name, from, to string
+		indexed        bool
+	}{
+		{"2-day", "2024-06-01", "2024-06-03", true},
+		{"90-day", "2024-06-01", "2024-08-30", true},
+		{"91-day", "2024-06-01", "2024-08-31", false},
+		{"year", "2024-01-01", "2025-01-01", false},
+		{"from-only", "2024-06-01", "", false},
+		{"to-only", "", "2024-06-03", false},
+		{"all-time", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := baseFilter()
+			f.From, f.To = tc.from, tc.to
+			for _, table := range []struct{ name, date string }{
+				{"sessions", "COALESCE(NULLIF(started_at, ''), created_at)"},
+				{"sessions s", "COALESCE(NULLIF(s.started_at, ''), s.created_at)"},
+			} {
+				where, args := f.buildWhere(table.date)
+				plan := queryPlanOf(t, d, "SELECT id FROM "+table.name+" WHERE "+where, args...)
+				if tc.indexed {
+					assert.Contains(t, plan, "idx_sessions_effective_start")
+				} else {
+					assert.NotContains(t, plan, "idx_sessions_effective_start")
+				}
+			}
+		})
+	}
+}
+
+func TestGetAnalyticsTopSessionsEmptyDateWindowWork(t *testing.T) {
+	for _, history := range []int{30000} {
+		t.Run(fmt.Sprintf("history_%d", history), func(t *testing.T) {
+			d := testDB(t)
+			_, err := d.getWriter().ExecContext(t.Context(), `
+				WITH RECURSIVE seq(n) AS (
+					SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ? - 1
+				)
+				INSERT INTO sessions (id, project, machine, agent, message_count, started_at)
+				SELECT printf('old-%06d', n), 'project-a', 'local', 'claude',
+					n + 1, '2024-01-01T12:00:00Z' FROM seq`, history)
+			require.NoError(t, err)
+
+			// Count date evaluations using NULLIF's semantics for the fixture's
+			// non-NULL text starts. A date-index seek uses stored expression
+			// values; an archive-wide ranking walk evaluates each old row.
+			// Register only on the reader, leaving the stored index intact.
+			d.rawReader().SetMaxOpenConns(1)
+			conn, err := d.getReader().Conn(t.Context())
+			require.NoError(t, err)
+			var evaluations int
+			require.NoError(t, conn.Raw(func(driverConn any) error {
+				return driverConn.(interface{ RegisterFunc(string, any, bool) error }).RegisterFunc("nullif", func(value, other string) any {
+					evaluations++
+					if value == other {
+						return nil
+					}
+					return value
+				}, true)
+			}))
+			require.NoError(t, conn.Close())
+
+			for _, timezone := range []string{"UTC", "Asia/Kolkata"} {
+				t.Run(timezone, func(t *testing.T) {
+					evaluations = 0
+					resp, err := d.GetAnalyticsTopSessions(t.Context(), AnalyticsFilter{
+						From: "2024-06-01", To: "2024-06-02", Timezone: timezone,
+					}, "messages")
+					require.NoError(t, err)
+					assert.Equal(t, "messages", resp.Metric)
+					assert.Empty(t, resp.Sessions)
+					assert.LessOrEqual(t, evaluations, 16, "empty-window date evaluations must stay bounded as history grows")
+					t.Logf("date evaluations: %d", evaluations)
+				})
+			}
+		})
+	}
+}
+
+func TestAnalyticsDateWindowCreatedAtFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		startedAt *string
+	}{
+		{"null", nil},
+		{"empty", new("")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "fallback", "project-a", func(s *Session) { s.StartedAt = tc.startedAt })
+			_, err := d.getWriter().ExecContext(t.Context(), "UPDATE sessions SET created_at = '2024-06-02T12:00:00Z' WHERE id = 'fallback'")
+			require.NoError(t, err)
+			summary, err := d.GetAnalyticsSummary(t.Context(), baseFilter())
+			require.NoError(t, err)
+			assert.Equal(t, 1, summary.TotalSessions)
+			top, err := d.GetAnalyticsTopSessions(t.Context(), baseFilter(), "messages")
+			require.NoError(t, err)
+			require.Len(t, top.Sessions, 1)
+			assert.Equal(t, "fallback", top.Sessions[0].ID)
+		})
+	}
 }

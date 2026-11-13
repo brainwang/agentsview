@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/activity"
@@ -393,7 +394,7 @@ func paritySessionWrite(fs parityFixtureSession) db.SessionBatchWrite {
 // Sync and returns a read-only PG store over the same database. The schema is
 // dropped before and after so the test is self-contained.
 func pushParityPostgres(
-	t *testing.T, ctx context.Context, local *db.DB,
+	t *testing.T, ctx context.Context, local *db.DB, sessions int,
 ) *postgresstore.Store {
 	t.Helper()
 	pgURL := os.Getenv("TEST_PG_URL")
@@ -404,7 +405,7 @@ func pushParityPostgres(
 	t.Cleanup(func() { dropParitySchema(t, pgURL) })
 
 	ps, err := postgresstore.New(
-		pgURL, paritySchema, local, "parity-machine", true,
+		t.Context(), pgURL, paritySchema, local, "parity-machine", true,
 		storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating pg sync")
@@ -413,10 +414,10 @@ func pushParityPostgres(
 
 	res, err := ps.Push(ctx, false, nil)
 	require.NoError(t, err, "pushing to pg")
-	require.Equal(t, len(parityFixture()), res.SessionsPushed,
+	require.Equal(t, sessions, res.SessionsPushed,
 		"pg sessions pushed")
 
-	store, err := postgresstore.NewStore(pgURL, paritySchema, true)
+	store, err := postgresstore.NewStore(t.Context(), pgURL, paritySchema, true)
 	require.NoError(t, err, "opening pg store")
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return store
@@ -425,17 +426,19 @@ func pushParityPostgres(
 // dropParitySchema removes the PG schema so each run starts clean.
 func dropParitySchema(t *testing.T, pgURL string) {
 	t.Helper()
-	store, err := postgresstore.NewStore(pgURL, paritySchema, true)
+	// Also called from t.Cleanup, where t.Context() is already canceled.
+	ctx := context.WithoutCancel(t.Context())
+	store, err := postgresstore.NewStore(ctx, pgURL, paritySchema, true)
 	require.NoError(t, err, "opening pg for schema drop")
 	defer func() { require.NoError(t, store.Close()) }()
-	_, _ = store.DB().Exec("DROP SCHEMA IF EXISTS " + paritySchema + " CASCADE")
+	_, _ = store.DB().ExecContext(ctx, "DROP SCHEMA IF EXISTS "+paritySchema+" CASCADE")
 }
 
 // pushParityDuckDB pushes the SQLite fixture to a DuckDB mirror via the
 // production Push entry point and returns a read-only DuckDB store over
 // the built mirror file.
 func pushParityDuckDB(
-	t *testing.T, ctx context.Context, local *db.DB,
+	t *testing.T, ctx context.Context, local *db.DB, sessions int,
 ) *duckdbstore.Store {
 	t.Helper()
 	target := filepath.Join(t.TempDir(), "parity.duckdb")
@@ -444,7 +447,7 @@ func pushParityDuckDB(
 		storage.MirrorPushOptions{}, true, nil,
 	)
 	require.NoError(t, err, "pushing to duckdb")
-	require.Equal(t, len(parityFixture()), res.SessionsPushed,
+	require.Equal(t, sessions, res.SessionsPushed,
 		"duckdb sessions pushed")
 
 	store, err := duckdbstore.NewStore(ctx, target)
@@ -458,7 +461,7 @@ func pushParityDuckDB(
 // returns nil when TEST_CLICKHOUSE_URL is unset so PostgreSQL-only runs
 // do not skip.
 func pushParityClickHouse(
-	t *testing.T, ctx context.Context, local *db.DB,
+	t *testing.T, ctx context.Context, local *db.DB, sessions int,
 ) *clickhousestore.Store {
 	t.Helper()
 	if os.Getenv("TEST_CLICKHOUSE_URL") == "" {
@@ -473,7 +476,7 @@ func pushParityClickHouse(
 	t.Cleanup(func() { require.NoError(t, syncer.Close()) })
 	res, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err, "pushing to clickhouse")
-	require.Equal(t, len(parityFixture()), res.SessionsPushed,
+	require.Equal(t, sessions, res.SessionsPushed,
 		"clickhouse sessions pushed")
 	store, err := clickhousestore.NewStore(ctx, target)
 	require.NoError(t, err, "opening clickhouse store")
@@ -514,18 +517,18 @@ func canonicalizeReport(r *activity.Report) {
 // complete (non-partial) and every backend's report is deterministic regardless
 // of wall clock.
 func TestGetActivityReportParityAcrossBackends(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local := seedParitySQLite(t)
 
 	var pgStore *postgresstore.Store
 	if os.Getenv("TEST_PG_URL") != "" {
-		pgStore = pushParityPostgres(t, ctx, local)
+		pgStore = pushParityPostgres(t, ctx, local, len(parityFixture()))
 	}
-	chStore := pushParityClickHouse(t, ctx, local)
+	chStore := pushParityClickHouse(t, ctx, local, len(parityFixture()))
 	if pgStore == nil && chStore == nil {
 		t.Skip("TEST_PG_URL and TEST_CLICKHOUSE_URL are unset; skipping cross-backend parity")
 	}
-	duckStore := pushParityDuckDB(t, ctx, local)
+	duckStore := pushParityDuckDB(t, ctx, local, len(parityFixture()))
 	assertCandidateParity(t, ctx, local, pgStore, duckStore, chStore)
 
 	fixedNow, err := time.Parse(time.RFC3339, "2030-01-01T00:00:00Z")
@@ -579,20 +582,117 @@ func TestGetActivityReportParityAcrossBackends(t *testing.T) {
 	}
 }
 
+func TestActivityReportMessageCountsAcrossBackends(t *testing.T) {
+	ctx := t.Context()
+	local := seedParitySQLite(t)
+	for _, id := range []string{"parity-a", "parity-b", "parity-c", "parity-d"} {
+		session, err := local.GetSession(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, session)
+		session.Project = "message-counts"
+		session.StartedAt = new("2026-06-14T09:00:00Z")
+		session.EndedAt = new("2026-06-14T11:00:00Z")
+		session.IsAutomated = id == "parity-b"
+		if id == "parity-c" {
+			session.RelationshipType = "subagent"
+		}
+		messages := []db.Message{
+			{Role: "user", Timestamp: "2026-06-14T10:00:00Z"},
+			{Role: "assistant", Timestamp: "2026-06-14T10:00:00Z"},
+		}
+		if id == "parity-a" {
+			messages = []db.Message{
+				{Role: "user", Timestamp: "2026-06-14T09:59:59Z"},
+				{Role: "user", Timestamp: "2026-06-14T12:00:00+02:00"},
+				{Role: "assistant", Timestamp: "2026-06-14T10:04:59.999999Z"},
+				{Role: "user", Timestamp: "2026-06-14T10:05:00Z"},
+				{Role: "assistant", Timestamp: "2026-06-14T10:10:30.499Z"},
+				{Role: "assistant", Timestamp: "2026-06-14T10:10:30.500Z"},
+				{Role: "user"},
+				{Role: "user", Timestamp: "2026-06-14T10:01:00Z", SourceSubtype: "tool_result"},
+				{Role: "assistant", Timestamp: "2026-06-14T10:02:00Z", IsSystem: true},
+				{Role: "user", Timestamp: "2026-06-14T10:03:00Z", IsSystem: true},
+				{Role: "tool", Timestamp: "2026-06-14T10:04:00Z"},
+			}
+		}
+		if id == "parity-d" {
+			messages = []db.Message{{Role: "user", Timestamp: "2026-06-14T10:08:00Z"}}
+		}
+		for i := range messages {
+			messages[i].SessionID, messages[i].Ordinal = id, i
+			messages[i].Content = "message"
+		}
+		if id == "parity-b" {
+			messages[0].Content = "You are a code reviewer. Review the code."
+		}
+		session.MessageCount = len(messages)
+		_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
+			Session: *session, Messages: messages, DataVersion: 1, ReplaceMessages: true,
+		}})
+		require.NoError(t, err)
+		stored, err := local.GetSession(ctx, id)
+		require.NoError(t, err)
+		require.Equal(t, id == "parity-b", stored.IsAutomated)
+	}
+	stores := map[string]db.ActivityReportArtifactStore{
+		"sqlite": local,
+		"duckdb": pushParityDuckDB(t, ctx, local, len(parityFixture())),
+	}
+	if os.Getenv("TEST_PG_URL") != "" {
+		stores["postgres"] = pushParityPostgres(t, ctx, local, len(parityFixture()))
+	}
+	if store := pushParityClickHouse(t, ctx, local, len(parityFixture())); store != nil {
+		stores["clickhouse"] = store
+	}
+	q, err := activity.ResolveQuery(activity.QueryInput{
+		Preset: "custom", Timezone: "UTC", BucketOverride: "5m",
+		From: "2026-06-14T10:00:00Z", To: "2026-06-14T10:15:00Z",
+	}, time.Date(2026, 6, 14, 10, 10, 30, 500_000_000, time.UTC))
+	require.NoError(t, err)
+	for name, store := range stores {
+		t.Run(name, func(t *testing.T) {
+			// The second build counts messages from inputs a store kept from
+			// the first.
+			var artifacts activity.CandidateArtifacts
+			for range 2 {
+				var err error
+				artifacts, err = store.BuildActivityReportArtifacts(ctx,
+					db.AnalyticsFilter{Project: "message-counts"}, q, nil)
+				require.NoError(t, err)
+				var user, assistant []int
+				for _, bucket := range artifacts.Report.Buckets {
+					user = append(user, bucket.UserMessages)
+					assistant = append(assistant, bucket.AssistantMessages)
+				}
+				assert.Equal(t, []int{1, 2, 0}, user)
+				assert.Equal(t, []int{3, 0, 1}, assistant)
+			}
+			page, err := activity.PageSessions(artifacts.Sessions, artifacts.Membership,
+				activity.SessionPageOptions{BucketRange: &activity.BucketRange{Start: 1, End: 2}})
+			require.NoError(t, err)
+			var ids []string
+			for _, session := range page.Sessions {
+				ids = append(ids, session.SessionID)
+			}
+			assert.ElementsMatch(t, []string{"parity-a", "parity-d"}, ids)
+		})
+	}
+}
+
 func TestGetActivityReportIncludesTerminalAfterSessionEndAcrossBackends(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local := seedParitySQLite(t)
 	var pgStore *postgresstore.Store
 	if os.Getenv("TEST_PG_URL") != "" {
-		pgStore = pushParityPostgres(t, ctx, local)
+		pgStore = pushParityPostgres(t, ctx, local, len(parityFixture()))
 	}
-	chStore := pushParityClickHouse(t, ctx, local)
+	chStore := pushParityClickHouse(t, ctx, local, len(parityFixture()))
 	if pgStore == nil && chStore == nil {
 		t.Skip("TEST_PG_URL and TEST_CLICKHOUSE_URL are unset; skipping cross-backend parity")
 	}
-	duckStore := pushParityDuckDB(t, ctx, local)
+	duckStore := pushParityDuckDB(t, ctx, local, len(parityFixture()))
 
 	q, err := activity.ResolveQuery(activity.QueryInput{
 		Preset: "day", Date: "2026-06-15", Timezone: "UTC",

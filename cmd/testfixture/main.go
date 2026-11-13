@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
@@ -89,7 +90,7 @@ func run() error {
 	defer database.Close()
 
 	// Seed model pricing for usage page e2e tests.
-	if err := database.UpsertModelPricing([]db.ModelPricing{
+	if err := database.UpsertModelPricingContext(ctx, []db.ModelPricing{
 		{
 			ModelPattern:         "claude-sonnet-4-20250514",
 			InputPerMTok:         money.Money{Microdollars: 3_000_000},
@@ -131,13 +132,19 @@ func run() error {
 		return fmt.Errorf("creating duration showcase: %w", err)
 	}
 
+	if err := createToolSequencesFixture(
+		ctx, database, base.Add(144*time.Hour),
+	); err != nil {
+		return fmt.Errorf("creating tool-sequences fixture: %w", err)
+	}
+
 	if err := createRecentEditsFixture(ctx,
 		database, base.Add(96*time.Hour),
 	); err != nil {
 		return fmt.Errorf("creating recent-edits fixture: %w", err)
 	}
 
-	if err := createProjectReclassificationFixture(
+	if err := createProjectReclassificationFixture(ctx,
 		database, base.Add(120*time.Hour),
 	); err != nil {
 		return fmt.Errorf("creating project-reclassification fixture: %w", err)
@@ -145,7 +152,7 @@ func run() error {
 
 	fmt.Printf("Fixture DB written to %s\n", *out)
 	if *duckDBOut != "" {
-		if err := writeDuckDBMirror(database, *duckDBOut); err != nil {
+		if err := writeDuckDBMirror(ctx, database, *duckDBOut); err != nil {
 			return fmt.Errorf("writing DuckDB mirror: %w", err)
 		}
 		fmt.Printf("Fixture DuckDB mirror written to %s\n", *duckDBOut)
@@ -154,7 +161,7 @@ func run() error {
 }
 
 func createProjectReclassificationFixture(
-	database *db.DB, start time.Time,
+	ctx context.Context, database *db.DB, start time.Time,
 ) error {
 	const (
 		machine      = "remote-example-host"
@@ -169,7 +176,6 @@ func createProjectReclassificationFixture(
 		{suffix: "root", cwd: worktreeRoot},
 		{suffix: "nested", cwd: worktreeRoot + "/cmd/server"},
 	}
-	ctx := context.Background()
 	for index, item := range cwds {
 		sessionID := "test-session-project-reclassification-" + item.suffix
 		startedAt := start.Add(time.Duration(index) * time.Hour)
@@ -227,12 +233,57 @@ func createProjectReclassificationFixture(
 	return nil
 }
 
-func writeDuckDBMirror(database *db.DB, path string) error {
+func createToolSequencesFixture(
+	ctx context.Context, database *db.DB, start time.Time,
+) error {
+	const sessionID = "test-session-tool-sequences"
+	msgs := dbtest.ToolSequencesExampleMessages(sessionID)
+	for i := range msgs {
+		messageTime := start.Add(time.Duration(msgs[i].Ordinal) * time.Minute)
+		msgs[i].Timestamp = messageTime.Format(time.RFC3339Nano)
+		for callIndex := range msgs[i].ToolCalls {
+			for eventIndex := range msgs[i].ToolCalls[callIndex].ResultEvents {
+				event := &msgs[i].ToolCalls[callIndex].ResultEvents[eventIndex]
+				eventTime := messageTime
+				if event.Status == "completed" || event.Status == "errored" {
+					eventTime = eventTime.Add(2 * time.Second)
+				}
+				event.Timestamp = eventTime.Format(time.RFC3339Nano)
+			}
+		}
+	}
+	for ordinal := len(msgs); ordinal < 54; ordinal++ {
+		role := "user"
+		if ordinal%2 == 1 {
+			role = "assistant"
+		}
+		content := fmt.Sprintf("Transcript context message %d", ordinal)
+		msgs = append(msgs, db.Message{
+			SessionID: sessionID, Ordinal: ordinal, Role: role,
+			Content: content, ContentLength: len(content),
+			Timestamp: start.Add(time.Duration(ordinal) * time.Minute).Format(time.RFC3339Nano),
+		})
+	}
+	startedAt := start.Format(time.RFC3339Nano)
+	endedAt := start.Add(55 * time.Minute).Format(time.RFC3339Nano)
+	firstMessage := "Find the config"
+	session := db.Session{
+		ID: sessionID, Project: "project-alpha", Machine: "test-machine", Agent: "claude",
+		FirstMessage: &firstMessage, StartedAt: &startedAt, EndedAt: &endedAt,
+		MessageCount: len(msgs), UserMessageCount: 26,
+		TerminationStatus: new("clean"),
+	}
+	if err := database.UpsertSession(ctx, session); err != nil {
+		return err
+	}
+	return database.ReplaceSessionMessages(ctx, sessionID, msgs)
+}
+
+func writeDuckDBMirror(ctx context.Context, database *db.DB, path string) error {
 	if err := os.Remove(path); err != nil &&
 		!errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("removing existing DuckDB mirror: %w", err)
 	}
-	ctx := context.Background()
 	result, err := duckdbsync.Push(
 		ctx, path, database, "test-machine", storage.MirrorPushOptions{}, true, nil,
 	)

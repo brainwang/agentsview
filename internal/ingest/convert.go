@@ -1,0 +1,351 @@
+package ingest
+
+import (
+	"context"
+	"slices"
+	"time"
+
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/timeutil"
+)
+
+// ConvertSessionContext converts parser session metadata into a storage row.
+func ConvertSessionContext(
+	ctx context.Context, parsed parser.ParsedSession,
+	messages []parser.ParsedMessage,
+) (db.Session, error) {
+	hasTotal, hasPeak, err := parsed.TokenCoverageContext(ctx, messages)
+	if err != nil {
+		return db.Session{}, err
+	}
+	parent := stringPtr(parsed.ParentSessionID)
+	session := db.Session{
+		ID: parsed.ID, Project: parsed.Project, Machine: parsed.Machine,
+		MessageCount: parsed.MessageCount, UserMessageCount: parsed.UserMessageCount,
+		ParentSessionID: parent, ParserParentSessionID: cloneStringPtr(parent),
+		RelationshipType:     string(parsed.RelationshipType),
+		TotalOutputTokens:    parsed.TotalOutputTokens,
+		PeakContextTokens:    parsed.PeakContextTokens,
+		HasTotalOutputTokens: hasTotal, HasPeakContextTokens: hasPeak,
+		Cwd: parsed.Cwd, GitBranch: parsed.GitBranch,
+		SourceSessionID:      parsed.SourceSessionID,
+		SourceVersion:        parsed.SourceVersion,
+		GroupKey:             parsed.GroupKey,
+		TranscriptFidelity:   parsed.TranscriptFidelity,
+		ParserMalformedLines: parsed.MalformedLines,
+		IsTruncated:          parsed.IsTruncated,
+		TerminationStatus:    stringPtr(string(parsed.TerminationStatus)),
+		FilePath:             stringPtr(parsed.File.Path), FileSize: int64Ptr(parsed.File.Size),
+		FileMtime:         int64Ptr(parsed.File.Mtime),
+		NextOrdinal:       NextParsedOrdinal(0, messages),
+		LastEntryUUID:     stringPtr(LastParsedSourceUUID("", messages)),
+		ClaudeLinearParse: parsed.ClaudeLinearParse,
+		FileInode:         int64Ptr(parsed.File.Inode),
+		FileDevice:        int64Ptr(parsed.File.Device),
+		FileHash:          stringPtr(parsed.File.Hash),
+	}
+	db.ApplyParsedSessionIdentity(&session, parsed)
+	if parsed.FirstMessage != "" {
+		session.FirstMessage = &parsed.FirstMessage
+	}
+	session.SessionName = db.ParsedSessionName(parsed)
+	session.PreserveSessionName = parser.PreservesStoredSessionName(parsed)
+	if !parsed.StartedAt.IsZero() {
+		session.StartedAt = timeutil.Ptr(parsed.StartedAt)
+	}
+	if !parsed.EndedAt.IsZero() {
+		session.EndedAt = timeutil.Ptr(parsed.EndedAt)
+	}
+	return session, ctx.Err()
+}
+
+// ConvertMessagesContext converts messages and applies result pairing and
+// carrier filtering.
+func ConvertMessagesContext(
+	ctx context.Context, sessionID string, agent parser.AgentType,
+	parsed []parser.ParsedMessage, blocked map[string]bool,
+) ([]db.Message, error) {
+	messages := make([]db.Message, len(parsed))
+	for i, message := range parsed {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		hasContext, hasOutput := message.TokenPresence()
+		toolCalls, err := ConvertToolCallsContext(
+			ctx, sessionID, message.ToolCalls,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if parser.IsCodexFormatAgent(agent) {
+			for j := range toolCalls {
+				for k := range toolCalls[j].ResultEvents {
+					db.PrepareToolResultEvent(&toolCalls[j].ResultEvents[k])
+				}
+			}
+		}
+		toolResults, err := ConvertToolResultsContext(ctx, message.ToolResults)
+		if err != nil {
+			return nil, err
+		}
+		messages[i] = db.Message{
+			SessionID: sessionID, Ordinal: message.Ordinal,
+			Role: string(message.Role), Content: message.Content,
+			ThinkingText: message.ThinkingText,
+			DialogueText: message.DialogueText,
+			Timestamp:    timeutil.Format(message.Timestamp),
+			HasThinking:  message.HasThinking, HasToolUse: message.HasToolUse,
+			ContentLength: message.ContentLength, IsSystem: message.IsSystem,
+			Model: message.Model, ReasoningEffort: message.ReasoningEffort,
+			ProviderID: message.ProviderID, TokenUsage: message.TokenUsage,
+			ContextTokens: message.ContextTokens, OutputTokens: message.OutputTokens,
+			HasContextTokens: hasContext, HasOutputTokens: hasOutput,
+			ClaudeMessageID: message.ClaudeMessageID,
+			ClaudeRequestID: message.ClaudeRequestID,
+			SourceType:      message.SourceType, SourceSubtype: message.SourceSubtype,
+			PromptSource: message.PromptSource, SourceUUID: message.SourceUUID,
+			SourceParentUUID:  message.SourceParentUUID,
+			IsSidechain:       message.IsSidechain,
+			IsCompactBoundary: message.IsCompactBoundary,
+			ToolCalls:         toolCalls, ToolResults: toolResults,
+		}
+	}
+	return PairAndFilterContext(ctx, messages, blocked)
+}
+
+// ConvertUsageEventsContext converts, stamps the final session ID, and
+// validates parser usage rows.
+func ConvertUsageEventsContext(
+	ctx context.Context, sessionID string, parsed []parser.ParsedUsageEvent,
+) ([]db.UsageEvent, db.ValidationStats, error) {
+	events := make([]db.UsageEvent, 0, len(parsed))
+	for _, event := range parsed {
+		if err := ctx.Err(); err != nil {
+			return nil, db.ValidationStats{}, err
+		}
+		events = append(events, db.UsageEvent{
+			SessionID: sessionID, MessageOrdinal: event.MessageOrdinal,
+			Source: event.Source, Model: event.Model, ProviderID: event.ProviderID,
+			InputTokens: event.InputTokens, OutputTokens: event.OutputTokens,
+			CacheCreationInputTokens: event.CacheCreationInputTokens,
+			CacheReadInputTokens:     event.CacheReadInputTokens,
+			ReasoningTokens:          event.ReasoningTokens, Cost: event.Cost,
+			CostStatus: event.CostStatus, CostSource: event.CostSource,
+			OccurredAt: event.OccurredAt, DedupKey: event.DedupKey,
+		})
+	}
+	stats, err := db.ValidateAndSanitizeContext(ctx, nil, nil, events)
+	return events, stats, err
+}
+
+// ConvertSessionTotal converts the usage total the agent recorded for a
+// whole session into its storage row, or nil when the parser reported none.
+func ConvertSessionTotal(total *parser.ParsedSessionTotal) *db.SessionUsageTotal {
+	if total == nil {
+		return nil
+	}
+	row := &db.SessionUsageTotal{
+		Source:        db.SanitizeUTF8(total.Source),
+		SubagentScope: db.SanitizeUTF8(total.SubagentScope),
+		Cost:          total.Cost,
+		Incomplete:    total.Incomplete,
+	}
+	for _, model := range total.Models {
+		row.Models = append(row.Models, db.SessionUsageTotalModel{
+			Model:                    db.SanitizeUTF8(model.Model),
+			InputTokens:              model.InputTokens,
+			OutputTokens:             model.OutputTokens,
+			ReasoningTokens:          model.ReasoningTokens,
+			CacheCreationInputTokens: model.CacheCreationInputTokens,
+			CacheReadInputTokens:     model.CacheReadInputTokens,
+			WebSearchRequests:        model.WebSearchRequests,
+			Cost:                     model.Cost,
+		})
+	}
+	return row
+}
+
+// ConvertPlanUsage converts a session's plan usage and live-capture
+// coverage into its plan usage row, or nil when the parser reported
+// neither.
+func ConvertPlanUsage(
+	usage *parser.ParsedPlanUsage, coverage *parser.ParsedCaptureCoverage,
+) *db.SessionPlanUsage {
+	if usage == nil && coverage == nil {
+		return nil
+	}
+	var row db.SessionPlanUsage
+	if usage != nil {
+		row = db.SessionPlanUsage{
+			HasPlanUsage:    true,
+			DataAsOf:        planUsageTime(usage.DataAsOf),
+			DataStatus:      db.SanitizeUTF8(usage.DataStatus),
+			UsageSource:     db.SanitizeUTF8(usage.UsageSource),
+			WeeklyPercent:   usage.WeeklyPercent,
+			FiveHourPercent: usage.FiveHourPercent,
+			Credits:         sanitizedStringPtr(usage.Credits),
+			Final:           usage.Final,
+			OutcomeKind:     db.SanitizeUTF8(usage.OutcomeKind),
+			OutcomeAt:       planUsageTime(usage.OutcomeAt),
+			CountedUnder:    db.SanitizeUTF8(usage.CountedUnder),
+		}
+		for _, g := range usage.Groups {
+			row.Groups = append(row.Groups, db.SessionPlanUsageGroup{
+				Model:             db.SanitizeUTF8(g.Model),
+				ReasoningEffort:   db.SanitizeUTF8(g.ReasoningEffort),
+				Speed:             db.SanitizeUTF8(g.Speed),
+				ProductExperience: db.SanitizeUTF8(g.ProductExperience),
+				WeeklyPercent:     g.WeeklyPercent,
+				FiveHourPercent:   g.FiveHourPercent,
+				Credits:           sanitizedStringPtr(g.Credits),
+			})
+		}
+	}
+	if coverage != nil {
+		row.HasCoverage = true
+		row.LastCaptureAt = planUsageTime(coverage.LastCaptureAt)
+		row.UncapturedTurns = coverage.UncapturedTurns
+	}
+	return &row
+}
+
+func planUsageTime(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func sanitizedStringPtr(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	return new(db.SanitizeUTF8(*s))
+}
+
+// ConvertToolCallsContext converts parsed tool calls into normalized rows.
+func ConvertToolCallsContext(
+	ctx context.Context, sessionID string, parsed []parser.ParsedToolCall,
+) ([]db.ToolCall, error) {
+	if len(parsed) == 0 {
+		return nil, ctx.Err()
+	}
+	calls := make([]db.ToolCall, len(parsed))
+	for i, call := range parsed {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		filePath := call.FilePath
+		if filePath == "" {
+			filePath = parser.ResolveFilePathFromJSON(call.InputJSON)
+		}
+		resultEvents, err := ConvertToolResultEventsContext(ctx, call.ResultEvents)
+		if err != nil {
+			return nil, err
+		}
+		calls[i] = db.ToolCall{
+			SessionID: sessionID, ToolName: call.ToolName,
+			Category: call.Category, ToolUseID: call.ToolUseID,
+			InputJSON: call.InputJSON, Rendering: call.Rendering,
+			FilePath: filePath, CallIndex: i, SkillName: call.SkillName,
+			SubagentSessionID: call.SubagentSessionID,
+			ResultEvents:      resultEvents,
+		}
+	}
+	return calls, ctx.Err()
+}
+
+// ConvertToolResultEventsContext converts structured result events.
+func ConvertToolResultEventsContext(
+	ctx context.Context, parsed []parser.ParsedToolResultEvent,
+) ([]db.ToolResultEvent, error) {
+	if len(parsed) == 0 {
+		return nil, ctx.Err()
+	}
+	events := make([]db.ToolResultEvent, len(parsed))
+	for i, event := range parsed {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		events[i] = db.ToolResultEvent{
+			RawContentDigest: event.RawContentDigest, ToolUseID: event.ToolUseID,
+			AgentID: event.AgentID, SubagentSessionID: event.SubagentSessionID,
+			Source: event.Source, Status: event.Status, Content: event.Content,
+			ContentLength: len(event.Content), Timestamp: timeutil.Format(event.Timestamp),
+			EventIndex: i,
+		}
+	}
+	return events, ctx.Err()
+}
+
+// ConvertToolResultsContext converts transient result carriers for pairing.
+func ConvertToolResultsContext(
+	ctx context.Context, parsed []parser.ParsedToolResult,
+) ([]db.ToolResult, error) {
+	if len(parsed) == 0 {
+		return nil, ctx.Err()
+	}
+	results := make([]db.ToolResult, len(parsed))
+	for i, result := range parsed {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		results[i] = db.ToolResult{
+			ToolUseID: result.ToolUseID, ContentLength: result.ContentLength,
+			Source: result.Source, Status: result.Status,
+			ContentRaw: result.ContentRaw,
+		}
+	}
+	return results, ctx.Err()
+}
+
+// NextParsedOrdinal returns the resume ordinal after the final parsed row.
+func NextParsedOrdinal(current int, messages []parser.ParsedMessage) int {
+	if len(messages) == 0 {
+		return current
+	}
+	return messages[len(messages)-1].Ordinal + 1
+}
+
+// LastParsedSourceUUID returns the last available source UUID for resumption.
+//
+// A deferred hook record keeps its native source UUID on the
+// stored message, but that identity is not part of the ordinary entry chain,
+// so it never becomes the resume cursor. A batch without another source UUID
+// keeps the current cursor.
+func LastParsedSourceUUID(
+	current string, messages []parser.ParsedMessage,
+) string {
+	for _, message := range slices.Backward(messages) {
+		if parser.IsClaudeHookSubtype(message.SourceSubtype) {
+			continue
+		}
+		if message.SourceUUID != "" {
+			return message.SourceUUID
+		}
+	}
+	return current
+}
+
+func stringPtr(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func int64Ptr(value int64) *int64 {
+	if value == 0 {
+		return nil
+	}
+	return &value
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}

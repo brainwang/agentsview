@@ -17,11 +17,12 @@ import (
 )
 
 type fakeRecallVectorSearcher struct {
-	hits     []RecallVectorHit
-	query    string
-	limit    int
-	onSearch func()
-	database *DB
+	hits       []RecallVectorHit
+	query      string
+	limit      int
+	onSearch   func()
+	onValidate func()
+	database   *DB
 }
 
 type boundedRecallVectorSearcher struct {
@@ -86,6 +87,9 @@ func (f *fakeRecallVectorSearcher) SearchRecall(
 func (f *fakeRecallVectorSearcher) ValidateRecallSnapshot(
 	ctx context.Context, snapshot RecallVectorSnapshot,
 ) error {
+	if f.onValidate != nil {
+		f.onValidate()
+	}
 	if f.database == nil {
 		return nil
 	}
@@ -120,19 +124,6 @@ func TestClampRecallVectorCandidates(t *testing.T) {
 				clampRecallVectorCandidates(tt.k, tt.ceiling))
 		})
 	}
-}
-
-func TestRecallEntriesSchemaIndexesSourceEpisode(t *testing.T) {
-	d := testDB(t)
-
-	var count int
-	err := d.getReader().QueryRow(t.Context(),
-		`SELECT count(*) FROM sqlite_master
-		 WHERE type='index' AND name='idx_recall_entries_source_episode'`,
-	).Scan(&count)
-
-	require.NoError(t, err, "query recall source episode index")
-	assert.Equal(t, 1, count)
 }
 
 func TestInsertRecallEntryDefaultsReviewStateToUnreviewedAuto(t *testing.T) {
@@ -339,11 +330,8 @@ func TestOpenRepairsMissingRecallEntrySourceEpisodeIndex(t *testing.T) {
 	assert.Equal(t, 1, count)
 }
 
-func TestOpenCreatesSearchableRecallFTSWhenRuntimeSupportsFTS4(t *testing.T) {
+func TestOpenCreatesSearchableRecallFTS(t *testing.T) {
 	d := testDB(t)
-	if !d.HasFTS(t.Context()) && !sqliteRuntimeSupportsFTS4(t, d) {
-		t.Skip("no FTS4 or FTS5 support")
-	}
 	ctx := t.Context()
 	insertSession(t, d, "s1", "agentsview", func(s *Session) {
 		s.Agent = "codex"
@@ -372,13 +360,10 @@ func TestOpenCreatesSearchableRecallFTSWhenRuntimeSupportsFTS4(t *testing.T) {
 	assert.Equal(t, 1, count)
 }
 
-func TestOpenCreatesSearchableRecallEvidenceFTSWhenRuntimeSupportsFTS4(
+func TestOpenCreatesSearchableRecallEvidenceFTS(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	if !d.HasFTS(t.Context()) && !sqliteRuntimeSupportsFTS4(t, d) {
-		t.Skip("no FTS4 or FTS5 support")
-	}
 	ctx := t.Context()
 	insertSession(t, d, "s1", "agentsview", func(s *Session) {
 		s.Agent = "codex"
@@ -416,22 +401,6 @@ func TestOpenCreatesSearchableRecallEvidenceFTSWhenRuntimeSupportsFTS4(
 	assert.Equal(t, 1, count)
 }
 
-func sqliteRuntimeSupportsFTS4(t *testing.T, d *DB) bool {
-	t.Helper()
-	_, err := d.getWriter().Exec(t.Context(),
-		`CREATE VIRTUAL TABLE temp.recall_fts4_probe USING fts4(value)`,
-	)
-	if err != nil {
-		if strings.Contains(err.Error(), "no such module") {
-			return false
-		}
-		require.NoError(t, err, "probe fts4 support")
-	}
-	_, err = d.getWriter().Exec(t.Context(), `DROP TABLE temp.recall_fts4_probe`)
-	require.NoError(t, err, "drop fts4 probe table")
-	return true
-}
-
 func requireRecallFTS(t *testing.T, d *DB) {
 	t.Helper()
 	var count int
@@ -446,19 +415,6 @@ func requireRecallFTS(t *testing.T, d *DB) {
 	_, err = d.getReader().Exec(t.Context(), `SELECT 1 FROM recall_entries_fts LIMIT 1`)
 	if err != nil {
 		t.Skipf("no recall FTS support: %v", err)
-	}
-}
-
-func requireRecallFTS4(t *testing.T, d *DB) {
-	t.Helper()
-	var ddl string
-	err := d.getReader().QueryRow(t.Context(),
-		`SELECT lower(sql) FROM sqlite_master
-		 WHERE type = 'table' AND name = 'recall_entries_fts'`,
-	).Scan(&ddl)
-	require.NoError(t, err, "query recall fts ddl")
-	if !strings.Contains(ddl, "using fts4") {
-		t.Skip("recall FTS table is not FTS4")
 	}
 }
 
@@ -1883,6 +1839,70 @@ func TestQueryRecallEntriesVectorRejectsCorpusMutationAfterSearch(t *testing.T) 
 	assert.ErrorIs(t, err, ErrSemanticUnavailable)
 }
 
+func TestQueryRecallEntriesHybridSeesEntriesChangedBetweenRankings(t *testing.T) {
+	newEntry := func(id string) RecallEntry {
+		return RecallEntry{
+			ID: id, Type: "fact", Scope: "project", Status: "accepted",
+			Title: "Database pool", Body: "Reuse idle connections.",
+			SourceSessionID: "s1",
+		}
+	}
+	exec := func(stmt string) func(*testing.T, *DB) {
+		return func(t *testing.T, d *DB) {
+			t.Helper()
+			_, err := d.getWriter().ExecContext(t.Context(), stmt)
+			require.NoError(t, err)
+		}
+	}
+	for _, tt := range []struct {
+		name   string
+		change func(*testing.T, *DB)
+		want   []string
+	}{
+		{
+			name:   "rejected after the vector ranking reads it",
+			change: exec("UPDATE recall_entries SET status = 'rejected' WHERE id = 'hidden'"),
+			want:   []string{"kept"},
+		},
+		{
+			name: "added after the vector ranking reads it",
+			change: func(t *testing.T, d *DB) {
+				t.Helper()
+				_, err := d.InsertRecallEntry(t.Context(), newEntry("added"))
+				require.NoError(t, err)
+			},
+			want: []string{"added", "hidden", "kept"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "s1", "agentsview")
+			for _, id := range []string{"kept", "hidden"} {
+				_, err := d.InsertRecallEntry(t.Context(), newEntry(id))
+				require.NoError(t, err)
+			}
+			// No database: validation accepts the write, as a lag-tolerant index does.
+			d.SetRecallVectorSearcher(&fakeRecallVectorSearcher{
+				hits: []RecallVectorHit{
+					{EntryID: "hidden", Score: 0.9}, {EntryID: "kept", Score: 0.8},
+				},
+				onValidate: func() { tt.change(t, d) },
+			})
+
+			page, err := d.QueryRecallEntries(t.Context(), RecallQuery{
+				Text: "database pool", Mode: RecallQueryModeHybrid, Limit: 5,
+			})
+
+			require.NoError(t, err)
+			ids := make([]string, 0, len(page.RecallEntries))
+			for _, result := range page.RecallEntries {
+				ids = append(ids, result.ID)
+			}
+			assert.ElementsMatch(t, tt.want, ids)
+		})
+	}
+}
+
 func TestQueryRecallEntriesVectorExpandsPastFilteredCandidates(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
@@ -2289,86 +2309,6 @@ func TestListRecallEntryTextCandidatesOrdersByLexicalRank(t *testing.T) {
 	assert.Equal(t, "partial", candidates[1].ID)
 }
 
-func TestListRecallEntryTextCandidatesFallsBackToLikeForFTS4SubstringMatch(t *testing.T) {
-	d := testDB(t)
-	requireRecallFTS(t, d)
-	requireRecallFTS4(t, d)
-	ctx := t.Context()
-	insertSession(t, d, "s1", "test-agent", func(s *Session) {
-		s.Agent = "test-agent"
-	})
-	_, err := d.InsertRecallEntry(ctx, RecallEntry{
-		ID:              "substring-recall",
-		Type:            "fact",
-		Scope:           "project",
-		Status:          "accepted",
-		Title:           "Portal substring clue",
-		Body:            "The decisive clue was abcdefghij in the portal state.",
-		Project:         "test-agent",
-		Agent:           "test-agent",
-		SourceSessionID: "s1",
-	})
-	require.NoError(t, err)
-
-	candidates, err := d.ListRecallEntryTextCandidates(ctx, RecallQuery{
-		Text:    "cdefg",
-		Project: "test-agent",
-		Agent:   "test-agent",
-		Limit:   10,
-	})
-
-	require.NoError(t, err)
-	require.NotEmpty(t, candidates)
-	assert.Equal(t, "substring-recall", candidates[0].ID)
-}
-
-func TestListRecallEntryTextCandidatesUsesFTS4RowIDMatchForDirectText(t *testing.T) {
-	d := testDB(t)
-	requireRecallFTS(t, d)
-	requireRecallFTS4(t, d)
-	ctx := t.Context()
-	insertSession(t, d, "s1", "test-agent", func(s *Session) {
-		s.Agent = "test-agent"
-	})
-	_, err := d.InsertRecallEntry(ctx, RecallEntry{
-		ID:              "fts4-direct-recall",
-		Type:            "fact",
-		Scope:           "project",
-		Status:          "accepted",
-		Title:           "Portal menu finding",
-		Body:            "The dropdown was inspected.",
-		Project:         "test-agent",
-		Agent:           "test-agent",
-		SourceSessionID: "s1",
-	})
-	require.NoError(t, err)
-	_, err = d.getWriter().ExecContext(ctx, `
-		UPDATE recall_entries_fts
-		SET body = 'The decisive clue was heliotrope parser overflow.'
-		WHERE rowid = (SELECT rowid FROM recall_entries WHERE id = ?)`,
-		"fts4-direct-recall",
-	)
-	require.NoError(t, err)
-
-	candidates, err := d.ListRecallEntryTextCandidates(ctx, RecallQuery{
-		Text:    "heliotrope parser overflow",
-		Project: "test-agent",
-		Agent:   "test-agent",
-		Limit:   10,
-	})
-
-	require.NoError(t, err)
-	require.NotEmpty(t, candidates)
-	assert.Equal(t, "fts4-direct-recall", candidates[0].ID)
-}
-
-func TestRecallEvidenceFTSKindDetectsFTS4(t *testing.T) {
-	d := testDB(t)
-	requireRecallFTS4(t, d)
-
-	assert.Equal(t, "fts4", d.recallEvidenceFTSKind(t.Context()))
-}
-
 func TestRecallQueryTermsRetainsShortCriticalUITerms(t *testing.T) {
 	got := recallQueryTerms(
 		`I am working with our internal ops portal. On the Incidents list page, ` +
@@ -2578,7 +2518,7 @@ func TestCopyRecallEntriesFrom(t *testing.T) {
 		s.Agent = "codex"
 	})
 
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath), "CopyRecallEntriesFrom")
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath), "CopyRecallEntriesFrom")
 
 	ctx := t.Context()
 	destinationRevision, err := dstDB.RecallCorpusRevision(ctx)
@@ -2660,7 +2600,7 @@ func TestCopyRecallEntriesFromAdvancesQueryRevisionWhenAllEntriesSkipped(
 	require.NoError(t, err)
 	defer dstDB.Close()
 
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	entries, err := dstDB.ListRecallEntries(ctx, RecallQuery{})
 	require.NoError(t, err)
@@ -2715,7 +2655,7 @@ func TestCopyRecallEntriesFromPreservesPendingArchivedEmbeddingChange(
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dstDB.Close() })
 	insertSession(t, dstDB, "s1", "agentsview")
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	var changes []EmbeddableUnit
 	nextWatermark, err := dstDB.ScanRecallEmbeddingUnits(
@@ -2753,7 +2693,7 @@ func TestCopyRecallEntriesFromReconcilesShiftedEvidence(t *testing.T) {
 	insertSession(t, dstDB, "s1", "agentsview")
 	insertMessages(t, dstDB, shifted...)
 
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	got := requireRecallEntry(t, dstDB, "m1")
 	assert.True(t, got.ProvenanceOK)
@@ -2801,7 +2741,7 @@ func TestCopyRecallEntriesFromRevokesIDEEnvelopeSplitEvidence(t *testing.T) {
 	hidden.IsSystem = true
 	insertMessages(t, dstDB, append([]Message{hidden}, oldMessages...)...)
 
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	got := requireRecallEntry(t, dstDB, "m1")
 	assert.False(t, got.ProvenanceOK,
@@ -2831,7 +2771,7 @@ func TestCopyRecallEntriesFromRevokesChangedEvidence(t *testing.T) {
 	insertSession(t, dstDB, "s1", "agentsview")
 	insertMessages(t, dstDB, shifted...)
 
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	got := requireRecallEntry(t, dstDB, "m1")
 	assert.False(t, got.ProvenanceOK)
@@ -2890,7 +2830,7 @@ func TestCopyRecallEntriesFromRevokesDroppedEvidenceSession(t *testing.T) {
 	insertSession(t, dstDB, "entry-session", "agentsview")
 	logs := captureRecallEvidenceLog(t)
 
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	for _, entryID := range []string{"a-entry", "z-entry"} {
 		got := requireRecallEntry(t, dstDB, entryID)
@@ -2941,7 +2881,7 @@ func TestCopyRecallEntriesFromRevokesEvidenceWithoutFingerprint(t *testing.T) {
 	insertSession(t, dstDB, "s1", "agentsview")
 	insertMessages(t, dstDB, messages...)
 
-	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	got := requireRecallEntry(t, dstDB, "m1")
 	assert.False(t, got.ProvenanceOK)
@@ -3049,9 +2989,6 @@ func TestListRecallEvidenceHydratesMoreThanSQLiteBindLimit(t *testing.T) {
 func TestVacuumPreservesRecallEntriesFTSSearchable(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
-	if d.recallFTSKind(ctx) != "fts5" {
-		t.Skip("requires fts5 runtime support")
-	}
 	insertSession(t, d, "s1", "agentsview", func(s *Session) {
 		s.Agent = "codex"
 	})
@@ -3078,13 +3015,13 @@ func TestVacuumPreservesRecallEntriesFTSSearchable(t *testing.T) {
 	q := RecallQuery{Text: "heliotrope"}
 	terms := recallQueryTerms(q.Text)
 
-	pre, err := d.listRecallFTS5Candidates(ctx, q, terms)
+	pre, err := d.listRecallFTSCandidates(ctx, q, terms)
 	require.NoError(t, err, "fts5 search before vacuum")
 	require.Len(t, pre, 1, "fts join finds survivor before vacuum")
 
 	require.NoError(t, d.Vacuum(ctx), "vacuum")
 
-	post, err := d.listRecallFTS5Candidates(ctx, q, terms)
+	post, err := d.listRecallFTSCandidates(ctx, q, terms)
 	require.NoError(t, err, "fts5 search after vacuum")
 	require.Len(t, post, 1, "fts join still finds survivor after vacuum")
 	assert.Equal(t, "m3", post[0].ID)

@@ -3,6 +3,7 @@
      the localized trigger label) and maps it onto kit-ui's sectioned
      item model; all popover markup and behavior live in kit-ui. -->
 <script lang="ts">
+  import { formatCount } from "../../utils/format.js";
   import {
     FilterDropdown,
     type FilterDropdownItem,
@@ -13,10 +14,12 @@
     id?: string;
     name: string;
     count?: number;
+    description?: string;
   }
 
   interface Props {
     label: string;
+    selectedLabel?: string;
     items: FilterItem[];
     /** Comma-separated list of excluded item IDs. */
     excludedCsv: string;
@@ -31,6 +34,7 @@
 
   let {
     label,
+    selectedLabel = "",
     items,
     excludedCsv,
     onToggle,
@@ -67,12 +71,13 @@
   );
 
   const buttonLabel = $derived.by(() => {
+    if (selectedLabel) return `${label}: ${selectedLabel}`;
     if (filteredCount === 0) return m.usage_filter_all({ label });
     if (mode === "include") {
       if (filteredCount === 1) return `${label}: ${excludedCsv}`;
       return m.usage_filter_selected({
         label,
-        countLabel: filteredCount.toLocaleString(),
+        countLabel: formatCount(filteredCount),
       });
     }
     if (visibleCount === 1 && unlistedFilteredCount === 0) {
@@ -92,7 +97,7 @@
     }
     return m.usage_filter_hidden({
       label,
-      countLabel: filteredCount.toLocaleString(),
+      countLabel: formatCount(filteredCount),
     });
   });
 
@@ -106,6 +111,7 @@
       return {
         id,
         label: item.name,
+        description: item.description,
         active: included,
         count: item.count,
         color: color?.(item.name),
@@ -129,9 +135,10 @@
   });
 </script>
 
+<div class="filter-chip-dropdown">
 <FilterDropdown
   label={buttonLabel}
-  active={filteredCount > 0}
+  active={filteredCount > 0 || selectedLabel !== ""}
   showBadge={false}
   sections={[{ items: dropdownItems }]}
   searchable={items.length > 8}
@@ -142,3 +149,34 @@
   selectAllLabel={m.usage_filter_select_all()}
   deselectAllLabel={m.usage_filter_deselect_all()}
 />
+</div>
+
+<style>
+  /* Same chip height as the Typeahead filter chips (shared/FilterChip). */
+  .filter-chip-dropdown {
+    display: contents;
+    --kit-control-height: var(--filter-chip-height);
+  }
+
+  /* Like the Typeahead chips, these carry no funnel: the "Project:" label
+     names the filter, and the page's single filter button keeps the
+     funnel. kit-ui FilterDropdown has no icon-less variant yet. */
+  .filter-chip-dropdown :global(.kit-filter-dropdown__btn > svg.lucide-funnel) {
+    display: none;
+  }
+
+  /* kit-ui FilterDropdown has no chevron; draw the Typeahead chips' 12px
+     muted chevron after the label so every filter chip that opens a list
+     shows it. Kept in step with usage/TokenTypePicker. */
+  .filter-chip-dropdown :global(.kit-filter-dropdown__btn)::after {
+    content: "";
+    flex-shrink: 0;
+    width: 12px;
+    height: 12px;
+    margin-inline-start: -1px;
+    background: var(--text-muted);
+    opacity: 0.8;
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+  }
+</style>

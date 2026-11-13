@@ -158,7 +158,7 @@ func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
 		d, err := db.Open(ctx, filepath.Join(t.TempDir(), "sessions.db"))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = d.Close() })
-		sched, err := setupRecallExtraction(config.Config{}, d, nil)
+		sched, err := setupRecallExtraction(t.Context(), config.Config{}, d, nil)
 		require.NoError(t, err)
 		assert.Nil(t, sched,
 			"a disabled daemon with no generation starts no scheduler")
@@ -184,7 +184,7 @@ func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, d.SoftDeleteSession(ctx, "sess-gone"))
 
-		sched, err := setupRecallExtraction(config.Config{}, d, nil)
+		sched, err := setupRecallExtraction(t.Context(), config.Config{}, d, nil)
 		require.NoError(t, err)
 		require.NotNil(t, sched,
 			"a disabled daemon with a generation runs reconciliation")
@@ -226,7 +226,7 @@ func TestSetupExtractReconcileOnlyWhenDisabled(t *testing.T) {
 
 		cfg := config.Config{}
 		cfg.Recall.Extract.CandidateFindings = config.RecallCandidateFindingsAllow
-		sched, err := setupRecallExtraction(cfg, d, nil)
+		sched, err := setupRecallExtraction(t.Context(), cfg, d, nil)
 		require.NoError(t, err)
 		require.NotNil(t, sched)
 		started, _, err := sched.mgr.TryPass(ctx, extract.PassOptions{})
@@ -298,6 +298,8 @@ func TestRecallExtractDoctorProbesTheModel(t *testing.T) {
 	require.NoError(t, err, "doctor output: %s", out)
 	assert.Contains(t, out, "Fingerprint:")
 	assert.Contains(t, out, "test-model")
+	assert.Contains(t, out, "Concurrency: 1",
+		"an unset concurrency resolves to one session at a time")
 	assert.Contains(t, out, "probe: ok")
 }
 
@@ -374,9 +376,10 @@ func TestResolveExtractDistillationAppliesOverrides(t *testing.T) {
 		FailureBackoff:   "2h",
 		Servers: map[string]config.RecallExtractServerConfig{
 			"local": {
-				Endpoint:  "http://127.0.0.1:30000/v1",
-				APIKeyEnv: "AGENTSVIEW_TEST_RECALL_API_KEY",
-				Timeout:   "120s",
+				Endpoint:    "http://127.0.0.1:30000/v1",
+				APIKeyEnv:   "AGENTSVIEW_TEST_RECALL_API_KEY",
+				Timeout:     "120s",
+				Concurrency: 3,
 			},
 		},
 		Request: config.RecallExtractRequestConfig{
@@ -402,6 +405,8 @@ func TestResolveExtractDistillationAppliesOverrides(t *testing.T) {
 	assert.Equal(t, 30*time.Minute, dist.Quiet)
 	assert.Equal(t, 2*time.Hour, dist.Backoff)
 	assert.Equal(t, time.Hour, dist.Backstop)
+	assert.Equal(t, 3, dist.Concurrency,
+		"the resolved server's concurrency reaches the manager")
 
 	cfg.Enabled = false
 	_, err = resolveExtractDistillation(cfg)
@@ -425,7 +430,7 @@ func TestResolveExtractDistillationLoadsPromptDir(t *testing.T) {
 		BackstopInterval: "1h",
 		FailureBackoff:   "1h",
 		Servers: map[string]config.RecallExtractServerConfig{
-			"local": {Endpoint: "http://127.0.0.1:30000/v1", Timeout: "120s"},
+			"local": {Endpoint: "http://127.0.0.1:30000/v1", Timeout: "120s", Concurrency: 1},
 		},
 		Prompts: config.RecallExtractPromptsConfig{Dir: dir},
 	}
@@ -460,7 +465,7 @@ func TestResolveExtractDistillationRefusesAllRedirects(t *testing.T) {
 		BackstopInterval: "1h",
 		FailureBackoff:   "1h",
 		Servers: map[string]config.RecallExtractServerConfig{
-			"remote": {Endpoint: "https://build-box:30000/v1", Timeout: "120s"},
+			"remote": {Endpoint: "https://build-box:30000/v1", Timeout: "120s", Concurrency: 1},
 		},
 	}
 	dist, err := resolveExtractDistillation(cfg)

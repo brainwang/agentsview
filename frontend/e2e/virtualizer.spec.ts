@@ -20,19 +20,30 @@ const SESSIONS = {
   DELTA_5500: { project: "project-delta", count: 2750 },
 };
 
-function getSessionItem(page: Page, project: string, count: number) {
+async function getSessionItem(page: Page, project: string, count: number) {
+  // Counts are formatted for the app's language: the saved choice, else the
+  // browser's. Below 1,000 the plain number; from 1,000 the compact form
+  // with exactly one decimal. Format the expected count the same way.
+  const shown = await page.evaluate((n) => {
+    const locale = localStorage.getItem("agentsview-locale") ?? navigator.language;
+    const options: Intl.NumberFormatOptions =
+      Math.abs(n) < 1000
+        ? { maximumFractionDigits: 1 }
+        : { notation: "compact", minimumFractionDigits: 1, maximumFractionDigits: 1 };
+    return new Intl.NumberFormat(locale, options).format(n);
+  }, count);
   return page
     .locator(LOC.sessionItem)
     .filter({
       has: page.locator(`${LOC.sessionProject}:text-is("${project}")`),
     })
     .filter({
-      has: page.locator(`${LOC.sessionCount}:text-is("${count}")`),
+      has: page.locator(`${LOC.sessionCount}:text-is("${shown}")`),
     });
 }
 
 async function selectSession(page: Page, project: string, count: number): Promise<string> {
-  const item = getSessionItem(page, project, count);
+  const item = await getSessionItem(page, project, count);
   const sessionId = await item.getAttribute("data-session-id");
   expect(sessionId).toBeTruthy();
   await item.click();
@@ -82,7 +93,7 @@ async function maxVerticalGap(rows: Locator) {
       const match = style.match(/translateY\((\d+(?:\.\d+)?)px\)/);
       return {
         translateY: match ? parseFloat(match[1]!) : 0,
-        height: el.offsetHeight,
+        height: (el as HTMLElement).offsetHeight,
       };
     }),
   );
@@ -145,7 +156,7 @@ test.describe("Virtualizer measurement", () => {
     const container = await waitForLayoutSettle(page, displayRows);
 
     const sumOfHeights = await rows.evaluateAll((els) =>
-      els.reduce((sum, el) => sum + el.offsetHeight, 0),
+      els.reduce((sum, el) => sum + (el as HTMLElement).offsetHeight, 0),
     );
 
     const totalHeight = await container.evaluate((el) => el.getBoundingClientRect().height);

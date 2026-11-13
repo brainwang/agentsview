@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import { CopyButton, EmptyState } from "@kenn-io/kit-ui";
+  import LibraryPageHeader from "../shared/LibraryPageHeader.svelte";
   import { m } from "../../i18n/index.js";
   import {
     ExternalLinkIcon,
@@ -8,6 +9,7 @@
     XIcon,
   } from "../../icons.js";
   import { pins } from "../../stores/pins.svelte.js";
+  import { generatedErrorMessage } from "../../api/runtime.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
@@ -24,6 +26,19 @@
 
   /** Set of expanded pin IDs. */
   let expanded: Set<number> = $state(new Set());
+  let pinError = $state("");
+  let failedPinId: number | null = $state(null);
+
+  async function unpin(pin: import("../../api/generated/index.js").DbPinnedMessage) {
+    pinError = "";
+    try {
+      if (pin.message_key) await pins.removeReference(pin);
+      else await pins.unpin(pin.session_id, pin.message_id);
+    } catch (error) {
+      failedPinId = pin.id;
+      pinError = generatedErrorMessage(error);
+    }
+  }
 
   function toggleExpand(pinId: number) {
     const next = new Set(expanded);
@@ -53,7 +68,8 @@
           ),
       };
     }
-    const s = sessions.sessions.find((s) => s.id === pin.session_id);
+    const row = sessions.byId.get(pin.session_id);
+    const s = row ? sessions.view(row) : undefined;
     return s
       ? {
           project: s.project,
@@ -93,35 +109,41 @@
 </script>
 
 <div class="pinned-page">
-  <div class="pinned-header">
-    <PinIcon size="18" strokeWidth="2" class="pin-icon" aria-hidden="true" />
-    <h2>{m.pinned_title()}</h2>
-    {#if pins.pins.length > 0}
-      <span class="pin-count">{pins.pins.length}</span>
-    {/if}
-  </div>
+  <LibraryPageHeader title={m.pinned_title()}>
+    {#snippet trailing()}
+      {#if pins.pins.length > 0}
+        <span class="pin-count">{pins.pins.length}</span>
+      {/if}
+    {/snippet}
+  </LibraryPageHeader>
 
   {#if pins.loading}
     <div class="loading-state">{m.pinned_loading()}</div>
   {:else if pins.pins.length === 0 && sessions.filters.project}
     <EmptyState
+      align="top"
       title={m.pinned_none_for_project()}
       description={m.pinned_none_for_project_hint()}
-    />
-  {:else if pins.pins.length === 0}
-    <EmptyState title={m.pinned_none()} description={m.pinned_none_hint()}>
+    >
       {#snippet icon()}
-        <PinIcon size="40" strokeWidth="1.6" aria-hidden="true" />
+        <PinIcon size="24" strokeWidth="1.75" />
+      {/snippet}
+    </EmptyState>
+  {:else if pins.pins.length === 0}
+    <EmptyState align="top" title={m.pinned_none()} description={m.pinned_none_hint()}>
+      {#snippet icon()}
+        <PinIcon size="24" strokeWidth="1.75" />
       {/snippet}
     </EmptyState>
   {:else}
     <div class="pin-list">
-      {#each pins.pins as pin (pin.id)}
+      {#each pins.pins as pin (`${pin.session_id}:${pin.message_key ?? pin.id}`)}
         {@const info = getSessionInfo(pin)}
         {@const isExpanded = expanded.has(pin.id)}
         {@const preview = previewContent(pin.content)}
         {@const hasMore = (pin.content?.length ?? 0) > 300}
         <div class="pin-card" class:expanded={isExpanded}>
+          {#if pinError && failedPinId === pin.id}<p role="alert">{pinError}</p>{/if}
           <div class="pin-card-header">
             <span
               class="role-badge"
@@ -136,6 +158,9 @@
             <span class="pin-time">{formatRelativeTime(pin.created_at)}</span>
           </div>
 
+          {#if pin.unresolved}
+            <div class="pin-content-preview">{m.pinned_unresolved()}</div>
+          {/if}
           {#if preview}
             <div class="pin-content-wrap">
               {#if isExpanded && pin.content}
@@ -157,6 +182,7 @@
           <div class="pin-card-footer">
             <button
               class="pin-card-meta"
+              disabled={pin.unresolved}
               onclick={() => navigateToPin(pin.session_id, pin.ordinal)}
               title={m.pinned_go_to_message()}
             >
@@ -183,7 +209,7 @@
               <button
                 class="unpin-btn"
                 title={m.pinned_unpin()}
-                onclick={() => pins.unpin(pin.session_id, pin.message_id)}
+                onclick={() => unpin(pin)}
               >
                 <XIcon size="12" strokeWidth="2.4" aria-hidden="true" />
               </button>
@@ -196,37 +222,17 @@
 </div>
 
 <style>
+  /* Shared library page frame: a 1040px content column. */
   .pinned-page {
-    max-width: 1100px;
+    max-width: 1088px;
     margin: 0 auto;
-    padding: 40px 24px;
-  }
-
-  .pinned-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    margin-bottom: 28px;
-  }
-
-  :global(.pin-icon) {
-    color: var(--accent-blue);
-  }
-
-  .pinned-header h2 {
-    font-size: 20px;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0;
+    padding: 28px 24px;
   }
 
   .pin-count {
-    background: var(--accent-blue);
-    color: var(--accent-blue-foreground);
-    font-size: 11px;
-    font-weight: 600;
-    padding: 1px 7px;
-    border-radius: 10px;
+    color: var(--text-muted);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
   }
 
   .loading-state {

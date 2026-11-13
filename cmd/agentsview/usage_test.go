@@ -641,7 +641,7 @@ func TestLocalTimezoneWindowsNameProducesServerAcceptedUsageQuery(t *testing.T) 
 		dailyUsageQuery{Filter: db.UsageFilter{
 			Timezone: time.Now().Location().String(),
 		}, NoDefaultRange: true})
-	assert.Equal(t, db.DailyUsageResult{}, base)
+	assert.Equal(t, dailyUsageReport{}, base)
 	require.EqualError(t, err,
 		`usage summary: HTTP 400: {"error":"invalid timezone: Eastern Standard Time"}`)
 	t.Logf("base: timezone=%q error=%v", gotTimezones[0], err)
@@ -677,7 +677,7 @@ func TestRunUsageDailyDefaultsToMappedLocalTimezone(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{JSON: true, Offline: false})
+		runUsageDaily(t.Context(), UsageDailyConfig{JSON: true, Offline: false})
 	})
 	assert.Equal(t, "America/New_York", gotTimezone)
 }
@@ -696,7 +696,7 @@ func TestRunUsageStatuslineDefaultsToMappedLocalTimezone(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	captureStdout(t, func() {
-		runUsageStatusline(UsageStatuslineConfig{JSON: true})
+		runUsageStatusline(t.Context(), UsageStatuslineConfig{JSON: true})
 	})
 	assert.Equal(t, "America/New_York", gotTimezone)
 }
@@ -839,7 +839,7 @@ func TestRunUsageDailyUsesDiscoveredDaemon(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	out := captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON:     true,
 			Since:    "2026-06-01",
 			Until:    "2026-06-02",
@@ -867,7 +867,7 @@ func TestRunUsageDailyResolvesDurationSince(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	_ = captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON:     true,
 			Since:    "14d",
 			Timezone: "UTC",
@@ -984,7 +984,7 @@ func TestRunUsageDailyTableSkipsDaemonSessionCounts(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	out := captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{Timezone: "UTC"})
+		runUsageDaily(t.Context(), UsageDailyConfig{Timezone: "UTC"})
 	})
 
 	assert.Equal(t, "false", gotSessionCounts)
@@ -1003,7 +1003,7 @@ func TestRunUsageDailyBreakdownUsesDaemonBreakdowns(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	_ = captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON:      true,
 			Breakdown: true,
 			Timezone:  "UTC",
@@ -1025,7 +1025,7 @@ func TestRunUsageDailyDefaultRangeUsesDaemonDefaults(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	out := captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON:     true,
 			Timezone: "UTC",
 		})
@@ -1049,7 +1049,7 @@ func TestRunUsageDailyAllPreservesEmptyRangeWithDiscoveredDaemon(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	out := captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON:     true,
 			All:      true,
 			Timezone: "UTC",
@@ -1074,7 +1074,7 @@ func TestRunUsageDailyNoSyncUsesDiscoveredDaemon(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	out := captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON:     true,
 			NoSync:   true,
 			Since:    "2026-06-01",
@@ -1097,7 +1097,7 @@ func TestRunUsageDailyOfflineUsesReadOnlyDBWhenWriteLockHeld(t *testing.T) {
 	defer func() { require.NoError(t, lock.Close()) }()
 
 	out := captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON:     true,
 			Offline:  true,
 			Since:    "2026-04-01",
@@ -1150,7 +1150,7 @@ func TestArchiveQueryBackendNoSyncStartsNoSyncDaemonForDailyUsage(t *testing.T) 
 	newAgentDataDir(t)
 	var started bool
 	stubStartBackgroundServeForTransport(t, func(
-		_ context.Context, cfg *config.Config, _ time.Duration,
+		_ context.Context, cfg *config.Config, _ time.Duration, _ bool,
 	) (*DaemonRuntime, error) {
 		started = true
 		assert.True(t, cfg.NoSync)
@@ -1291,7 +1291,7 @@ func TestUsageDailyJSONIncludesExportMetadata(t *testing.T) {
 	require.NoError(t, database.Close())
 
 	out := captureStdout(t, func() {
-		runUsageDaily(UsageDailyConfig{
+		runUsageDaily(t.Context(), UsageDailyConfig{
 			JSON: true, Since: "2026-06-01", Until: "2026-06-01",
 			Timezone: "UTC", Offline: true, NoSync: true,
 		})
@@ -1327,6 +1327,47 @@ func TestUsageDailyJSONIncludesExportMetadata(t *testing.T) {
 	assert.Equal(t, 2, got.SessionCounts.Total)
 	assert.Equal(t, map[string]int{projectKey: 2},
 		got.SessionCounts.ByProject)
+}
+
+func TestUsageDailyJSONPricesCodexAutoReviewAsLuna(t *testing.T) {
+	dataDir := testDataDir(t)
+	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
+	require.NoError(t, pricingrefresh.SeedFallback(database))
+	started := "2026-10-01T12:00:00Z"
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID: "usage-auto-review", Project: "shared-project", Machine: "test",
+		Agent: "codex", StartedAt: &started, EndedAt: &started,
+		CreatedAt: started, MessageCount: 1, RelationshipType: "root",
+		DataVersion: 1,
+	}))
+	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+		SessionID: "usage-auto-review", Ordinal: 0, Role: "assistant",
+		Timestamp: started, Model: "codex-auto-review",
+		TokenUsage: jsontext.Value(`{"cache_read_input_tokens":900000,"input_tokens":100000,"output_tokens":10000}`),
+	}}))
+	require.NoError(t, database.Close())
+
+	out := captureStdout(t, func() {
+		runUsageDaily(t.Context(), UsageDailyConfig{
+			JSON: true, Breakdown: true, Since: "2026-10-01",
+			Until: "2026-10-01", Timezone: "UTC", Offline: true, NoSync: true,
+		})
+	})
+
+	var got db.DailyUsageResult
+	require.NoError(t, json.Unmarshal([]byte(out), &got))
+	require.Len(t, got.Daily, 1)
+	require.Len(t, got.Daily[0].ModelBreakdowns, 1)
+	breakdown := got.Daily[0].ModelBreakdowns[0]
+	assert.Equal(t, "codex-auto-review", breakdown.ModelName)
+	assert.Positive(t, breakdown.Cost.Microdollars)
+	require.NotNil(t, got.Pricing)
+	require.Contains(t, got.Pricing.Models, "codex-auto-review")
+	assert.NotContains(t, got.Pricing.Models, "gpt-5.6-luna")
+	resolutions := got.Pricing.Models["codex-auto-review"].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, "gpt-5.6-luna", resolutions[0].PricedModel)
+	assert.NotNil(t, resolutions[0].MatchedPattern)
 }
 
 func seedUsageDailyExportMetadataFixture(
@@ -1822,7 +1863,7 @@ func TestRunUsageDailyHintsNoTokenDataForCopilot(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	stderr := captureStderr(t, func() {
-		runUsageDaily(UsageDailyConfig{Agent: "copilot", Timezone: "UTC"})
+		runUsageDaily(t.Context(), UsageDailyConfig{Agent: "copilot", Timezone: "UTC"})
 	})
 
 	assert.Contains(t, stderr, "Copilot")
@@ -1837,7 +1878,7 @@ func TestRunUsageDailyNoHintWithoutAgentFilter(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	stderr := captureStderr(t, func() {
-		runUsageDaily(UsageDailyConfig{Timezone: "UTC"})
+		runUsageDaily(t.Context(), UsageDailyConfig{Timezone: "UTC"})
 	})
 
 	assert.NotContains(t, stderr, "token")
@@ -1851,7 +1892,7 @@ func TestRunUsageDailyNoHintWhenDataPresent(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	stderr := captureStderr(t, func() {
-		runUsageDaily(UsageDailyConfig{Agent: "codex", Timezone: "UTC"})
+		runUsageDaily(t.Context(), UsageDailyConfig{Agent: "codex", Timezone: "UTC"})
 	})
 
 	assert.NotContains(t, stderr, "token-usage")

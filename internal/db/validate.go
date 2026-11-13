@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/stringutil"
+	"go.kenn.io/agentsview/internal/usagefacts"
 )
 
 // This file is the single centralized validation and sanitization pass
@@ -31,7 +32,8 @@ import (
 //     terminal escape through intact.
 //   - Model: clamped to MaxModelLen bytes. Real model ids are well under
 //     that; a verified repro pushed a multi-megabyte printable string
-//     through as a model id.
+//     through as a model id. A usage event with a cost but no model is
+//     labeled usagefacts.UnknownModel so usage reads keep it.
 //   - Token counts: clamped to maxPlausibleTokens. Implausible values
 //     (e.g. a nanosecond-latency counter misread as a token field) are
 //     bounded rather than stored verbatim.
@@ -184,6 +186,7 @@ func SanitizeMessage(m *Message) ValidationStats {
 	sanitizeLengthTrackedString(
 		&m.Content, &m.ContentLength, &stats,
 	)
+	sanitizeStringPtrField(m.DialogueText, &stats)
 	origThinkingLen := len(m.ThinkingText)
 	sanitizeStringField(&m.ThinkingText, &stats)
 	if removed := origThinkingLen - len(m.ThinkingText); removed > 0 {
@@ -199,6 +202,9 @@ func SanitizeMessage(m *Message) ValidationStats {
 			m.ContentLength -= removed
 		}
 	}
+	// Keep the parser's classification even when dialogue equals Content.
+	// NULL also represents older or unclassified messages, so storage drops
+	// an equal copy only with a marker (see StoredDialogue).
 	sanitizeStringField(&m.ClaudeMessageID, &stats)
 	sanitizeStringField(&m.ClaudeRequestID, &stats)
 	sanitizeStringField(&m.SourceType, &stats)
@@ -275,6 +281,12 @@ func SanitizeUsageEvent(ev *UsageEvent) ValidationStats {
 	if ClampModel(&ev.Model) {
 		stats.ModelClamped++
 	}
+	// Usage reads require a model. A costed event that names none goes to
+	// the unknown-model bucket so its tokens and cost still count; it has no
+	// catalog rate, so only its own cost prices it.
+	if ev.Model == "" && ev.Cost != nil {
+		ev.Model = usagefacts.UnknownModel
+	}
 
 	if clampUsageEventTokens(ev.Source, &ev.InputTokens) {
 		stats.TokensClamped++
@@ -329,6 +341,7 @@ func SanitizeSession(s *Session) ValidationStats {
 	var stats ValidationStats
 
 	sanitizeStringField(&s.Project, &stats)
+	sanitizeStringField(&s.GroupKey, &stats)
 	sanitizeStringField(&s.Machine, &stats)
 	sanitizeStringField(&s.Agent, &stats)
 	sanitizeStringField(&s.AgentLabel, &stats)
@@ -336,6 +349,11 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringField(&s.SessionKind, &stats)
 	sanitizeStringField(&s.Cwd, &stats)
 	sanitizeStringField(&s.GitBranch, &stats)
+	for i := range s.PRLinks {
+		sanitizeStringField(&s.PRLinks[i].URL, &stats)
+		sanitizeStringField(&s.PRLinks[i].Host, &stats)
+		sanitizeStringField(&s.PRLinks[i].Repository, &stats)
+	}
 	sanitizeStringField(&s.SourceSessionID, &stats)
 	sanitizeStringField(&s.SourceVersion, &stats)
 	sanitizeStringField(&s.TranscriptFidelity, &stats)
@@ -455,7 +473,7 @@ func clampTokens(p *int) bool {
 // BlankImplausibleTimestamp blanks a stored timestamp string in place
 // when it parses to a time outside the plausibility window, returning
 // whether it changed. An empty string is left empty (no change), and an
-// unparseable-but-nonempty value is left as-is: downstream localTime
+// unparseable-but-nonempty value is left as-is: downstream LocalTime
 // already treats both as invalid, so blanking only the parseable-yet-
 // absurd case avoids reformatting otherwise-untouched values.
 func BlankImplausibleTimestamp(p *string) bool {
@@ -488,7 +506,7 @@ func BlankImplausibleTimestampPtr(p *string) (*string, bool) {
 }
 
 // ParseStoredTimestamp parses a timestamp stored in the same formats
-// the read path (db.localTime) accepts.
+// the read path (db.LocalTime) accepts.
 func ParseStoredTimestamp(s string) (time.Time, bool) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, true

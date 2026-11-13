@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/readbase"
+	"go.kenn.io/agentsview/internal/readbase/readbasetest"
 	"go.kenn.io/agentsview/internal/storage"
 )
 
@@ -179,4 +181,93 @@ func TestDuckGetMessagesWindow_EmptyRolesEquivalentToGetMessages(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, direct, windowed,
 		"empty Roles should behave identically to GetMessages")
+}
+
+func TestDuckGetMessagesWindow_ReportsRevisionWithRows(t *testing.T) {
+	ctx := t.Context()
+	store := newDuckWindowStore(t, func(local *db.DB) {
+		seedDuckWindowMessages(t, local, "sRev")
+	})
+	sess, err := store.GetSession(ctx, "sRev")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	require.NotEmpty(t, *sess.TranscriptRevision)
+
+	from := 4
+	revision := ""
+	msgs, err := store.GetMessagesWindow(ctx, "sRev", db.MessageWindow{
+		From: &from, Limit: 3, Asc: true,
+		Roles:            []string{"user", "assistant"},
+		ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{5, 6, 7}, duckOrdinalsOf(msgs))
+	assert.Equal(t, *sess.TranscriptRevision, revision,
+		"linear page must report the session revision it was read at")
+
+	anchor := 6
+	revision = ""
+	msgs, err = store.GetMessagesWindow(ctx, "sRev", db.MessageWindow{
+		Around: &anchor, Before: 2, After: 2,
+		Roles:            []string{"user", "assistant"},
+		ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{3, 5, 6, 7, 8}, duckOrdinalsOf(msgs))
+	assert.Equal(t, *sess.TranscriptRevision, revision,
+		"around window must report the session revision it was read at")
+
+	revision = ""
+	msgs, err = store.GetMessagesWindow(ctx, "missing", db.MessageWindow{
+		Around: &anchor, Before: 2, After: 2, ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, msgs)
+	assert.Empty(t, revision, "no rows means no revision to describe them")
+}
+
+func TestDuckGetMessagesWindowReadsOnlyWindowToolRows(t *testing.T) {
+	ctx := t.Context()
+	store := newDuckWindowStore(t, func(local *db.DB) {
+		seedDuckWindowMessages(t, local, "tools")
+		msgs, err := local.GetAllMessages(ctx, "tools")
+		require.NoError(t, err)
+		for i := range msgs {
+			if msgs[i].Role == "assistant" {
+				msgs[i].ToolCalls = []db.ToolCall{{
+					ToolName: "Read", Category: "Read", ResultContent: "result", ResultContentLength: 6,
+					ResultEvents: []db.ToolResultEvent{{Source: "tool", Status: "complete", Content: "result", ContentLength: 6}},
+				}}
+			}
+		}
+		sess, err := local.GetSessionFull(ctx, "tools")
+		require.NoError(t, err)
+		_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{Session: *sess, Messages: msgs, ReplaceMessages: true, DataVersion: 1}})
+		require.NoError(t, err)
+	})
+	all, err := store.GetAllMessages(ctx, "tools")
+	require.NoError(t, err)
+	require.Len(t, all, 12)
+	require.Len(t, all[6].ToolCalls, 1)
+	assert.Equal(t, "result", all[6].ToolCalls[0].ResultContent)
+	require.Len(t, all[6].ToolCalls[0].ResultEvents, 1)
+	from := 5
+	recorder := &readbasetest.RecordingSessions{SessionsBackend: sessionsSQL{store}, T: t}
+	reader := readbase.NewSessions(recorder)
+	for _, roles := range [][]string{nil, {"assistant"}} {
+		recorder.ToolOrdinals = nil
+		window, err := reader.GetMessagesWindow(ctx, "tools", db.MessageWindow{From: &from, Limit: 4, Asc: true, Roles: roles})
+		require.NoError(t, err)
+		if roles == nil {
+			assert.Equal(t, []int{5, 6, 7, 8}, duckOrdinalsOf(window))
+			assert.Equal(t, [][]int{{6, 8}, {6, 8}}, recorder.ToolOrdinals)
+		} else {
+			assert.Equal(t, []int{6, 8, 11}, duckOrdinalsOf(window))
+			assert.Equal(t, [][]int{{6, 8, 11}, {6, 8, 11}}, recorder.ToolOrdinals)
+		}
+		for _, msg := range window {
+			assert.Equal(t, all[msg.Ordinal].ToolCalls, msg.ToolCalls)
+		}
+	}
 }

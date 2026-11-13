@@ -18,15 +18,13 @@ func (s *Store) GetTrendsTerms(
 	if granularity == "" {
 		granularity = "week"
 	}
+	acc := db.NewTrendWorkers(ctx, f.From, f.To, granularity, terms)
+	defer func() {
+		if acc != nil {
+			_, _ = acc.Finish()
+		}
+	}()
 	loc := analyticsLocation(f)
-	buckets := db.TrendBucketRange(f.From, f.To, granularity)
-	bucketIndex := trendBucketIndex(buckets)
-	counts := make([][]int, len(terms))
-	for i := range counts {
-		counts[i] = make([]int, len(buckets))
-	}
-	messageCounts := make([]int, len(buckets))
-
 	sessionFilter := f
 	sessionFilter.From = ""
 	sessionFilter.To = ""
@@ -35,25 +33,52 @@ func (s *Store) GetTrendsTerms(
 	sessionFilter.Model = ""
 	pb := &paramBuilder{}
 	preds := []string{buildAnalyticsWhereWithDate(
-		sessionFilter, "", pb, false, "s.id",
+		sessionFilter, "", pb, false, "s.id", s.sessionDialect(),
 	)}
-	flt := messageScopeFilter(f)
+	// The window bounds are inlined as literals. pgx caches prepared
+	// statements per connection, and from the sixth run PostgreSQL may switch
+	// to a generic plan that cannot see how narrow the window is.
+	if sessionWindow := pgAnalyticsMessageWindowLiteral(f, pgDateCol); sessionWindow != "" {
+		messageWindow := pgAnalyticsMessageWindowLiteral(f, "wm.timestamp")
+		preds = append(preds, "s.id IN (SELECT sessions.id FROM sessions WHERE ("+sessionWindow+" OR EXISTS (SELECT 1 FROM messages wm WHERE wm.session_id = sessions.id AND wm.timestamp IS NOT NULL AND "+messageWindow+")))")
+	}
+	flt := f.MessageScopeFilter()
 	modelFiltering := len(flt.Models) > 0
-	query := `SELECT m.session_id, m.ordinal, m.role, m.is_system,
-			COALESCE(m.model, ''), m.content,
+	content := "m.content"
+	if inWindow := pgAnalyticsMessageWindowLiteral(f, "COALESCE(m.timestamp, s.started_at, s.created_at)"); inWindow != "" {
+		rowWindow := inWindow
+		if modelFiltering {
+			content = "CASE WHEN " + inWindow + " THEN m.content ELSE '' END"
+			rowWindow = "(" + inWindow + " OR m.role = 'assistant')"
+		}
+		preds = append(preds, rowWindow)
+	}
+	// A model filter credits a prompt to the next assistant reply, so the
+	// scope reducer needs rows in order. Without one, rows count on their
+	// own, and the sort spills to disk on large ranges.
+	tail := ""
+	if modelFiltering {
+		tail = `
+		ORDER BY m.session_id, m.ordinal`
+	}
+	columns := `m.content, COALESCE(m.timestamp, s.started_at, s.created_at)`
+	if modelFiltering {
+		columns = `m.session_id, m.ordinal, m.role, m.is_system,
+			m.model, ` + content + `,
 			COALESCE(TO_CHAR(m.timestamp AT TIME ZONE 'UTC',
 				'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
 			COALESCE(TO_CHAR(s.started_at AT TIME ZONE 'UTC',
 				'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
 			COALESCE(TO_CHAR(s.created_at AT TIME ZONE 'UTC',
-				'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
+				'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')`
+	}
+	query := `SELECT ` + columns + `
 		FROM sessions s
 		JOIN messages m ON m.session_id = s.id
 		WHERE ` + strings.Join(preds, " AND ") + `
 			AND m.role IN ('user', 'assistant')
 			AND m.is_system = FALSE
-			AND ` + db.PostgresSystemPrefixSQL("m.content", "m.role") + `
-		ORDER BY m.session_id, m.ordinal`
+			AND ` + db.PostgresSystemPrefixSQL("m.content", "m.role") + tail
 
 	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
 	if err != nil {
@@ -71,61 +96,36 @@ func (s *Store) GetTrendsTerms(
 		startedAt string
 		createdAt string
 	}
-	processRow := func(row trendRow) {
-		msgTime, ok := trendMessageLocalTime(row.msgTS, row.startedAt, row.createdAt, loc)
-		if !ok {
-			return
-		}
-		msgDate := msgTime.Format("2006-01-02")
-		if !inDateRange(msgDate, f.From, f.To) {
-			return
-		}
-		bucketDate := db.TrendBucketDate(msgTime, loc, granularity)
-		bucket, ok := bucketIndex[bucketDate]
-		if !ok {
-			return
-		}
-		messageCounts[bucket]++
-		for i, term := range terms {
-			count := db.CountTrendOccurrences(row.content, term)
-			if count > 0 {
-				counts[i][bucket] += count
-			}
-		}
-	}
-	rowStartedAt := make(map[string]string)
-	rowCreatedAt := make(map[string]string)
 	emit := func(m db.ScopedMessage) {
-		processRow(trendRow{
-			sessionID: m.SessionID,
-			role:      m.Role,
-			isSystem:  m.IsSystem,
-			content:   m.Content,
-			msgTS:     m.Timestamp,
-			startedAt: rowStartedAt[m.SessionID],
-			createdAt: rowCreatedAt[m.SessionID],
-		})
+		if m.HasLocalTime {
+			acc.Add(m.Content, m.LocalTime)
+		}
 	}
 	reducer := db.NewScopeReducer(flt, emit)
 
 	for rows.Next() {
 		var row trendRow
 		var ordinal int
+		if !modelFiltering {
+			var timestamp *time.Time
+			if err := rows.Scan(&row.content, &timestamp); err != nil {
+				return db.TrendsTermsResponse{}, fmt.Errorf("scanning trends term row: %w", err)
+			}
+			if timestamp != nil {
+				local := timestamp.In(loc)
+				if flt.MatchesDayHour(local, true) {
+					acc.Add(row.content, local)
+				}
+			}
+			continue
+		}
 		if err := rows.Scan(
 			&row.sessionID, &ordinal, &row.role, &row.isSystem, &row.model,
 			&row.content, &row.msgTS, &row.startedAt, &row.createdAt,
 		); err != nil {
 			return db.TrendsTermsResponse{}, fmt.Errorf("scanning trends term row: %w", err)
 		}
-		if !modelFiltering {
-			msgTime, ok := trendMessageLocalTime(row.msgTS, row.startedAt, row.createdAt, loc)
-			if ok && flt.MatchesDayHour(msgTime, true) {
-				processRow(row)
-			}
-			continue
-		}
-		rowStartedAt[row.sessionID] = row.startedAt
-		rowCreatedAt[row.sessionID] = row.createdAt
+
 		msgTime, has := trendMessageLocalTime(row.msgTS, row.startedAt, row.createdAt, loc)
 		if err := reducer.Push(db.MessageInput{
 			SessionID:    row.sessionID,
@@ -145,9 +145,9 @@ func (s *Store) GetTrendsTerms(
 		return db.TrendsTermsResponse{}, fmt.Errorf("iterating trends term rows: %w", err)
 	}
 
-	return db.BuildTrendsTermsResponse(
-		f.From, f.To, granularity, buckets, terms, counts, messageCounts,
-	), nil
+	response, err := acc.Finish()
+	acc = nil
+	return response, err
 }
 
 func trendMessageLocalTime(
@@ -157,17 +157,9 @@ func trendMessageLocalTime(
 	loc *time.Location,
 ) (time.Time, bool) {
 	for _, ts := range []string{messageTS, startedAt, createdAt} {
-		if t, ok := localTime(ts, loc); ok {
+		if t, ok := db.LocalTime(ts, loc); ok {
 			return t, true
 		}
 	}
 	return time.Time{}, false
-}
-
-func trendBucketIndex(buckets []db.TrendBucket) map[string]int {
-	index := make(map[string]int, len(buckets))
-	for i, bucket := range buckets {
-		index[bucket.Date] = i
-	}
-	return index
 }

@@ -1,15 +1,12 @@
 import { test, expect } from "@playwright/test";
 import { SessionsPage } from "./pages/sessions-page";
 
-// The test fixture seeds 12 root sessions with messages (including the
-// duration, recent-edits, and project-reclassification fixtures), plus 3 subagent
-// sessions, 1 fork, and 1 empty session. Navigation surfaces (session
-// list, status bar) show only the 12 root sessions. The analytics
-// summary additionally counts the 3 subagents, whose messages and
-// tokens are real spend, so it shows 13. Forks and empty sessions are
-// excluded everywhere.
-const EXPECTED_ROOT_SESSIONS = 12;
-const EXPECTED_ANALYTICS_SESSIONS = 15; // 12 root + 3 subagents
+// The test fixture seeds 13 root sessions with messages, plus 3 subagent
+// sessions, 1 fork, and 1 empty session. Navigation surfaces show only the
+// 13 root sessions. Analytics also counts the 3 subagents, so it shows 16.
+// Forks and empty sessions are excluded everywhere.
+const EXPECTED_ROOT_SESSIONS = 13;
+const EXPECTED_ANALYTICS_SESSIONS = 16; // 13 root + 3 subagents
 
 test.describe("Session count consistency", () => {
   let sp: SessionsPage;
@@ -39,15 +36,9 @@ test.describe("Session count consistency", () => {
     const summaryCards = page.locator(".summary-cards");
     await expect(summaryCards).toBeVisible({ timeout: 5_000 });
 
-    // Wait for the summary to finish loading.
     const sessionsCard = summaryCards
       .locator(".card")
       .filter({ has: page.locator(".card-label", { hasText: /^Sessions$/ }) });
-    await expect(sessionsCard.locator(".card-value")).not.toHaveText("--", { timeout: 10_000 });
-    await expect(sessionsCard.locator(".skeleton-value")).toHaveCount(0, { timeout: 5_000 });
-
-    const cardValue = await sessionsCard.locator(".card-value").textContent();
-    const analyticsCount = parseInt(cardValue?.replace(/,/g, "") ?? "0", 10);
 
     // Navigation surfaces (list, status bar) show only root sessions
     // and must agree. The analytics summary counts subagents on top, so
@@ -55,6 +46,8 @@ test.describe("Session count consistency", () => {
     // sessions stay excluded everywhere.
     expect(listCount, "session list").toBe(EXPECTED_ROOT_SESSIONS);
     expect(statsCount, "status bar").toBe(EXPECTED_ROOT_SESSIONS);
-    expect(analyticsCount, "analytics summary").toBe(EXPECTED_ANALYTICS_SESSIONS);
+    await expect(sessionsCard.locator(".card-value"), "analytics summary").toHaveText(
+      String(EXPECTED_ANALYTICS_SESSIONS),
+    );
   });
 });

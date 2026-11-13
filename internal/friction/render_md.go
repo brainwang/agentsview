@@ -1,0 +1,210 @@
+package friction
+
+import (
+	"bytes"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+)
+
+// DigestSnapshot holds one day's findings in detector order.
+type DigestSnapshot struct {
+	Date            string
+	Signals         []Signal
+	P0Alerts        map[string][]string
+	SessionsScanned int
+}
+
+// RenderMarkdown renders the Friction Log with signals grouped by kind.
+func RenderMarkdown(s DigestSnapshot) []byte {
+	groups := groupByKind(s.Signals)
+	corrections, errs := groups[KindCorrection], groups[KindError]
+	workarounds, deferrals := groups[KindWorkaround], groups[KindDeferral]
+	frustrations, interruptions := groups[KindFrustration], groups[KindInterruption]
+	patterns := groups[KindPattern]
+	total := len(corrections) + len(errs) + len(workarounds) + len(deferrals) +
+		len(frustrations) + len(interruptions) + len(patterns) + len(groups[KindDiagnostic])
+
+	var b bytes.Buffer
+	b.WriteString("---\n")
+	fmt.Fprintf(&b, "date: %s\n", s.Date)
+	fmt.Fprintf(&b, "signals_captured: %d\n", total)
+	fmt.Fprintf(&b, "p0_count: %d\n", len(s.P0Alerts))
+	fmt.Fprintf(&b, "corrections: %d\n", len(corrections))
+	fmt.Fprintf(&b, "errors: %d\n", len(errs))
+	fmt.Fprintf(&b, "workarounds: %d\n", len(workarounds))
+	fmt.Fprintf(&b, "deferrals: %d\n", len(deferrals))
+	fmt.Fprintf(&b, "patterns: %d\n", len(patterns))
+	fmt.Fprintf(&b, "frustrations: %d\n", len(frustrations))
+	fmt.Fprintf(&b, "interruptions: %d\n", len(interruptions))
+	if n := len(groups[KindDiagnostic]); n > 0 {
+		fmt.Fprintf(&b, "diagnostics: %d\n", n)
+	}
+	b.WriteString("---\n\n")
+	fmt.Fprintf(&b, "# Friction Log — %s\n\n", s.Date)
+
+	b.WriteString("## P0 Alerts\n\n")
+	if len(s.P0Alerts) == 0 {
+		b.WriteString("_No P0 alerts._\n\n")
+	} else {
+		for _, tool := range slices.Sorted(maps.Keys(s.P0Alerts)) {
+			sessions := make([]string, 0, len(s.P0Alerts[tool]))
+			for _, id := range s.P0Alerts[tool] {
+				sessions = append(sessions, code(id))
+			}
+			fmt.Fprintf(&b, "- **P0 ALERT**: %s failed in %d distinct sessions: %s\n",
+				code(tool), len(sessions), strings.Join(sessions, ", "))
+		}
+		b.WriteByte('\n')
+	}
+
+	section(&b, "Corrections", "_No corrections detected._", corrections, func(sig Signal) string {
+		return fmt.Sprintf("- %s%s — %s\n",
+			dimsPrefix(sig.Dims), code(sig.SubjectID), code(sig.Text))
+	})
+	section(&b, "Errors", "_No errors detected._", errs, func(sig Signal) string {
+		return strings.TrimRight(fmt.Sprintf("- %s%s / %s: %s",
+			dimsPrefix(sig.Dims), code(sig.SubjectID), code(sig.ToolName),
+			code(sig.Text)), " ") + "\n"
+	})
+	section(&b, "Workarounds", "_No workarounds detected._", workarounds, func(sig Signal) string {
+		return fmt.Sprintf("- %s%s pattern=%s: %s\n",
+			dimsPrefix(sig.Dims), code(sig.SubjectID), code(sig.Label), code(sig.Text))
+	})
+	section(&b, "Deferrals", "_No deferrals detected._", deferrals, func(sig Signal) string {
+		return fmt.Sprintf("- %s%s pattern=%s\n", dimsPrefix(sig.Dims), code(sig.SubjectID), code(sig.Label))
+	})
+	section(&b, "Patterns", "_No patterns detected._", patterns, func(sig Signal) string {
+		return fmt.Sprintf("- %s%s kind=%s: %s\n",
+			dimsPrefix(sig.Dims), code(sig.SubjectID), code(sig.Label), code(sig.Evidence))
+	})
+	section(&b, "Frustration", "_No frustration detected._", frustrations, func(sig Signal) string {
+		return fmt.Sprintf("- %s%s — %s\n",
+			dimsPrefix(sig.Dims), code(sig.SubjectID), code(sig.Text))
+	})
+	b.WriteString("## Interruptions\n\n")
+	if groups := groupInterruptions(interruptions); len(groups) == 0 {
+		b.WriteString("_No interruptions detected._\n")
+	} else {
+		for _, g := range groups {
+			fmt.Fprintf(&b, "- %s%s interruptions=%d\n", dimsPrefix(g.first.Dims), code(g.first.SubjectID), g.n)
+		}
+	}
+
+	if diagnostics := GroupDiagnostics(groups[KindDiagnostic]); len(diagnostics) > 0 {
+		b.WriteString("\n## Diagnostics\n\n")
+		for _, group := range diagnostics {
+			fmt.Fprintf(&b, "- %s: %s x%d\n", code(group.Source), code(group.Message), group.Count)
+		}
+	}
+	return b.Bytes()
+}
+
+// DiagnosticGroup counts diagnostic events with the same source and message.
+// The Markdown, the digest API, and the model summary all use this grouping.
+type DiagnosticGroup struct {
+	Source  string `json:"source"`
+	Message string `json:"message"`
+	Count   int    `json:"count"`
+}
+
+// GroupDiagnostics groups the diagnostic signals' source and message pairs in
+// order of first occurrence. Other kinds are skipped.
+func GroupDiagnostics(signals []Signal) []DiagnosticGroup {
+	groups := []DiagnosticGroup{}
+	index := map[[2]string]int{}
+	for _, signal := range signals {
+		if signal.Kind != KindDiagnostic {
+			continue
+		}
+		key := [2]string{signal.Label, signal.Text}
+		if i, ok := index[key]; ok {
+			groups[i].Count++
+		} else {
+			index[key] = len(groups)
+			groups = append(groups, DiagnosticGroup{Source: signal.Label, Message: signal.Text, Count: 1})
+		}
+	}
+	return groups
+}
+
+func section(b *bytes.Buffer, title, placeholder string, sigs []Signal, line func(Signal) string) {
+	b.WriteString("## " + title + "\n\n")
+	if len(sigs) == 0 {
+		b.WriteString(placeholder + "\n\n")
+		return
+	}
+	for _, sig := range sigs {
+		b.WriteString(line(sig))
+	}
+	b.WriteByte('\n')
+}
+
+type interruptionGroup struct {
+	first Signal // dims and subject come from the session's first signal
+	n     int
+}
+
+// groupInterruptions folds interruption signals into one entry per
+// subject, in order of first appearance (run order).
+func groupInterruptions(sigs []Signal) []interruptionGroup {
+	groups := make([]interruptionGroup, 0)
+	index := map[string]int{}
+	for _, sig := range sigs {
+		if i, ok := index[sig.SubjectID]; ok {
+			groups[i].n++
+			continue
+		}
+		index[sig.SubjectID] = len(groups)
+		groups = append(groups, interruptionGroup{first: sig, n: 1})
+	}
+	return groups
+}
+
+// dimsPrefix ports dims_prefix (digest.rs:1064-1085). An empty field is
+// jilog's None.
+func dimsPrefix(d Dims) string {
+	var b strings.Builder
+	if d.Seat != "" {
+		b.WriteString(code("seat:"+d.Seat) + " ")
+	}
+	if d.Agent != "" {
+		b.WriteString(code("agent:"+d.Agent) + " ")
+	}
+	if d.Machine != "" {
+		b.WriteString(code("machine:"+d.Machine) + " ")
+	}
+	return b.String()
+}
+
+func code(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = SanitizeDisplay(s)
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			longest = max(longest, run)
+		} else {
+			run = 0
+		}
+	}
+	fence := strings.Repeat("`", longest+1)
+	// Separate boundary backticks and preserve spaces that Markdown would strip.
+	if strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") ||
+		(strings.HasPrefix(s, " ") && strings.HasSuffix(s, " ") && strings.Trim(s, " ") != "") {
+		s = " " + s + " "
+	}
+	return fence + s + fence
+}
+
+func groupByKind(sigs []Signal) map[Kind][]Signal {
+	groups := make(map[Kind][]Signal)
+	for _, sig := range sigs {
+		groups[sig.Kind] = append(groups[sig.Kind], sig)
+	}
+	return groups
+}

@@ -31,9 +31,9 @@ func newAmpSourceSet(roots []string) JSONLSourceSet {
 }
 
 func ampParseFile(
-	_ context.Context, path string, req ParseRequest,
+	ctx context.Context, path string, req ParseRequest,
 ) ([]ParseResult, []string, error) {
-	sess, msgs, err := parseAmpSession(path, req.Machine)
+	sess, msgs, err := parseAmpSession(ctx, path, req.Machine)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -55,6 +55,7 @@ func ampProviderCapabilities() Capabilities {
 		Source: jsonlFileProviderSourceCapabilities(),
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			Thinking:             CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,

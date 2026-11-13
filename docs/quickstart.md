@@ -3,6 +3,9 @@ title: Quick Start
 description: Get AgentsView running in under a minute
 ---
 
+CLI examples use the commands from 0.47.0 and later. For older releases, use
+the legacy names in the [command migration](commands.md#command-migration).
+
 ## Install
 
 ### Desktop App
@@ -34,6 +37,38 @@ To keep AgentsView out of the Dock and Cmd-Tab while its window is closed, turn
 on **Hide from Dock and Cmd-Tab when window closed** in the menu-bar menu. This
 option is off by default and stays set across relaunches.
 
+#### macOS: use the bundled CLI
+
+The macOS app includes the `agentsview` CLI at
+`/Applications/AgentsView.app/Contents/MacOS/agentsview`. Homebrew Cask links it
+into Homebrew's `bin` directory automatically.
+
+If you installed the `.app` from a downloaded `.dmg`, move it to Applications,
+then add its CLI to your current shell's `PATH`:
+
+```bash
+export PATH="/Applications/AgentsView.app/Contents/MacOS:$PATH"
+```
+
+Add that same `export` line to `~/.zshrc` to keep it in new Terminal windows
+(or your shell's startup file if you use a different shell). Adjust the path
+if you installed the app elsewhere. The CLI follows updates to the app at that
+location; update it through the desktop app or Homebrew.
+
+Before running the bundled CLI for the first time, open AgentsView from
+Applications in a graphical login session and complete the macOS first-launch
+dialogs. A fresh Homebrew Cask install over SSH has been reported to leave the
+CLI hanging without output until this step is completed. Adding it to `PATH`
+does not replace that first launch. For an unattended Mac, use the
+[standalone CLI installer](#shell-script) instead.
+
+Confirm which CLI your shell finds and check its version:
+
+```bash
+command -v agentsview
+agentsview --version
+```
+
 ### pip / uvx
 
 ```bash
@@ -45,6 +80,9 @@ Platform-specific wheels are published to PyPI for Linux (x86_64, aarch64),
 macOS (x86_64, arm64), and Windows (x86_64, arm64).
 
 ### Shell Script
+
+For macOS and Linux, this installs the standalone CLI without the desktop app.
+Use this path when setting up a Mac over SSH without a graphical login session.
 
 ```bash
 curl -fsSL https://agentsview.io/install.sh | bash
@@ -59,6 +97,12 @@ powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | i
 The installer detects your OS and architecture, downloads the latest release
 from GitHub Releases, verifies the SHA-256 checksum, and installs the binary.
 
+On macOS and Linux, it installs to `/usr/local/bin` when that directory is
+writable, or `~/.local/bin` otherwise. Follow the installer's `PATH`
+instructions and run `command -v agentsview` to check which binary your shell
+uses. When the standalone CLI and bundled CLI use different directories, put the
+standalone install directory first in `PATH` to select it.
+
 !!! note
 
     On Windows on ARM, the installer uses the native `arm64` build when one is
@@ -68,7 +112,7 @@ from GitHub Releases, verifies the SHA-256 checksum, and installs the binary.
 
 ### Build from source
 
-Requires Go 1.27+ with CGO and Node.js 24.11+:
+Requires Go 1.27.4+ with CGO and Node.js 24.22.1+:
 
 ```bash
 git clone https://github.com/kenn-io/agentsview.git
@@ -122,8 +166,14 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   ghcr.io/kenn-io/agentsview:latest
 ```
 
-The container's entrypoint runs `agentsview serve` by default. Set `PG_SERVE=1`
-to switch to `agentsview pg serve` instead — the same image powers both modes.
+The image runs `agentsview serve` by default. Set `AGENTSVIEW_MODE=pg-serve`, or
+pass `pg serve` as the command, to read PostgreSQL instead; the older
+`PG_SERVE=1` selector still works. The image listens on `0.0.0.0` inside the
+container and requires a bearer token. Flags you add, such as `--port 9000`,
+keep those defaults. The generated token is stored in `/data/config.toml`, or
+you can supply one with `AGENTSVIEW_AUTH_TOKEN_FILE`. See
+[container deployment](/docs/configuration/#container-deployment) for every
+variable.
 
 A containerized AgentsView only sees agent sessions from directories you
 explicitly bind-mount into the container. Mount each agent's session root
@@ -142,26 +192,31 @@ session roots read-only, and publishes the UI on `127.0.0.1:8080`:
 docker compose -f docker-compose.prod.yaml up -d
 ```
 
-The example publishes the UI on loopback only. To expose it beyond the host,
-also enable bearer-token [authentication](/docs/remote-access/#authentication) and
-publish the port intentionally.
+The example publishes the UI on loopback only. The image already requires
+bearer-token [authentication](/docs/remote-access/#authentication); publish the
+port beyond the host only intentionally.
 
 For a PostgreSQL-backed deployment, point the container at your shared database:
 
 ```bash
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e PG_SERVE=1 \
+  -e AGENTSVIEW_MODE=pg-serve \
   -e AGENTSVIEW_PG_URL='postgres://user:password@host:5432/agentsview?sslmode=require' \
   ghcr.io/kenn-io/agentsview:latest
 ```
+
+To ingest and publish sessions from the same container, enable the commented
+PostgreSQL and push-watch block in `docker-compose.prod.yaml` and set your
+database URL. That file mounts the session roots and `/data` and gives the
+container 40 seconds to finish its final push.
 
 ## Run
 
 The desktop app handles startup automatically: it attaches to an existing local
 daemon or starts one in the background, then opens the discovered URL. The
-daemon is shared with CLI commands and may outlive the desktop window, but it
-self-exits after an idle period when no client request or daemon-owned job is
-active.
+daemon is shared with CLI commands and may outlive the desktop window.
+Automatically started daemons self-exit after an idle period when no client
+request or daemon-owned job is active.
 
 CLI users can start the web UI explicitly:
 
@@ -170,7 +225,8 @@ agentsview serve
 ```
 
 Bare `agentsview serve` runs in the foreground until you press `Ctrl+C`. If a
-compatible server is already running, it reports that server's URL and exits.
+compatible server is already running, it reports that server's URL and exits
+with an error (status 1).
 
 This will:
 
@@ -215,9 +271,17 @@ archive directly in read-only mode. Commands that need fresh data or need to
 write, including `sync`, `usage`, `token-use`, `pg push`, and `duckdb push`,
 auto-start the detached daemon when needed. The server remains running after
 these commands finish. For scripts or CI jobs that must leave no background
-server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview sync`.
+server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview source sync`.
 That setting disables auto-start; it does not stop a running daemon or bypass
 its archive lock.
+
+### Search by meaning
+
+Choose **Settings → Embeddings → Turn on** or run `agentsview index embeddings build`
+and approve the download. Embeddings run locally by default; agents use keyword
+search until indexing is ready. Use `agentsview session search --semantic` or
+`--hybrid` to search by meaning. See [Semantic Search](/docs/semantic-search/#enabling-vector)
+to configure other providers.
 
 ## Customize
 
@@ -266,6 +330,7 @@ export GPTME_DIR=~/custom/gptme/logs
 export GROK_DIR=~/custom/grok/sessions
 export HERMES_SESSIONS_DIR=~/custom/hermes
 export IFLOW_DIR=~/custom/iflow/projects
+export JUNIE_DIR=~/custom/junie/sessions
 export KILO_DIR=~/custom/kilo
 export KILO_LEGACY_DIR=~/custom/kilo-legacy
 export KIMI_DIR=~/custom/kimi/sessions
@@ -273,6 +338,7 @@ export KIMI_WORK_DIR=~/custom/kimi-work/sessions
 export KIRO_SESSIONS_DIR=~/custom/kiro
 export KIRO_IDE_DIR=~/custom/kiro-ide
 export MIMOCODE_DIR=~/custom/mimocode
+export MUSE_SESSIONS_DIR=~/custom/muse/sessions
 export VIBE_SESSIONS_DIR=~/custom/vibe/logs/session
 export OMP_DIR=~/custom/omp/sessions
 export OPENCLAW_DIR=~/custom/openclaw/agents
@@ -335,8 +401,3 @@ Once running, the web UI provides:
 Use the [Usage Guide](/docs/usage/) for navigation and resume controls. To
 correct project assignments, see the [Data page](/docs/data/) and its opt-in
 project workspace.
-
-Beyond full-text search, opt-in semantic search lets
-`agentsview session search --semantic` (or `--hybrid`) match session content by
-meaning, backed by a local or hosted embeddings endpoint. See
-[Semantic Search](/docs/semantic-search/) for setup.

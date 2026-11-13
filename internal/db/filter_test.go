@@ -329,8 +329,14 @@ func TestListSessionsExcludesRelationshipTypes(t *testing.T) {
 		s.RelationshipType = "fork"
 	})
 
+	insertSession(t, d, "continuation", "proj", func(s *Session) {
+		s.MessageCount = 5
+		s.ParentSessionID = new("normal")
+		s.RelationshipType = "continuation"
+	})
+
 	f := SessionFilter{}
-	requireSessions(t, d, f, []string{"normal"})
+	requireSessions(t, d, f, []string{"normal", "continuation"})
 }
 
 func TestIncludeChildrenBypassesFilters(t *testing.T) {
@@ -1761,4 +1767,32 @@ func TestIncrementalUpdateClearsAutomated(t *testing.T) {
 	require.NoError(t, err, "get after")
 	assert.False(t, s.IsAutomated,
 		"should no longer be automated after second user turn")
+}
+
+func TestListSessionsParentlessChildrenRespectFilters(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"worker", "dangling", "deleted", "other"} {
+		insertSession(t, d, id, "proj", func(s *Session) {
+			s.RelationshipType = "subagent"
+			s.MessageCount, s.UserMessageCount = 2, 1
+			if id == "dangling" {
+				s.ParentSessionID = new("missing")
+			}
+			if id == "other" {
+				s.Project = "other"
+			}
+		})
+	}
+	insertSession(t, d, "nested", "proj", func(s *Session) {
+		s.RelationshipType = "subagent"
+		s.ParentSessionID = new("worker")
+		s.MessageCount, s.UserMessageCount = 2, 1
+	})
+	require.NoError(t, d.SoftDeleteSession(t.Context(), "deleted"))
+	f := SessionFilter{IncludeChildren: true, Project: "proj"}
+	requireSessions(t, d, f, []string{"worker", "nested"})
+	f.IncludeOrphans = true
+	requireSessions(t, d, f, []string{"worker", "nested", "dangling"})
+	f.IncludeChildren, f.IncludeOrphans = false, false
+	requireSessions(t, d, f, nil)
 }

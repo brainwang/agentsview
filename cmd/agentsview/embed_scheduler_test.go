@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,12 +14,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/embedmodel"
+	kitvec "go.kenn.io/kit/vector"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
@@ -195,32 +197,6 @@ func TestEmbedSchedulerBackstopTickIssuesBackstopBuild(t *testing.T) {
 	assert.True(t, calls[0].Backstop, "backstop tick must set BuildRequest.Backstop")
 }
 
-func TestEmbedSchedulerPendingDebounceHoldsIdleWorkLease(t *testing.T) {
-	fake := &fakeEmbedManager{}
-	idled := make(chan struct{})
-	ctx, cancel := context.WithCancel(t.Context())
-	tracker := server.NewIdleTracker(20*time.Millisecond, func() {
-		close(idled)
-		cancel()
-	})
-	s := newEmbedScheduler(fake, 100*time.Millisecond, 0, false, tracker)
-
-	// setupVectorServing queues Recall startup work before either goroutine
-	// starts, so exercise that ordering explicitly.
-	s.Notify()
-	go tracker.Run(ctx)
-	go s.Run(ctx)
-	defer s.Stop()
-
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"pending startup work did not survive an idle timeout shorter than its debounce")
-	select {
-	case <-idled:
-	case <-time.After(2 * time.Second):
-		require.Fail(t, "daemon never idled after the pending build completed")
-	}
-}
-
 func TestEmbedSchedulerBuildsHoldIdleWorkLease(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -233,96 +209,81 @@ func TestEmbedSchedulerBuildsHoldIdleWorkLease(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mgr := &blockingEmbedManager{
-				started: make(chan struct{}),
-				release: make(chan struct{}),
-			}
-			idled := make(chan struct{})
-			tracker := server.NewIdleTracker(50*time.Millisecond, func() { close(idled) })
-			s := newEmbedScheduler(
-				mgr, tt.debounce, tt.backstop, false, tracker,
-			)
-			ctx := t.Context()
-			go tracker.Run(ctx)
-			go s.Run(ctx)
-			defer s.Stop()
-			defer mgr.releaseOnce()
+			synctest.Test(t, func(t *testing.T) {
+				mgr := &blockingEmbedManager{
+					started: make(chan struct{}),
+					release: make(chan struct{}),
+				}
+				idled := make(chan struct{})
+				tracker := server.NewIdleTracker(50*time.Millisecond, func() { close(idled) })
+				s := newEmbedScheduler(
+					mgr, tt.debounce, tt.backstop, false, tracker,
+				)
+				ctx := t.Context()
+				go tracker.Run(ctx)
+				go s.Run(ctx)
+				defer s.Stop()
+				defer mgr.releaseOnce()
 
-			if tt.notify {
-				s.Notify()
-			}
-			<-mgr.started
-			select {
-			case <-idled:
-				require.Fail(t, "daemon idled while an embedding build was in flight")
-			case <-time.After(200 * time.Millisecond):
-			}
-			mgr.releaseOnce()
-			select {
-			case <-idled:
-			case <-time.After(2 * time.Second):
-				require.Fail(t, "daemon never idled after the embedding build completed")
-			}
+				if tt.notify {
+					s.Notify()
+				}
+				<-mgr.started
+				select {
+				case <-idled:
+					require.Fail(t, "daemon idled while an embedding build was in flight")
+				case <-time.After(200 * time.Millisecond):
+				}
+				mgr.releaseOnce()
+				select {
+				case <-idled:
+				case <-time.After(2 * time.Second):
+					require.Fail(t, "daemon never idled after the embedding build completed")
+				}
+			})
 		})
 	}
 }
 
-func TestEmbedSchedulerFailedDebouncedBuildRetriesWithoutNotification(
-	t *testing.T,
-) {
-	fake := &fakeEmbedManager{results: []fakeTryBuildResult{
-		{started: true, err: errors.New("embedding endpoint unavailable")},
-		{started: true},
-	}}
-	idled := make(chan struct{})
-	ctx, cancel := context.WithCancel(t.Context())
-	tracker := server.NewIdleTracker(20*time.Millisecond, func() {
-		close(idled)
-		cancel()
-	})
-	s := newEmbedScheduler(fake, 50*time.Millisecond, 0, false, tracker)
-	s.Notify()
-	go tracker.Run(ctx)
-	go s.Run(ctx)
-	defer s.Stop()
-
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 2 },
-		"a failed debounced build must retry without another notification")
-	select {
-	case <-idled:
-	case <-time.After(2 * time.Second):
-		require.Fail(t, "daemon never idled after the retry succeeded")
-	}
-	assert.Equal(t, []vector.BuildRequest{{}, {}}, fake.callsSnapshot())
-}
-
-func TestEmbedSchedulerRepeatedDebouncedFailuresReleaseIdleLease(
+func TestEmbedSchedulerDebouncedBuildRetriesReleaseIdleLease(
 	t *testing.T,
 ) {
 	buildErr := errors.New("embedding request rejected")
-	fake := &fakeEmbedManager{results: []fakeTryBuildResult{
-		{started: true, err: buildErr},
-		{started: true, err: buildErr},
-	}}
-	idled := make(chan struct{})
-	ctx, cancel := context.WithCancel(t.Context())
-	tracker := server.NewIdleTracker(15*time.Millisecond, func() {
-		close(idled)
-		cancel()
-	})
-	s := newEmbedScheduler(fake, 20*time.Millisecond, 0, false, tracker)
-	s.Notify()
-	go tracker.Run(ctx)
-	go s.Run(ctx)
-	defer s.Stop()
+	for _, tt := range []struct {
+		name     string
+		retryErr error
+	}{
+		{name: "fail then succeed"},
+		{name: "fail twice", retryErr: buildErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				fake := &fakeEmbedManager{results: []fakeTryBuildResult{
+					{started: true, err: buildErr},
+					{started: true, err: tt.retryErr},
+				}}
+				idled := make(chan struct{})
+				ctx, cancel := context.WithCancel(t.Context())
+				tracker := server.NewIdleTracker(15*time.Millisecond, func() {
+					close(idled)
+					cancel()
+				})
+				s := newEmbedScheduler(fake, 20*time.Millisecond, 0, false, tracker)
+				s.Notify()
+				go tracker.Run(ctx)
+				go s.Run(ctx)
+				defer s.Stop()
 
-	select {
-	case <-idled:
-	case <-time.After(2 * time.Second):
-		require.Fail(t, "repeated build failures kept the daemon alive indefinitely")
+				select {
+				case <-idled:
+				case <-time.After(2 * time.Second):
+					require.Fail(t, "daemon never idled after the bounded retry")
+				}
+				assert.Equal(t, []vector.BuildRequest{{}, {}}, fake.callsSnapshot(),
+					"one notification should get one bounded retry")
+			})
+		})
 	}
-	assert.Equal(t, []vector.BuildRequest{{}, {}}, fake.callsSnapshot(),
-		"one notification should get one bounded retry")
 }
 
 func TestEmbedSchedulerPendingBackstopRetriesBeforeNextTick(
@@ -342,41 +303,43 @@ func TestEmbedSchedulerPendingBackstopRetriesBeforeNextTick(
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fake := &fakeEmbedManager{results: []fakeTryBuildResult{
-				tt.result,
-				{started: true},
-			}}
-			idled := make(chan struct{})
-			ctx, cancel := context.WithCancel(t.Context())
-			tracker := server.NewIdleTracker(300*time.Millisecond, func() {
-				close(idled)
-				cancel()
-			})
-			s := newEmbedScheduler(
-				fake, 200*time.Millisecond, time.Second, false, tracker,
-			)
-			go s.Run(ctx)
-			defer s.Stop()
+			synctest.Test(t, func(t *testing.T) {
+				fake := &fakeEmbedManager{results: []fakeTryBuildResult{
+					tt.result,
+					{started: true},
+				}}
+				idled := make(chan struct{})
+				ctx, cancel := context.WithCancel(t.Context())
+				tracker := server.NewIdleTracker(300*time.Millisecond, func() {
+					close(idled)
+					cancel()
+				})
+				s := newEmbedScheduler(
+					fake, 200*time.Millisecond, time.Second, false, tracker,
+				)
+				go s.Run(ctx)
+				defer s.Stop()
 
-			waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-				"expected the initial backstop attempt")
-			// Start idle observation only after the deliberately delayed backstop
-			// acquires its lease. Otherwise the idle timeout can cancel the test
-			// before the first tick when the tick interval is kept well clear of
-			// the retry and idle deadlines.
-			go tracker.Run(ctx)
-			waitForSchedulerConditionWithin(t, 500*time.Millisecond,
-				func() bool { return fake.callCount() >= 2 },
-				"a pending backstop must retry before the next backstop tick")
-			select {
-			case <-idled:
-			case <-time.After(2 * time.Second):
-				require.Fail(t, "daemon never idled after the backstop retry succeeded")
-			}
-			calls := fake.callsSnapshot()
-			require.Len(t, calls, 2)
-			assert.True(t, calls[0].Backstop)
-			assert.True(t, calls[1].Backstop)
+				waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
+					"expected the initial backstop attempt")
+				// Start idle observation only after the deliberately delayed backstop
+				// acquires its lease. Otherwise the idle timeout can cancel the test
+				// before the first tick when the tick interval is kept well clear of
+				// the retry and idle deadlines.
+				go tracker.Run(ctx)
+				waitForSchedulerConditionWithin(t, 500*time.Millisecond,
+					func() bool { return fake.callCount() >= 2 },
+					"a pending backstop must retry before the next backstop tick")
+				select {
+				case <-idled:
+				case <-time.After(2 * time.Second):
+					require.Fail(t, "daemon never idled after the backstop retry succeeded")
+				}
+				calls := fake.callsSnapshot()
+				require.Len(t, calls, 2)
+				assert.True(t, calls[0].Backstop)
+				assert.True(t, calls[1].Backstop)
+			})
 		})
 	}
 }
@@ -450,32 +413,45 @@ func TestEmbedSchedulerLaterBackstopStartsFreshLifecycle(t *testing.T) {
 func TestEmbedSchedulerExhaustedBackstopCarriesIntoNextNotification(
 	t *testing.T,
 ) {
-	synctest.Test(t, func(t *testing.T) {
-		buildErr := errors.New("embedding request rejected")
-		fake := &fakeEmbedManager{results: []fakeTryBuildResult{
-			{started: true, err: buildErr},
-			{started: true, err: buildErr},
-			{started: true},
-		}}
-		s := newEmbedScheduler(
-			fake, 20*time.Millisecond, 200*time.Millisecond, false, nil,
-		)
-		go s.Run(t.Context())
-		defer s.Stop()
+	for _, deferOnBattery := range []bool{false, true} {
+		t.Run(fmt.Sprintf("battery_backstop=%t", deferOnBattery), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				buildErr := errors.New("embedding request rejected")
+				fake := &fakeEmbedManager{results: []fakeTryBuildResult{
+					{started: true, err: buildErr},
+					{started: true, err: buildErr},
+					{started: true},
+				}}
+				s := newEmbedScheduler(
+					fake, 20*time.Millisecond, 200*time.Millisecond, false, nil,
+				)
+				var battery atomic.Bool
+				s.onBattery = battery.Load
+				s.batteryDeferredPath = filepath.Join(t.TempDir(), "deferred")
+				go s.Run(t.Context())
+				defer s.Stop()
 
-		// Finish the failed tick and its retry before sending new work,
-		// keeping the clock before the next periodic tick at 400ms.
-		synctest.Sleep(250 * time.Millisecond)
-		require.Equal(t, 2, fake.callCount(),
-			"expected the failed backstop and its bounded retry")
-		s.Notify()
-		synctest.Sleep(20 * time.Millisecond)
+				// Finish the failed tick and its retry before the next periodic tick.
+				synctest.Sleep(250 * time.Millisecond)
+				require.Equal(t, 2, fake.callCount(),
+					"expected the failed backstop and its bounded retry")
+				if deferOnBattery {
+					battery.Store(true)
+					synctest.Sleep(151 * time.Millisecond)
+					synctest.Wait()
+					require.FileExists(t, s.batteryDeferredPath)
+					battery.Store(false)
+				}
+				s.Notify()
+				synctest.Sleep(20 * time.Millisecond)
 
-		assert.Equal(t, []vector.BuildRequest{
-			{Backstop: true}, {Backstop: true}, {Backstop: true},
-		}, fake.callsSnapshot(),
-			"retry exhaustion must preserve full-reconciliation intent")
-	})
+				assert.Equal(t, []vector.BuildRequest{
+					{Backstop: true}, {Backstop: true}, {Backstop: true},
+				}, fake.callsSnapshot(),
+					"retry exhaustion must preserve full-reconciliation intent")
+			})
+		})
+	}
 }
 
 // TestEmbedSchedulerDroppedBackstopRetriesOnNextDebouncedBuild is the fix-4
@@ -642,7 +618,7 @@ func TestEmbedSchedulerNotifyNeverBlocksWithoutAReader(t *testing.T) {
 	}
 }
 
-// --- teeEmitter ---
+// --- embedding sync emitter ---
 
 type recordingEmitter struct {
 	mu     sync.Mutex
@@ -661,62 +637,50 @@ func (e *recordingEmitter) count() int {
 	return len(e.scopes)
 }
 
-func TestTeeEmitterAlwaysCallsPrimaryAndGatesSchedulerOnRunAfterSync(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		primary := &recordingEmitter{}
-		fake := &fakeEmbedManager{}
-		s := newEmbedScheduler(fake, 10*time.Millisecond, 0, false, nil)
-		go s.Run(t.Context())
-		defer s.Stop()
-
-		disabled := teeEmitter{primary: primary, scheduler: s, runAfterSync: false}
-		disabled.Emit("sessions")
-		assert.Equal(t, 1, primary.count())
-		synctest.Sleep(30 * time.Millisecond)
-		assert.Equal(t, 0, fake.callCount(), "runAfterSync=false must not notify the scheduler")
-
-		enabled := teeEmitter{primary: primary, scheduler: s, runAfterSync: true}
-		enabled.Emit("sessions")
-		assert.Equal(t, 2, primary.count())
-		synctest.Sleep(30 * time.Millisecond)
-		require.Equal(t, 1, fake.callCount(), "runAfterSync=true must notify the scheduler")
-	})
+func TestEmbeddingSyncEmitterForwardsThenNotifiesBothStores(t *testing.T) {
+	primary := &recordingEmitter{}
+	var notifications []bool
+	wrapEmbeddingSyncEmitter(primary, func(recall bool) {
+		assert.Equal(t, []string{"sessions"}, primary.scopes)
+		notifications = append(notifications, recall)
+	}).Emit("sessions")
+	assert.Equal(t, []bool{false, true}, notifications)
 }
 
-// TestRunRemoteHostSyncLoop_EmitsThroughTeeNotifiesScheduler is a
-// regression test for a bug where runServe wired startPeriodicSync's
-// scheduled remote-host sync path to the bare SSE broadcaster instead of
-// the wrapped teeEmitter, so remote-synced sessions notified SSE clients
-// but never reached the embed scheduler until an unrelated local sync or
-// the 24h backstop ran. It drives runRemoteHostSyncLoop — the function
-// startPeriodicSync spawns per configured remote host — with a teeEmitter
-// and a syncFn reporting synced sessions, and asserts the scheduler
-// actually receives a build trigger through that path.
-func TestRunRemoteHostSyncLoop_EmitsThroughTeeNotifiesScheduler(t *testing.T) {
-	primary := &recordingEmitter{}
-	fake := &fakeEmbedManager{}
-	s := newEmbedScheduler(fake, 5*time.Millisecond, 0, false, nil)
-	schedCtx := t.Context()
-	go s.Run(schedCtx)
-	defer s.Stop()
-
-	tee := teeEmitter{primary: primary, scheduler: s, runAfterSync: true}
-
-	syncFn := func() (int, error) {
-		return 1, nil // one session synced on this remote host
+func TestLiveVectorServingNotify(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("run_after_sync=%t", enabled), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cfg, err := config.Default()
+				require.NoError(t, err)
+				cfg.Vector.Embed.RunAfterSync = new(enabled)
+				fake := &fakeEmbedManager{}
+				scheduler := newEmbedScheduler(fake, time.Millisecond, 0, false, nil)
+				go scheduler.Run(t.Context())
+				defer scheduler.Stop()
+				recalls := 0
+				owner := &liveVectorServing{cfg: cfg, serving: vectorServing{
+					Scheduler: scheduler, RecallMutationNotify: func() { recalls++ },
+				}}
+				owner.Notify(false)
+				synctest.Sleep(2 * time.Millisecond)
+				if enabled {
+					assert.Equal(t, 1, fake.callCount())
+				} else {
+					assert.Zero(t, fake.callCount())
+				}
+				assert.Zero(t, recalls)
+				owner.Notify(true)
+				synctest.Sleep(2 * time.Millisecond)
+				assert.Equal(t, 1, recalls)
+				if enabled {
+					assert.Equal(t, 1, fake.callCount())
+				} else {
+					assert.Zero(t, fake.callCount())
+				}
+			})
+		})
 	}
-
-	loopCtx := t.Context()
-	done := make(chan struct{})
-	go runRemoteHostSyncLoop(
-		loopCtx, "remote-host", 5*time.Millisecond, syncFn, tee, nil, done,
-	)
-	defer close(done)
-
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"a scheduled remote sync reaching the tee emitter must notify the embed scheduler")
-	assert.NotZero(t, primary.count(),
-		"the tee must still forward remote sync completions to the SSE broadcaster")
 }
 
 // --- searcherAdapter error taxonomy ---
@@ -729,7 +693,9 @@ func TestTranslateSearchErrorMapsVectorErrorsToSemanticUnavailable(t *testing.T)
 	t.Run("building", func(t *testing.T) {
 		err := translateSearchError(&vector.BuildingError{Percent: 62})
 		require.ErrorIs(t, err, db.ErrSemanticUnavailable)
-		assert.Contains(t, err.Error(), "index is building: 62% complete")
+		unavailable, ok := errors.AsType[*db.SemanticUnavailableError](err)
+		require.True(t, ok)
+		assert.Equal(t, "index is building: 62% complete", unavailable.Reason)
 	})
 	t.Run("other error passes through", func(t *testing.T) {
 		boom := errors.New("boom")
@@ -756,8 +722,9 @@ func TestTranslateSearchErrorMapsVectorErrorsToSemanticUnavailable(t *testing.T)
 		got := translateSearchError(
 			fmt.Errorf("checking embedding index staleness: %w", vector.ErrMirrorVersionMismatch))
 		require.ErrorIs(t, got, db.ErrSemanticUnavailable)
-		assert.Contains(t, got.Error(), "embeddings build",
-			"the rebuild remediation must survive translation")
+		unavailable, ok := errors.AsType[*db.SemanticUnavailableError](got)
+		require.True(t, ok)
+		assert.Contains(t, unavailable.Reason, "embeddings build")
 	})
 }
 
@@ -773,7 +740,7 @@ func TestTranslateRecallSearchErrorUsesRecallRemediation(t *testing.T) {
 
 		require.ErrorIs(t, err, db.ErrSemanticUnavailable)
 		assert.Contains(t, err.Error(), "recall index is building: 37% complete")
-		assert.NotContains(t, err.Error(), "agentsview embeddings build",
+		assert.NotContains(t, err.Error(), "agentsview index embeddings build",
 			"an in-progress Recall build should not recommend another store build")
 	})
 }
@@ -826,14 +793,100 @@ func TestSearcherAdapterVersionMismatchedIndexReturnsSemanticUnavailable(t *test
 
 	enc, err := newVectorQueryEncoder(cfg.Vector.Embeddings, "")
 	require.NoError(t, err)
-	adapter := newSearcherAdapter(ix, enc, vectorGeneration(cfg.Vector.Embeddings))
+	adapter := newSearcherAdapter(ix, enc, vectorSpace(
+		cfg.Vector.Embeddings, vectorGeneration(cfg.Vector.Embeddings),
+	))
 
-	_, err = adapter.SemanticSearch(t.Context(), "any query", 5)
+	_, err = dbtest.SemanticSearch(t.Context(), adapter, "any query", 5)
 	require.Error(t, err)
 	require.ErrorIs(t, err, db.ErrSemanticUnavailable,
 		"a version-mismatched index must surface the semantic-unavailable taxonomy")
 	assert.Contains(t, err.Error(), "embeddings build",
 		"the error must tell the user to rebuild the index")
+}
+
+func TestSearcherAdapterActivityCandidateExpansion(t *testing.T) {
+	cfg := enabledVectorConfig(t)
+	ix, err := vector.Open(t.Context(), cfg.Vector.ResolvedDBPath(cfg.DataDir), false, cfg.Vector.Embeddings.MaxInputChars)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, ix.Close()) })
+	gen := kitvec.Generation{Model: "fake-model", Dimensions: 4}
+	_, err = ix.Build(t.Context(), testPushUnitSource(), fakePushEncoder(), gen, vector.BuildOptions{})
+	require.NoError(t, err)
+	encodes := 0
+	adapter := newSearcherAdapter(ix, func(ctx context.Context, texts []string) ([][]float32, error) {
+		encodes++
+		assert.Equal(t, []string{"query"}, texts)
+		return fakePushEncoder()(ctx, texts)
+	}, generationSpace(gen))
+	search, _, err := adapter.PrepareSemanticSearch(t.Context(), "query")
+	require.NoError(t, err)
+	_, exhausted, err := search(t.Context(), 200)
+	require.NoError(t, err)
+	assert.True(t, exhausted)
+	t.Run("engine ceiling", func(t *testing.T) {
+		encodes = 0
+		hits, err := db.SelectSurvivingVectorHits(t.Context(), db.ContentSearchFilter{
+			Pattern: "query", Limit: 4, ExcludeActiveSince: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		}, adapter, 5000, func(_ context.Context, _ db.ContentSearchFilter, ids []string) (map[string]bool, error) {
+			allowed := make(map[string]bool, len(ids))
+			for _, id := range ids {
+				allowed[id] = false
+			}
+			return allowed, nil
+		})
+		require.NoError(t, err)
+		assert.Empty(t, hits)
+		assert.Equal(t, 1, encodes)
+	})
+}
+
+func TestSearcherAdapterSemanticReadinessCoverageAndCompatibility(t *testing.T) {
+	cfg := enabledVectorConfig(t)
+	path := cfg.Vector.ResolvedDBPath(cfg.DataDir)
+	ix, err := vector.Open(t.Context(), path, false, cfg.Vector.Embeddings.MaxInputChars)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, ix.Close()) })
+	gen := kitvec.Generation{Model: "fake-model", Dimensions: 4}
+	_, err = ix.Build(
+		t.Context(), testPushUnitSource(), fakePushEncoder(), gen, vector.BuildOptions{},
+	)
+	require.NoError(t, err)
+	adapter := newSearcherAdapter(ix, fakePushEncoder(), generationSpace(gen))
+
+	ready, err := adapter.SemanticReadiness(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "ready", ready.State)
+	assert.EqualValues(t, 3, ready.Embedded)
+	assert.Zero(t, ready.Missing)
+
+	raw, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	_, err = raw.ExecContext(t.Context(), `DELETE FROM message_vectors_stamps WHERE rowid IN (SELECT rowid FROM message_vectors_stamps LIMIT 1)`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	partial, err := adapter.SemanticReadiness(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "partial", partial.State)
+	assert.Equal(t, "index_incomplete", partial.Reason)
+	assert.EqualValues(t, 2, partial.Embedded)
+	assert.EqualValues(t, 1, partial.Missing)
+
+	mismatched := newSearcherAdapter(ix, fakePushEncoder(), generationSpace(kitvec.Generation{
+		Model: "different-model", Dimensions: 4,
+	}))
+	status, err := mismatched.SemanticReadiness(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "unavailable", status.State)
+	assert.Equal(t, "configuration_mismatch", status.Reason)
+}
+
+// generationSpace describes gen the way vectorSpace does for configured
+// embeddings: gen's own fingerprint is the descriptor's legacy entry.
+func generationSpace(gen kitvec.Generation) embedmodel.Descriptor {
+	return vectorSpace(config.VectorEmbeddingsConfig{
+		Model: gen.Model, Dimension: gen.Dimensions,
+	}, gen)
 }
 
 // --- integration: real serve/server construction path ---
@@ -896,35 +949,16 @@ func startTestServer(t *testing.T, ln net.Listener, handler http.Handler) *httpt
 	return ts
 }
 
-// TestServeConstructionRegistersEmbeddingsRoutesWhenVectorEnabled drives the
-// real setupVectorServing + server.New construction path (not a fake mux)
-// with a vector-enabled config and asserts the embeddings status endpoint
-// responds, then a sibling test rebuilds with vector disabled and asserts
-// it does not.
-func TestServeConstructionRegistersEmbeddingsRoutesWhenVectorEnabled(t *testing.T) {
-	dataDir := t.TempDir()
-	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
-
-	ln, port := listenLoopback(t)
-	cfg := vectorTestConfig(dataDir)
-	cfg.Host, cfg.Port = "127.0.0.1", port
-	vs, err := setupVectorServing(t.Context(), cfg, database, nil)
-	require.NoError(t, err)
-	require.NotNil(t, vs.Scheduler)
-	require.NotNil(t, vs.RecallScheduler)
-	require.NotNil(t, vs.Close)
-	defer func() { require.NoError(t, vs.Close()) }()
-
-	srv := server.New(cfg, database, nil, vs.ServerOpts...)
-	ts := startTestServer(t, ln, srv.Handler())
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/api/v1/embeddings/status", nil)
-	require.NoError(t, err)
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "application/json", mediaType(t, resp.Header.Get("Content-Type")))
+func liveVectorServingFixture(t *testing.T, cfg config.Config, database *db.DB, serving vectorServing) *liveVectorServing {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	return &liveVectorServing{
+		ctx: ctx, cancel: cancel,
+		cfg: cfg, database: database, serving: serving,
+		reload: func() (config.Config, error) { return cfg, nil },
+		push:   &vectorPushSource{cfg: cfg},
+	}
 }
 
 func TestRecallSchedulerBackstopRemovesArchivedEntryVectors(t *testing.T) {
@@ -1032,7 +1066,7 @@ func TestRecallSchedulerSyncRemovesDeletedEntryWithoutExtraction(t *testing.T) {
 		return deleteErr
 	}))
 	emitter := wrapEmbeddingSyncEmitter(
-		&recordingEmitter{}, vs, cfg.Vector.Embed.RunAfterSyncEnabled(),
+		&recordingEmitter{}, liveVectorServingFixture(t, cfg, database, vs).Notify,
 	)
 	emitter.Emit("sync")
 
@@ -1094,7 +1128,7 @@ func TestRecallSchedulerSessionDeletionRemovesImportedEntryWithoutExtraction(t *
 			waitForSchedulerCondition(t, func() bool { return embeddedCount() == 1 },
 				"startup reconciliation did not embed the imported entry")
 
-			srv := server.New(cfg, database, nil, vs.ServerOpts...)
+			srv := server.New(cfg, database, nil, liveVectorServingFixture(t, cfg, database, vs).ServerOptions()...)
 			ts := startTestServer(t, ln, srv.Handler())
 			req, err := http.NewRequestWithContext(
 				t.Context(), http.MethodDelete, ts.URL+tc.path, nil,
@@ -1108,6 +1142,53 @@ func TestRecallSchedulerSessionDeletionRemovesImportedEntryWithoutExtraction(t *
 
 			waitForSchedulerCondition(t, func() bool { return embeddedCount() == 0 },
 				"session deletion did not remove the imported Recall vector")
+		})
+	}
+}
+
+func TestMessageSchedulerQueuesBuildOnSessionDeletion(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		path         string
+		wantStatus   int
+		runAfterSync bool
+		wantQueued   int
+	}{
+		{name: "permanent delete", path: "/api/v1/sessions/s1/permanent", wantStatus: http.StatusNoContent, runAfterSync: true, wantQueued: 1},
+		{name: "empty trash", path: "/api/v1/trash", wantStatus: http.StatusOK, runAfterSync: true, wantQueued: 1},
+		{name: "run after sync disabled", path: "/api/v1/sessions/s1/permanent", wantStatus: http.StatusNoContent, runAfterSync: false, wantQueued: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
+			dbtest.SeedSession(t, database, "s1", "agentsview")
+			require.NoError(t, database.SoftDeleteSession(t.Context(), "s1"))
+
+			ln, port := listenLoopback(t)
+			cfg := vectorTestConfig(dataDir)
+			cfg.Host, cfg.Port = "127.0.0.1", port
+			runAfterSync := tc.runAfterSync
+			cfg.Vector.Embed.RunAfterSync = &runAfterSync
+
+			vs, err := setupVectorServing(t.Context(), cfg, database, nil)
+			require.NoError(t, err)
+			require.NotNil(t, vs.Scheduler)
+			t.Cleanup(func() { require.NoError(t, vs.Close()) })
+			require.Empty(t, vs.Scheduler.dirty, "setup must not queue a message build")
+
+			srv := server.New(cfg, database, nil, liveVectorServingFixture(t, cfg, database, vs).ServerOptions()...)
+			ts := startTestServer(t, ln, srv.Handler())
+			req, err := http.NewRequestWithContext(
+				t.Context(), http.MethodDelete, ts.URL+tc.path, nil,
+			)
+			require.NoError(t, err)
+			req.Header.Set("Origin", ts.URL)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, tc.wantStatus, resp.StatusCode)
+
+			assert.Len(t, vs.Scheduler.dirty, tc.wantQueued)
 		})
 	}
 }
@@ -1204,20 +1285,34 @@ func TestRecallSchedulerStartupDoesNotDependOnRunAfterSync(t *testing.T) {
 	}, "a non-sync Recall mutation must refresh when run_after_sync is disabled")
 }
 
-func TestRecallSearchRejectsCorpusMutationUntilRefresh(t *testing.T) {
+// laggedRecallSearch is a Recall index built over two accepted entries and
+// served with a revision lag bound.
+type laggedRecallSearch struct {
+	database     *db.DB
+	mgr          *vector.Manager
+	searcher     recallSearcherAdapter
+	queryEncoder kitvec.EncodeFunc
+}
+
+func newLaggedRecallSearch(t *testing.T, maxLag int) laggedRecallSearch {
+	t.Helper()
 	dataDir := t.TempDir()
 	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
 	dbtest.SeedSession(t, database, "s1", "agentsview")
-	_, err := database.InsertRecallEntry(t.Context(), db.RecallEntry{
-		ID: "entry-1", Type: "fact", Scope: "project", Status: "accepted",
-		Title: "Database pool", Body: "Reuse idle connections.",
-		SourceSessionID: "s1", ExtractorMethod: "import-v1",
-	})
-	require.NoError(t, err)
+	for _, entry := range []db.RecallEntry{
+		{ID: "entry-1", Title: "Database pool", Body: "Reuse idle connections."},
+		{ID: "entry-2", Title: "Connection reuse", Body: "Keep idle connections open."},
+	} {
+		entry.Type, entry.Scope, entry.Status = "fact", "project", "accepted"
+		entry.SourceSessionID, entry.ExtractorMethod = "s1", "import-v1"
+		_, err := database.InsertRecallEntry(t.Context(), entry)
+		require.NoError(t, err)
+	}
 
 	stub := newEmbeddingsStubServer(t, 3)
 	t.Cleanup(stub.Close)
 	cfg := vectorTestConfig(dataDir)
+	cfg.Vector.RecallMaxRevisionLag = maxLag
 	embeddingsServer := cfg.Vector.Embeddings.Servers["local"]
 	embeddingsServer.Endpoint = stub.URL + "/v1"
 	cfg.Vector.Embeddings.Servers["local"] = embeddingsServer
@@ -1240,41 +1335,79 @@ func TestRecallSearchRejectsCorpusMutationUntilRefresh(t *testing.T) {
 	searcher := recallSearcherAdapter{
 		ix: ix, enc: queryEncoder, database: database, cfg: cfg,
 	}
-	_, _, _, err = searcher.SearchRecall(t.Context(), "connection reuse", 5)
-	require.NoError(t, err)
-
-	searcher.enc = func(
-		ctx context.Context, texts []string,
-	) ([][]float32, error) {
-		if updateErr := database.Update(ctx, func(tx *sql.Tx) error {
-			_, execErr := tx.ExecContext(ctx, `
-				UPDATE recall_entries
-				SET title = 'Connection policy',
-					updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-				WHERE id = 'entry-1'`)
-			return execErr
-		}); updateErr != nil {
-			return nil, updateErr
-		}
-		return queryEncoder(ctx, texts)
+	return laggedRecallSearch{
+		database: database, mgr: mgr, searcher: searcher, queryEncoder: queryEncoder,
 	}
-	_, _, _, err = searcher.SearchRecall(t.Context(), "connection reuse", 5)
-	require.Error(t, err)
+}
+
+func (l laggedRecallSearch) mutate(ctx context.Context, stmt string) error {
+	return l.database.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, stmt)
+		return err
+	})
+}
+
+func TestRecallSearchServesIndexWithinRevisionLag(t *testing.T) {
+	l := newLaggedRecallSearch(t, 2)
+	searcher := l.searcher
+	writeDuringSearch := func(stmt string) kitvec.EncodeFunc {
+		return func(ctx context.Context, texts []string) ([][]float32, error) {
+			if err := l.mutate(ctx, stmt); err != nil {
+				return nil, err
+			}
+			return l.queryEncoder(ctx, texts)
+		}
+	}
+
+	// Without a bound, a corpus revision landing during the search refuses.
+	strict := searcher
+	strict.cfg.Vector.RecallMaxRevisionLag = 0
+	strict.enc = writeDuringSearch(`UPDATE recall_entries SET title = 'Pool policy' WHERE id = 'entry-1'`)
+	_, _, _, err := strict.SearchRecall(t.Context(), "connection reuse", 5)
 	require.ErrorIs(t, err, db.ErrSemanticUnavailable)
 	assert.Contains(t, err.Error(), "changed during search")
 
-	searcher.enc = queryEncoder
-
+	// With a bound of 2, one more revision during the search is still served.
+	searcher.enc = writeDuringSearch(`UPDATE recall_entries SET status = 'rejected' WHERE id = 'entry-2'`)
 	_, _, _, err = searcher.SearchRecall(t.Context(), "connection reuse", 5)
-	require.Error(t, err)
+	require.NoError(t, err, "two revisions behind is within a lag of 2")
+
+	// One more revision puts the index past the bound.
+	searcher.enc = l.queryEncoder
+	require.NoError(t, l.mutate(t.Context(), `UPDATE recall_entries SET body = 'Cap the pool.' WHERE id = 'entry-1'`))
+	_, _, _, err = searcher.SearchRecall(t.Context(), "connection reuse", 5)
 	require.ErrorIs(t, err, db.ErrSemanticUnavailable)
 	assert.Contains(t, err.Error(), "embeddings build --store recall")
 
-	started, err = mgr.TryBuild(t.Context(), vector.BuildRequest{})
+	started, err := l.mgr.TryBuild(t.Context(), vector.BuildRequest{})
 	require.NoError(t, err)
 	require.True(t, started)
 	_, _, _, err = searcher.SearchRecall(t.Context(), "connection reuse", 5)
 	require.NoError(t, err)
+}
+
+func TestRecallRevisionFresh(t *testing.T) {
+	tests := []struct {
+		name      string
+		maxLag    int
+		completed string
+		want      string
+		fresh     bool
+	}{
+		{name: "any lag without a bound", maxLag: 0, completed: "counter-v1:5", want: "counter-v1:6"},
+		{name: "lag within the bound", maxLag: 3, completed: "counter-v1:5", want: "counter-v1:8", fresh: true},
+		{name: "lag past the bound", maxLag: 3, completed: "counter-v1:5", want: "counter-v1:9"},
+		{name: "index ahead of the corpus", maxLag: 3, completed: "counter-v1:9", want: "counter-v1:5"},
+		{name: "legacy watermarks still need equality", maxLag: 3, completed: "2026-01-01T00:00:00Z", want: "2026-01-01T00:00:01Z"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg config.Config
+			cfg.Vector.RecallMaxRevisionLag = tt.maxLag
+			a := recallSearcherAdapter{cfg: cfg}
+			assert.Equal(t, tt.fresh, a.revisionFresh(tt.completed, tt.want))
+		})
+	}
 }
 
 func TestRecallSchedulerRequiresExplicitOptInForAutomaticBuilds(t *testing.T) {
@@ -1318,7 +1451,7 @@ func TestRecallSchedulerRequiresExplicitOptInForAutomaticBuilds(t *testing.T) {
 	}, 100*time.Millisecond, 5*time.Millisecond,
 		"Recall content must not be embedded automatically without explicit opt-in")
 
-	srv := server.New(cfg, database, nil, vs.ServerOpts...)
+	srv := server.New(cfg, database, nil, liveVectorServingFixture(t, cfg, database, vs).ServerOptions()...)
 	ts := startTestServer(t, ln, srv.Handler())
 	input := strings.NewReader(`
 {"candidate_id":"second-import","type":"fact","scope":"repository","title":"Import policy","body":"Keep imports manual too.","project":"agentsview","agent":"codex","session_id":"import-session","label":"correct","transferable":true,"provenance_ok":true,"evidence":{"ordinal_start":0,"ordinal_end":0}}
@@ -1378,7 +1511,7 @@ func TestRecallImportSchedulesEmbeddingRefresh(t *testing.T) {
 		require.NoError(t, vs.Close())
 	})
 
-	srv := server.New(cfg, database, nil, vs.ServerOpts...)
+	srv := server.New(cfg, database, nil, liveVectorServingFixture(t, cfg, database, vs).ServerOptions()...)
 	ts := startTestServer(t, ln, srv.Handler())
 	input := strings.NewReader(`
 {"candidate_id":"imported-entry","type":"fact","scope":"repository","title":"Database pool","body":"Reuse idle connections.","project":"agentsview","agent":"codex","session_id":"import-session","label":"correct","transferable":true,"provenance_ok":true,"evidence":{"ordinal_start":0,"ordinal_end":0}}
@@ -1425,7 +1558,7 @@ func TestEmbeddingsDaemonClientBuildSucceedsThroughRealMiddleware(t *testing.T) 
 	require.NoError(t, err)
 	defer func() { require.NoError(t, vs.Close()) }()
 
-	srv := server.New(cfg, database, nil, vs.ServerOpts...)
+	srv := server.New(cfg, database, nil, liveVectorServingFixture(t, cfg, database, vs).ServerOptions()...)
 	ts := startTestServer(t, ln, srv.Handler())
 
 	client := embeddingsDaemonClient{baseURL: ts.URL}
@@ -1494,7 +1627,7 @@ func TestVectorServingCloseCancelsAPIStartedRecallBuild(t *testing.T) {
 	}
 	t.Cleanup(func() { require.NoError(t, closeVectorServing()) })
 
-	srv := server.New(cfg, database, nil, vs.ServerOpts...)
+	srv := server.New(cfg, database, nil, liveVectorServingFixture(t, cfg, database, vs).ServerOptions()...)
 	ts := startTestServer(t, ln, srv.Handler())
 	client := embeddingsDaemonClient{baseURL: ts.URL}
 	require.NoError(t, client.startBuild(t.Context(), vector.BuildRequest{
@@ -1583,41 +1716,15 @@ func TestSetupVectorServingAcquiresAndReleasesWriteLock(t *testing.T) {
 	require.NoError(t, held.Close())
 }
 
-func TestServeConstructionKeepsEmbeddingsRoutesUnavailableWhenVectorDisabled(t *testing.T) {
+func TestSetupVectorServingDisabled(t *testing.T) {
 	dataDir := t.TempDir()
 	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
-
-	ln, port := listenLoopback(t)
-	cfg := config.Config{
-		DataDir: dataDir, DBPath: filepath.Join(dataDir, "sessions.db"),
-		Host: "127.0.0.1", Port: port,
-	}
+	cfg := config.Config{DataDir: dataDir, DBPath: filepath.Join(dataDir, "sessions.db")}
 	vs, err := setupVectorServing(t.Context(), cfg, database, nil)
 	require.NoError(t, err)
+	assert.Nil(t, vs.manager)
 	assert.Nil(t, vs.Scheduler)
 	assert.Nil(t, vs.Close)
-	assert.Empty(t, vs.ServerOpts)
-
-	srv := server.New(cfg, database, nil, vs.ServerOpts...)
-	ts := startTestServer(t, ln, srv.Handler())
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/api/v1/embeddings/status", nil)
-	require.NoError(t, err)
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode,
-		"the embeddings API should be documented and registered, but unavailable when vector is disabled")
-	assert.Equal(t, "application/json", mediaType(t, resp.Header.Get("Content-Type")))
-}
-
-// mediaType extracts the bare MIME type from a Content-Type header value,
-// dropping any "; charset=..." parameters, so tests can compare it exactly.
-func mediaType(t *testing.T, contentType string) string {
-	t.Helper()
-	mt, _, err := mime.ParseMediaType(contentType)
-	require.NoError(t, err)
-	return mt
 }
 
 // --- installDirectVectorSearcher (direct, non-daemon CLI path) ---
@@ -1627,7 +1734,7 @@ func TestInstallDirectVectorSearcherNoOpWhenVectorDisabled(t *testing.T) {
 	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
 
 	cfg := config.Config{DataDir: dataDir}
-	closeFn := installDirectVectorSearcher(cfg, database)
+	closeFn := installDirectVectorSearcher(t.Context(), cfg, database)
 	assert.Nil(t, closeFn)
 	assert.False(t, database.HasSemantic())
 }
@@ -1637,7 +1744,7 @@ func TestInstallDirectVectorSearcherNoOpWhenVectorsDBMissing(t *testing.T) {
 	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
 
 	cfg := vectorTestConfig(dataDir)
-	closeFn := installDirectVectorSearcher(cfg, database)
+	closeFn := installDirectVectorSearcher(t.Context(), cfg, database)
 	assert.Nil(t, closeFn)
 	assert.False(t, database.HasSemantic(),
 		"no searcher wired means callers see db.ErrSemanticUnavailable naturally")
@@ -1653,7 +1760,7 @@ func TestInstallDirectVectorSearcherWiresSearcherWhenVectorsDBExists(t *testing.
 	require.NoError(t, err)
 	require.NoError(t, seed.Close())
 
-	closeFn := installDirectVectorSearcher(cfg, database)
+	closeFn := installDirectVectorSearcher(t.Context(), cfg, database)
 	require.NotNil(t, closeFn)
 	defer func() { assert.NoError(t, closeFn()) }()
 
@@ -1679,7 +1786,7 @@ func TestInstallDirectVectorSearcherDegradesOnCorruptVectorsDB(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(vectorsPath), 0o755))
 	require.NoError(t, os.WriteFile(vectorsPath, []byte("not a sqlite database"), 0o644))
 
-	closeFn := installDirectVectorSearcher(cfg, database)
+	closeFn := installDirectVectorSearcher(t.Context(), cfg, database)
 	assert.Nil(t, closeFn,
 		"a corrupt vectors.db must not return a handle to close")
 	assert.False(t, database.HasSemantic(),
@@ -1718,7 +1825,7 @@ func TestInstallDirectVectorSearcherVersionMismatchServesRebuildRequired(t *test
 	require.NoError(t, err)
 	require.NoError(t, raw.Close())
 
-	closeFn := installDirectVectorSearcher(cfg, database)
+	closeFn := installDirectVectorSearcher(t.Context(), cfg, database)
 	require.NotNil(t, closeFn,
 		"a version-mismatched vectors.db must wire a searcher, not silently unwire semantic search")
 	defer func() { assert.NoError(t, closeFn()) }()
@@ -1745,4 +1852,105 @@ func TestInstallDirectVectorSearcherVersionMismatchServesRebuildRequired(t *test
 		"the error body must carry the rebuild-required remediation")
 	assert.Contains(t, string(body), "embeddings build",
 		"the error body must tell the user how to rebuild")
+}
+
+func TestEmbedSchedulerDefersBuildOnBatteryUntilAC(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		notify, backstop, replay bool
+	}{
+		{name: "notify", notify: true},
+		{name: "backstop", backstop: true},
+		{name: "notify then backstop", notify: true, backstop: true},
+		{name: "restart", replay: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, idleExit := range []bool{false, true} {
+				if idleExit && !tc.notify {
+					continue
+				}
+				t.Run(fmt.Sprintf("idle_exit=%t", idleExit), func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						var tracker *server.IdleTracker
+						idled := make(chan struct{})
+						ctx, cancel := context.WithCancel(t.Context())
+						defer cancel()
+						if idleExit {
+							tracker = server.NewIdleTracker(2*time.Second, func() { close(idled) })
+							go tracker.Run(ctx)
+						}
+						mgr := &fakeEmbedManager{}
+						var battery atomic.Bool
+						battery.Store(true)
+						s := newEmbedScheduler(mgr, time.Second, 0, false, tracker)
+						s.onBattery = battery.Load
+						s.batteryDeferredPath = filepath.Join(t.TempDir(), "deferred")
+						if tc.replay {
+							require.NoError(t, os.WriteFile(s.batteryDeferredPath, nil, 0o600))
+						}
+						ticks := make(chan time.Time)
+						go s.run(ctx, ticks)
+						defer s.Stop()
+						if tc.notify {
+							s.Notify()
+							synctest.Wait()
+						}
+						if tc.backstop {
+							ticks <- time.Now()
+						}
+						synctest.Sleep(4 * time.Second)
+						synctest.Wait()
+						assert.Zero(t, mgr.callCount())
+						assert.FileExists(t, s.batteryDeferredPath)
+						if idleExit {
+							select {
+							case <-idled:
+							default:
+								assert.Fail(t, "battery-deferred work kept the daemon alive")
+							}
+							return
+						}
+						synctest.Sleep(3 * batteryRecheckInterval)
+						synctest.Wait()
+						assert.Zero(t, mgr.callCount())
+						battery.Store(false)
+						synctest.Sleep(batteryRecheckInterval)
+						synctest.Wait()
+						assert.Equal(t, []vector.BuildRequest{{Backstop: tc.backstop || tc.replay}}, mgr.callsSnapshot())
+						assert.NoFileExists(t, s.batteryDeferredPath)
+					})
+				})
+			}
+		})
+	}
+}
+
+func TestMessageSchedulerAutomaticBuildSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		runAfterSync, wantMarker bool
+		backstop                 string
+	}{
+		{name: "both enabled", runAfterSync: true, backstop: "24h", wantMarker: true},
+		{name: "after sync only", runAfterSync: true, backstop: "0", wantMarker: true},
+		{name: "backstop only", backstop: "24h", wantMarker: true},
+		{name: "automatic builds disabled", backstop: "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
+			cfg := vectorTestConfig(dataDir)
+			cfg.Vector.Embed.Recall = false
+			cfg.Vector.Embed.RunAfterSync = new(tc.runAfterSync)
+			cfg.Vector.Embed.BackstopInterval = tc.backstop
+			vs, err := setupVectorServing(t.Context(), cfg, database, nil)
+			require.NoError(t, err)
+			defer vs.Close()
+			if tc.wantMarker {
+				assert.Equal(t, cfg.Vector.ResolvedDBPath(cfg.DataDir)+".battery-deferred", vs.Scheduler.batteryDeferredPath)
+			} else {
+				assert.Empty(t, vs.Scheduler.batteryDeferredPath)
+			}
+		})
+	}
 }

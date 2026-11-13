@@ -33,6 +33,26 @@ The `prepare-sidecar` step runs automatically for `tauri:dev` and `tauri:build`.
 It builds `agentsview` and copies it to
 `src-tauri/binaries/agentsview-<target-triple>`.
 
+## Updates
+
+The app checks
+`https://github.com/kenn-io/agentsview/releases/download/updater/latest.json`
+for new versions. It installs an update only when the update's signature
+matches the public key in `plugins.updater.pubkey` in
+`src-tauri/tauri.conf.json`. That key belongs to the AgentsView release
+pipeline. Set `AGENTSVIEW_DESKTOP_AUTOUPDATE=0` to turn off update checks.
+
+A build that publishes its own updates passes its public key and its own
+update manifest URL at build time. The manifest must list updates signed with
+the matching private key:
+
+```bash
+npx tauri build --config '{"plugins":{"updater":{"pubkey":"<base64 key>","endpoints":["https://example.com/latest.json"]}}}'
+```
+
+The build stops with an error if the key is missing or is not a minisign
+public key, because that updater would refuse every update.
+
 ## Deep Links
 
 The desktop app registers the `agentsview://` URL scheme. External tools can
@@ -58,17 +78,29 @@ If a link appears to do nothing, deep link handling is recorded in
 the scheme is registered through the bundled app's `Info.plist`, so dev builds
 (`tauri:dev`) do not receive deep links; use a bundled build.
 
-## Window Behavior (macOS)
+## Window Behavior (macOS and Windows)
 
-Closing the main window hides AgentsView to the menu bar instead of quitting;
-the tray item keeps the backend running. The window comes back through the tray
-menu, a deep link, or standard macOS reopen gestures: clicking the Dock icon or
-activating the app with no visible windows.
+Closing the main window hides AgentsView instead of quitting; the tray item
+keeps the backend running. The window comes back through the tray menu, a deep
+link, or (on macOS) standard reopen gestures: clicking the Dock icon or
+activating the app with no visible windows. The tray menu provides Show
+AgentsView, Open Logs Folder, Check for Updates, and Quit; Quit is the only
+explicit way to exit. Both platforms share one status-item setup path and one
+close-handler path, with a platform-specific icon: the monochrome template
+asset on macOS and Tauri's packaged default window icon on Windows.
 
-AgentsView appears in the Dock and Cmd-Tab while running, even with the window
-hidden. To make it behave like a menu-bar app whenever the window is closed,
-check "Hide from Dock and Cmd-Tab when window closed" in the tray menu. The
-choice persists across relaunches, takes effect immediately, and applies to
+Tray and close-to-tray setup failures are logged and do not abort the desktop
+wrapper; close interception is registered only after tray creation succeeds, so
+a tray setup failure preserves normal close behavior instead of hiding the
+window without a way to restore it.
+
+Linux keeps normal close behavior and does not build in Tauri's `tray-icon`
+feature, which avoids adding Linux AppIndicator packaging requirements.
+
+AgentsView appears in the Dock and Cmd-Tab on macOS while running, even with the
+window hidden. To make it behave like a menu-bar app whenever the window is
+closed, check "Hide from Dock and Cmd-Tab when window closed" in the tray menu.
+The choice persists across relaunches, takes effect immediately, and applies to
 every restore path (tray menu, dock click, deep links, and second launches). It
 is off by default.
 

@@ -163,10 +163,11 @@ func TestSessionUsageJSONSchemaIncludesCostContract(t *testing.T) {
 		// db.CostUSDFromCost helper (called by every backend and
 		// the subagent combiner); set here directly since this
 		// test pins the JSON contract, not the computation.
-		CostUSD:        db.CostUSDFromCost(true, cost),
-		Models:         []string{"gpt-5.1"},
-		UnpricedModels: []string{"local-model"},
-		ServerRunning:  true,
+		CostUSD:           db.CostUSDFromCost(true, cost),
+		Models:            []string{"gpt-5.1"},
+		UnpricedModels:    []string{"local-model"},
+		ServerRunning:     true,
+		RefreshIncomplete: true,
 	}
 
 	data, err := json.Marshal(out)
@@ -186,12 +187,21 @@ func TestSessionUsageJSONSchemaIncludesCostContract(t *testing.T) {
 		"cost": map[string]any{
 			"microdollars": float64(420000),
 		},
-		"has_cost":        true,
-		"cost_usd":        0.42,
-		"models":          []any{"gpt-5.1"},
-		"unpriced_models": []any{"local-model"},
-		"server_running":  true,
+		"has_cost":           true,
+		"cost_usd":           0.42,
+		"models":             []any{"gpt-5.1"},
+		"unpriced_models":    []any{"local-model"},
+		"server_running":     true,
+		"refresh_incomplete": true,
 	}, raw, "a session with no subagents must omit subagent-only fields")
+
+	out.RefreshIncomplete = false
+	data, err = json.Marshal(out)
+	require.NoError(t, err)
+	raw = nil
+	require.NoError(t, json.Unmarshal(data, &raw))
+	assert.NotContains(t, raw, "refresh_incomplete",
+		"complete usage results must omit the incomplete-refresh field")
 }
 
 // TestSessionUsageJSONSchemaOmitsCostUSDWhenNoCost pins the other half of
@@ -258,16 +268,21 @@ func TestSessionUsageJSONSchemaIncludesSubagentContract(t *testing.T) {
 		"subagent rows keep their real source")
 }
 
-func TestRenderSessionUsageHuman_SubagentLine(t *testing.T) {
+func TestRenderSessionUsageHuman_SubagentLines(t *testing.T) {
 	tests := []struct {
-		name          string
-		subagentCount int
-		wantLine      bool
+		name              string
+		subagentCount     int
+		refreshIncomplete bool
+		wantLine          bool
 	}{
 		{name: "own session omits the line", subagentCount: 0},
 		{
 			name:          "combined session names the count",
 			subagentCount: 2, wantLine: true,
+		},
+		{
+			name:              "incomplete refresh reports stored totals",
+			refreshIncomplete: true,
 		},
 	}
 
@@ -276,7 +291,7 @@ func TestRenderSessionUsageHuman_SubagentLine(t *testing.T) {
 			out := &sessionUsageOutput{
 				SessionID: "claude:s1", Agent: "claude-code",
 				TotalOutputTokens: 100, HasTokenData: true,
-				SubagentCount: tt.subagentCount,
+				SubagentCount: tt.subagentCount, RefreshIncomplete: tt.refreshIncomplete,
 			}
 			var b strings.Builder
 			require.NoError(t, renderSessionUsageHuman(&b, out))
@@ -284,7 +299,48 @@ func TestRenderSessionUsageHuman_SubagentLine(t *testing.T) {
 				assert.Contains(t, b.String(), "Subagents:     2 (included)")
 				return
 			}
+			if tt.refreshIncomplete {
+				assert.Contains(t, b.String(), "Usage refresh is incomplete. Saved totals may be out of date.")
+				return
+			}
 			assert.NotContains(t, b.String(), "Subagents")
 		})
 	}
+}
+
+func TestRenderSessionUsageHuman_AgentRecordedCost(t *testing.T) {
+	out := &sessionUsageOutput{
+		SessionID: "pi:s1", Agent: "pi",
+		HasTokenData: true, Cost: money.MustParseDollars("0.42"), HasCost: true,
+		Models: []string{"custom-model"},
+	}
+	var b strings.Builder
+	require.NoError(t, renderSessionUsageHuman(&b, out))
+	assert.NotContains(t, b.String(), "Agent cost", "no line without a recorded cost")
+
+	out.RecordedCost = &db.SessionRecordedCost{
+		Recorded: money.MustParseDollars("0.50"), Computed: money.MustParseDollars("0.42"),
+		Rows: 3, FallbackRows: 1, UnpricedRows: 1,
+	}
+	b.Reset()
+	require.NoError(t, renderSessionUsageHuman(&b, out))
+	assert.Contains(t, b.String(),
+		"Agent cost:    the agent recorded $0.50; AgentsView charged $0.42 for the same usage "+
+			"(1 priced from the agent's figure because no catalog rate exists; 1 with no price from either)")
+}
+
+func TestRenderSessionUsageHuman_AgentSessionTotal(t *testing.T) {
+	cost := money.MustParseDollars("1.25")
+	out := &sessionUsageOutput{
+		SessionID: "claude:s1", Agent: "claude",
+		HasTokenData: true, Cost: money.MustParseDollars("1.10"), HasCost: true,
+		Models: []string{"claude-opus-5-5"},
+	}
+	out.SessionTotal = &db.SessionUsageTotal{
+		Source: "claude-cost-state", SubagentScope: "included", Cost: &cost, Incomplete: true,
+	}
+	var b strings.Builder
+	require.NoError(t, renderSessionUsageHuman(&b, out))
+	assert.Contains(t, b.String(),
+		"Agent total:   $1.25 for the session, including subagents; the agent could not price every model")
 }

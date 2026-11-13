@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatCount } from "../../utils/format.js";
   import { Bar, BarChart } from "layerchart";
   import { Button } from "@kenn-io/kit-ui";
   import { scaleUtc } from "d3-scale";
@@ -9,6 +10,7 @@
     type TimeInterval,
   } from "d3-time";
   import { analytics } from "../../stores/analytics.svelte.js";
+  import PanelStatus from "./PanelStatus.svelte";
   import {
     addDays,
     endOfMonth,
@@ -24,6 +26,7 @@
   } from "../../i18n/index.js";
 
   type Metric = "messages" | "sessions";
+  type ScaleMode = "absolute" | "percent";
   const MAX_DAY_RANGE = 120;
   interface Props {
     deferInitialFetch?: boolean;
@@ -34,9 +37,13 @@
   let { onRangeSelect, onRangeClear, deferInitialFetch = false }: Props = $props();
 
   let metric = $state<Metric>("messages");
+  let scaleMode = $state<ScaleMode>("absolute");
   let chartAreaWidth = $state(0);
   let keyboardAnchorIndex = $state<number | null>(null);
   const selectedRange = $derived(analytics.selectedActivityRange);
+  const percentScale = $derived(
+    metric === "messages" && scaleMode === "percent",
+  );
 
   const dayRangeCount = $derived.by(() => {
     const from = Date.parse(`${analytics.from}T00:00:00Z`);
@@ -103,7 +110,7 @@
   const chart = $derived.by(() => {
     const activitySeries = analytics.activity?.series;
     if (!activitySeries || activitySeries.length === 0) {
-      return { bars: [], labels: [] as string[] };
+      return { bars: [] };
     }
 
     const byDate = new Map(
@@ -119,15 +126,65 @@
           assistant_messages: 0,
         })
       : activitySeries;
-    const bars = series.map((entry) => ({
-      value: metric === "messages" ? entry.messages : entry.sessions,
-      date: entry.date,
-      instant: new Date(`${entry.date}T00:00:00Z`),
-      userMessages: entry.user_messages,
-      assistantMessages: entry.assistant_messages,
-    }));
+    const bars = series.map((entry) => {
+      const userMessages = entry.user_messages;
+      const assistantMessages = entry.assistant_messages;
+      const splitTotal = userMessages + assistantMessages;
+      const total = metric === "messages" ? entry.messages : entry.sessions;
+      // The message total also counts tool-result carrier rows and
+      // system-injected rows that belong to neither role segment.
+      const otherMessages = metric === "messages"
+        ? Math.max(0, total - splitTotal)
+        : 0;
+      let value: number;
+      let userRange: [number, number];
+      let assistantRange: [number, number];
+      let otherRange: [number, number];
+      if (metric === "messages") {
+        if (percentScale) {
+          const toPct = (part: number) =>
+            total > 0 ? (part / total) * 100 : 0;
+          const userPct = toPct(userMessages);
+          const assistantPct = toPct(assistantMessages);
+          value = 100;
+          userRange = [0, userPct];
+          assistantRange = [userPct, userPct + assistantPct];
+          otherRange = [userPct + assistantPct, total > 0 ? 100 : 0];
+        } else {
+          value = total;
+          userRange = [0, userMessages];
+          assistantRange = [userMessages, splitTotal];
+          otherRange = [splitTotal, total];
+        }
+      } else {
+        value = total;
+        userRange = [0, 0];
+        assistantRange = [0, 0];
+        otherRange = [0, 0];
+      }
+      return {
+        value,
+        total,
+        date: entry.date,
+        instant: new Date(`${entry.date}T00:00:00Z`),
+        userMessages,
+        assistantMessages,
+        otherMessages,
+        userRange,
+        assistantRange,
+        otherRange,
+      };
+    });
 
-    return { bars };
+    // Each day's focus and hover target spans the tallest column, so days
+    // with no messages or no user messages stay reachable.
+    const top = Math.max(0, ...bars.map((bar) => bar.value));
+    return {
+      bars: bars.map((bar) => ({
+        ...bar,
+        columnRange: [0, top] as [number, number],
+      })),
+    };
   });
   const xDomain = $derived.by((): [Date, Date] | undefined => {
     const first = chart.bars[0];
@@ -135,9 +192,27 @@
     if (!first || !last) return undefined;
     return [first.instant, xInterval.offset(last.instant, 1)];
   });
+  // The left padding holds the y-axis value labels; the selection
+  // overlay's inset in the styles below matches it.
+  const PLOT_PADDING = { top: 20, right: 24, bottom: 20, left: 40 };
+  const Y_TICKS = 4;
+  const percentTickFormat = $derived(
+    new Intl.NumberFormat(getLocale(), {
+      style: "percent",
+      maximumFractionDigits: 0,
+    }),
+  );
+  function formatYTick(value: number): string {
+    return percentScale
+      ? percentTickFormat.format(value / 100)
+      : formatCount(value);
+  }
   const barInset = $derived.by(() => {
     if (chart.bars.length === 0 || chartAreaWidth === 0) return 0;
-    const plotWidth = Math.max(chartAreaWidth - 48, 0);
+    const plotWidth = Math.max(
+      chartAreaWidth - PLOT_PADDING.left - PLOT_PADDING.right,
+      0,
+    );
     const bucketWidth = plotWidth / chart.bars.length;
     return Math.max(0, Math.min(1, (bucketWidth - 0.75) / 2));
   });
@@ -162,19 +237,43 @@
     });
   }
 
+  function barClass(
+    bar: (typeof chart.bars)[number],
+    segment?: "user" | "assistant" | "other",
+  ): string {
+    const inSelection = isSelected(bar);
+    const dimmed = selectedRange !== null && !inSelection;
+    return `bar${bar.total === 0 ? " empty" : ""}${inSelection ? " selected" : ""}${dimmed ? " dimmed" : ""}${segment ? ` bar-${segment}` : ""}`;
+  }
+
+  function splitPercent(bar: (typeof chart.bars)[number]): {
+    user: string;
+    assistant: string;
+    other: string;
+  } {
+    const format = new Intl.NumberFormat(getLocale(), {
+      style: "percent",
+      maximumFractionDigits: 1,
+    });
+    const toPct = (part: number) =>
+      format.format(bar.total > 0 ? part / bar.total : 0);
+    return {
+      user: toPct(bar.userMessages),
+      assistant: toPct(bar.assistantMessages),
+      other: toPct(bar.otherMessages),
+    };
+  }
+
   let tooltip = $state<{
     x: number;
     y: number;
     text: string;
   } | null>(null);
 
-  function handleBarHover(
-    e: MouseEvent,
+  function describeBar(
     bar: (typeof chart.bars)[number],
-  ) {
-    const rect = (
-      e.currentTarget as SVGElement
-    ).getBoundingClientRect();
+    asPercent: boolean,
+  ): string[] {
     const label = formatDateTime(`${bar.date}T00:00:00`, {
       month: "short",
       day: "numeric",
@@ -183,24 +282,48 @@
     const lines = [
       m.analytics_activity_timeline_tooltip_value({
         label,
-        value: bar.value.toLocaleString(getLocale()),
+        value: formatCount(bar.total),
         metric: metric === "messages"
           ? m.analytics_metric_messages()
           : m.analytics_metric_sessions(),
       }),
     ];
     if (metric === "messages") {
+      const split = asPercent
+        ? splitPercent(bar)
+        : {
+            user: formatCount(bar.userMessages),
+            assistant: formatCount(bar.assistantMessages),
+            other: formatCount(bar.otherMessages),
+          };
       lines.push(
         m.analytics_activity_timeline_tooltip_messages({
-          user: bar.userMessages,
-          assistant: bar.assistantMessages,
+          user: split.user,
+          assistant: split.assistant,
+          other: split.other,
         }),
       );
     }
+    return lines;
+  }
+
+  function isSelected(bar: (typeof chart.bars)[number]): boolean {
+    return selectedRange !== null &&
+      bar.date >= bucketStart(selectedRange.from) &&
+      bar.date <= bucketStart(selectedRange.to);
+  }
+
+  function handleBarHover(
+    e: MouseEvent,
+    bar: (typeof chart.bars)[number],
+  ) {
+    const rect = (
+      e.currentTarget as SVGElement
+    ).getBoundingClientRect();
     tooltip = {
       x: rect.left + rect.width / 2,
       y: rect.top - 4,
-      text: lines.join(" | "),
+      text: describeBar(bar, percentScale).join(" | "),
     };
   }
 
@@ -376,6 +499,24 @@
           {m.analytics_granularity_month()}
         </button>
       </div>
+      {#if metric === "messages"}
+        <div class="scale-toggle">
+          <button
+            class="toggle-btn"
+            class:active={scaleMode === "absolute"}
+            onclick={() => (scaleMode = "absolute")}
+          >
+            {m.analytics_activity_timeline_mode_absolute()}
+          </button>
+          <button
+            class="toggle-btn"
+            class:active={scaleMode === "percent"}
+            onclick={() => (scaleMode = "percent")}
+          >
+            {m.analytics_activity_timeline_mode_percent()}
+          </button>
+        </div>
+      {/if}
       {#if selectedRange}
         <Button
           size="sm"
@@ -384,20 +525,32 @@
           onclick={clearDateRange}
         />
       {/if}
+      {#if metric === "messages"}
+        <div class="segment-legend">
+          <span class="legend-item">
+            <span class="legend-swatch user" aria-hidden="true"></span>
+            {m.message_content_role_user()}
+          </span>
+          <span class="legend-item">
+            <span class="legend-swatch assistant" aria-hidden="true"></span>
+            {m.message_content_role_assistant()}
+          </span>
+          <span class="legend-item">
+            <span class="legend-swatch other" aria-hidden="true"></span>
+            {m.shared_other()}
+          </span>
+        </div>
+      {/if}
     </div>
   </div>
 
-  {#if analytics.errors.activity}
-    <div class="error">
-      {analytics.errors.activity}
-      <button
-        class="retry-btn"
-        onclick={() => analytics.fetchActivity()}
-      >
-        {m.shared_retry()}
-      </button>
-    </div>
-  {:else if chart.bars.length > 0}
+  <PanelStatus
+    hasData={analytics.activity !== null}
+    pending={analytics.querying.activity}
+    error={analytics.errors.activity}
+    onRetry={() => analytics.fetchActivity()}
+  />
+  {#if chart.bars.length > 0}
     <div class="chart-area" bind:clientWidth={chartAreaWidth}>
       <BarChart
         data={chart.bars}
@@ -408,11 +561,11 @@
         {xDomain}
         yDomain={[0, null]}
         yNice
-        padding={{ top: 20, right: 24, bottom: 20, left: 24 }}
+        padding={PLOT_PADDING}
         height={164}
         class="timeline-chart"
-        axis="x"
-        grid={{ class: "grid-line" }}
+        axis={true}
+        grid={{ class: "grid-line", yTicks: Y_TICKS }}
         rule={false}
         highlight={false}
         tooltipContext={false}
@@ -433,31 +586,71 @@
             rule: false,
             classes: { tickLabel: "x-label" },
           },
+          yAxis: {
+            ticks: Y_TICKS,
+            format: (value) => formatYTick(value as number),
+            tickMarks: false,
+            rule: false,
+            classes: { tickLabel: "y-label" },
+          },
         }}
       >
         {#snippet marks()}
           {#each chart.bars as bar, index (bar.date)}
-            <Bar
-              data={bar}
-              x="instant"
-              radius={1}
-              insets={{ left: barInset, right: barInset }}
-              class={`bar${bar.value === 0 ? " empty" : ""}${selectedRange && bar.date >= bucketStart(selectedRange.from) && bar.date <= bucketStart(selectedRange.to) ? " selected" : ""}${selectedRange && (bar.date < bucketStart(selectedRange.from) || bar.date > bucketStart(selectedRange.to)) ? " dimmed" : ""}`}
+            <g
+              class="day-column"
               role="button"
               tabindex={0}
               data-activity-bar-index={index}
-              aria-pressed={selectedRange !== null && bar.date >= bucketStart(selectedRange.from) && bar.date <= bucketStart(selectedRange.to)}
-              aria-label={m.analytics_activity_timeline_tooltip_value({
-                label: formatDateLabel(bar.instant),
-                value: bar.value.toLocaleString(getLocale()),
-                metric: metric === "messages"
-                  ? m.analytics_metric_messages()
-                  : m.analytics_metric_sessions(),
-              })}
+              aria-pressed={isSelected(bar)}
+              aria-label={describeBar(bar, false).join(", ")}
               onpointerenter={(event) => handleBarHover(event, bar)}
               onpointerleave={handleBarLeave}
               onkeydown={(event) => handleBarKeydown(event, index)}
-            />
+            >
+              <Bar
+                data={bar}
+                x="instant"
+                y="columnRange"
+                radius={1}
+                insets={{ left: barInset, right: barInset }}
+                class="bar-target"
+              />
+              {#if metric === "messages"}
+                <Bar
+                  data={bar}
+                  x="instant"
+                  y="userRange"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar, "user")}
+                />
+                <Bar
+                  data={bar}
+                  x="instant"
+                  y="assistantRange"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar, "assistant")}
+                />
+                <Bar
+                  data={bar}
+                  x="instant"
+                  y="otherRange"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar, "other")}
+                />
+              {:else}
+                <Bar
+                  data={bar}
+                  x="instant"
+                  radius={1}
+                  insets={{ left: barInset, right: barInset }}
+                  class={barClass(bar)}
+                />
+              {/if}
+            </g>
           {/each}
         {/snippet}
       </BarChart>
@@ -477,7 +670,7 @@
         <span>{tooltip.text}</span>
       </div>
     {/if}
-  {:else}
+  {:else if analytics.activity}
     <div class="empty">{m.analytics_activity_empty()}</div>
   {/if}
 </div>
@@ -497,20 +690,29 @@
 
   .controls {
     display: flex;
-    gap: 8px;
+    flex: 1;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    min-width: 0;
   }
 
+  /* Each choice group sits in its own inset track, like the shared
+     segmented control, so the three groups read as separate choices. */
   .metric-toggle,
-  .granularity-toggle {
+  .granularity-toggle,
+  .scale-toggle {
     display: flex;
     gap: 2px;
+    padding: 2px;
+    border-radius: var(--radius-md);
+    background: var(--bg-inset);
   }
 
   .toggle-btn {
     height: 22px;
     padding: 0 8px;
     border-radius: var(--radius-sm);
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 500;
     color: var(--text-muted);
     cursor: pointer;
@@ -527,9 +729,45 @@
     cursor: not-allowed;
   }
 
+  /* Shared selected-segment idiom (app.css): raised pill, medium weight. */
   .toggle-btn.active {
-    background: var(--bg-inset);
+    background: var(--selected-strong-bg);
+    box-shadow: var(--selected-strong-edge);
     color: var(--text-primary);
+    font-weight: var(--selected-strong-weight);
+  }
+
+  .segment-legend {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    margin-left: auto;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .legend-swatch {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+  }
+
+  .legend-swatch.user {
+    background: var(--accent-green);
+  }
+
+  .legend-swatch.assistant {
+    background: var(--accent-blue);
+  }
+
+  .legend-swatch.other {
+    background: var(--chart-series-other);
   }
 
   .chart-area {
@@ -555,7 +793,33 @@
     transition: opacity 0.15s;
   }
 
-  .timeline-container :global(.bar:hover) {
+  .timeline-container :global(.bar-user) {
+    fill: var(--accent-green);
+  }
+
+  .timeline-container :global(.bar-assistant) {
+    fill: var(--accent-blue);
+  }
+
+  .timeline-container :global(.bar-other) {
+    fill: var(--chart-series-other);
+  }
+
+  .timeline-container :global(.day-column) {
+    outline: none;
+  }
+
+  .timeline-container :global(.bar-target) {
+    fill: transparent;
+  }
+
+  .timeline-container :global(.day-column:focus-visible .bar-target) {
+    stroke: var(--accent-blue);
+    stroke-width: 1;
+  }
+
+  .timeline-container :global(.day-column:hover .bar),
+  .timeline-container :global(.day-column:focus-visible .bar) {
     opacity: 1;
   }
 
@@ -567,7 +831,7 @@
     opacity: 0.2;
   }
 
-  .timeline-container :global(.bar.dimmed:hover) {
+  .timeline-container :global(.day-column:hover .bar.dimmed) {
     opacity: 0.5;
   }
 
@@ -587,7 +851,7 @@
 
   .activity-selection-overlay {
     position: absolute;
-    inset: 20px 24px 24px;
+    inset: 20px 24px 24px 40px;
     pointer-events: none;
     background: color-mix(
       in srgb,
@@ -598,9 +862,18 @@
     border-right: 1px solid var(--accent-blue);
   }
 
-  .timeline-container :global(.x-label) {
-    font-size: 9px;
+  /* Value labels are quieter than the date labels: they give scale,
+     the dates locate the bars. */
+  .timeline-container :global(.y-label) {
+    font-size: 10px;
     fill: var(--text-muted);
+    font-family: var(--font-sans);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .timeline-container :global(.x-label) {
+    font-size: 11px;
+    fill: var(--text-secondary);
     font-family: var(--font-sans);
   }
 
@@ -610,7 +883,7 @@
     padding: 4px 8px;
     background: var(--text-primary);
     color: var(--bg-primary);
-    font-size: 10px;
+    font-size: 11px;
     border-radius: var(--radius-sm);
     white-space: nowrap;
     pointer-events: none;
@@ -622,23 +895,5 @@
     font-size: 12px;
     padding: 24px;
     text-align: center;
-  }
-
-  .error {
-    color: var(--accent-red);
-    font-size: 12px;
-    padding: 12px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .retry-btn {
-    padding: 2px 8px;
-    border: 1px solid currentColor;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    color: inherit;
-    cursor: pointer;
   }
 </style>

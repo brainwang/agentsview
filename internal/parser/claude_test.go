@@ -30,7 +30,7 @@ func TestClaudeSessionIdentity(t *testing.T) {
 		`{"type":"user","sessionId":"identity-shaped-noise","uuid":"u1","message":{"content":"hello"}}`,
 	}, "\n") + "\n"
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-	results, _, err := claudeParseWithExclusions(path, "project", "local")
+	results, _, err := claudeParseWithExclusions(t.Context(), path, "project", "local")
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "triage", results[0].Session.AgentLabel)
@@ -46,7 +46,7 @@ func TestClaudeSessionIdentityPreservesRawValues(t *testing.T) {
 		`{"type":"user","sessionId":"identity-shaped-noise","uuid":"u1","message":{"content":"hello"}}`,
 	}, "\n") + "\n"
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-	results, _, err := claudeParseWithExclusions(path, "project", "local")
+	results, _, err := claudeParseWithExclusions(t.Context(), path, "project", "local")
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "  Claude Code  ", results[0].Session.AgentLabel)
@@ -61,7 +61,7 @@ func TestClaudeSessionIdentityAbsent(t *testing.T) {
 		`{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"text","text":"hi"}]}}`,
 	}, "\n") + "\n"
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-	results, _, err := claudeParseWithExclusions(path, "project", "local")
+	results, _, err := claudeParseWithExclusions(t.Context(), path, "project", "local")
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Empty(t, results[0].Session.AgentLabel)
@@ -78,7 +78,7 @@ func TestClaudeSessionKindAndPromptSource(t *testing.T) {
 		`{"type":"user","uuid":"u2","parentUuid":"a1","promptSource":"queued","message":{"content":"second"}}`,
 	}, "\n") + "\n"
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-	results, _, err := claudeParseWithExclusions(path, "project", "local")
+	results, _, err := claudeParseWithExclusions(t.Context(), path, "project", "local")
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 
@@ -108,12 +108,41 @@ func TestClaudeSessionKindAndPromptSourceAbsent(t *testing.T) {
 		`{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"text","text":"hi"}]}}`,
 	}, "\n") + "\n"
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-	results, _, err := claudeParseWithExclusions(path, "project", "local")
+	results, _, err := claudeParseWithExclusions(t.Context(), path, "project", "local")
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Empty(t, results[0].Session.SessionKind)
 	for _, m := range results[0].Messages {
 		assert.Empty(t, m.PromptSource, "ordinal %d", m.Ordinal)
+	}
+}
+
+func TestClaudeWorkerOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name, entrypoint, origin, prefix string
+		want                             RelationshipType
+	}{
+		{name: "worker", entrypoint: "sdk-cli", origin: `"turnOrigin":"sdk",`, want: RelSubagent},
+		{name: "human relay", entrypoint: "sdk-cli", origin: `"turnOrigin":"human","origin":{"kind":"human"},`},
+		{name: "human conflict", entrypoint: "sdk-cli", origin: `"turnOrigin":"sdk","origin":{"kind":"human"},`},
+		{name: "missing origin", entrypoint: "sdk-cli"},
+		{name: "TypeScript SDK", entrypoint: "sdk-ts", origin: `"turnOrigin":"sdk",`},
+		{name: "queued human before worker", entrypoint: "sdk-cli", origin: `"turnOrigin":"sdk",`, prefix: `{"type":"attachment","timestamp":"2026-01-01T00:00:00Z","attachment":{"type":"queued_command","origin":{"kind":"human"},"prompt":"Human question"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := buildMetadataLine(map[string]any{"type": "agent-setting", "entrypoint": tc.entrypoint})
+			content := metadata + "\n" + tc.prefix + "\n" +
+				`{"type":"user",` + tc.origin + `"timestamp":"2026-01-01T00:01:00Z","promptSource":"sdk","message":{"content":"Plan a settings change."}}` + "\n" +
+				`{"type":"user","uuid":"u2","parentUuid":"u1","turnOrigin":"sdk","message":{"content":"Revise the plan."}}` + "\n"
+			path := createTestFile(t, "worker.jsonl", content)
+			results, _, err := claudeParseWithExclusions(t.Context(), path, "project", "local")
+			require.NoError(t, err)
+			require.Len(t, results, 1)
+			assert.Equal(t, tc.want, results[0].Session.RelationshipType)
+			assert.Empty(t, results[0].Session.ParentSessionID)
+			assert.Empty(t, results[0].Session.SessionKind)
+			assert.Equal(t, tc.entrypoint, results[0].Session.Entrypoint)
+		})
 	}
 }
 
@@ -595,7 +624,7 @@ func TestClaudeIncrementalStoredIdentityAppendStaysIncremental(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	msgs, _, _, _, parseErr := claudeParseSessionFrom(
+	msgs, _, _, _, parseErr := claudeParseSessionFrom(t.Context(),
 		path, info.Size(), claudeIncrementalScan{
 			startOrdinal:  1,
 			lastEntryUUID: "u1",
@@ -645,7 +674,7 @@ func TestClaudeIncrementalNewIdentityFieldStillEscalates(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, _, parseErr := claudeParseSessionFrom(
+	_, _, _, _, parseErr := claudeParseSessionFrom(t.Context(),
 		path, info.Size(), claudeIncrementalScan{
 			startOrdinal:  1,
 			lastEntryUUID: "u1",

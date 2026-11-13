@@ -13,6 +13,11 @@ const DAY_MS = 24 * HOUR_MS;
  */
 export const DEFAULT_REFRESH_INTERVAL_MS = 5 * MINUTE_MS;
 
+// active_since follows the clock, so only whether it is set changes the scope.
+export function refreshScopeKey(params: { active_since?: string }): string {
+  return JSON.stringify({ ...params, active_since: params.active_since !== undefined });
+}
+
 export function formatRefreshAge(updatedAt: number | null | undefined, now = Date.now()): string {
   if (updatedAt == null) return m.shared_refresh_not_updated();
 
@@ -64,12 +69,15 @@ export interface QuerySegment {
 /** One measured step of a page's last data query. `name` is a stable key
  * (see `formatQueryStepLabel`), never user-facing on its own. `startMs` is
  * the offset from the query's start, so parallel steps can be drawn on one
- * time axis. `segments` split the step into request phases when known. */
+ * time axis. `segments` split the step into request phases when known.
+ * `running` marks a step of an in-flight query that has not finished yet;
+ * the refresh control draws it up to the current time. */
 export interface QueryStep {
   name: string;
   startMs: number;
   durationMs: number;
   segments?: QuerySegment[];
+  running?: boolean;
 }
 
 /**
@@ -132,12 +140,14 @@ export function formatQueryPhaseLabel(phase: QueryPhase): string {
 
 /**
  * Tick positions for a time axis spanning `axisMs`: the smallest 1, 2, or 5
- * times a power of ten step that fits in at most five intervals, from zero.
- * Never finer than a millisecond, since labels are whole milliseconds.
+ * times a power of ten step that fits in at most four intervals, from zero.
+ * Four keeps labels such as "400 ms" from running together on the 200 px
+ * track. Never finer than a millisecond, since labels are whole
+ * milliseconds.
  */
 export function queryAxisTicks(axisMs: number): number[] {
   if (!(axisMs > 0)) return [0];
-  const raw = Math.max(axisMs / 5, 1);
+  const raw = Math.max(axisMs / 4, 1);
   const magnitude = 10 ** Math.floor(Math.log10(raw));
   const step = [1, 2, 5, 10].map((m) => m * magnitude).find((candidate) => candidate >= raw)!;
   const ticks: number[] = [];
@@ -171,6 +181,9 @@ const STEP_LABELS: Record<string, () => string> = {
   skills: () => m.shared_refresh_step_skills(),
   topSessions: () => m.shared_refresh_step_top_sessions(),
   contextSummary: () => m.shared_refresh_step_context_summary(),
+  attributionSummary: () => m.shared_refresh_step_attribution_summary(),
+  referenceSummary: () => m.shared_refresh_step_reference_summary(),
+  zoom: () => m.shared_refresh_step_zoom(),
   signals: () => m.shared_refresh_step_signals(),
   comparison: () => m.shared_refresh_step_comparison(),
   pairwise: () => m.shared_refresh_step_pairwise(),
@@ -250,13 +263,27 @@ export function formatRefreshStatus(
 }
 
 /**
- * Every age variant paired with every duration unit at its widest, so the
- * label box is measured once against the widest localized phrase it can
- * show and never changes width afterwards.
+ * The label while a page reports progress in place of the age: the
+ * progress text, then how long the running query has taken so far.
  */
-export function refreshStatusWidthSamples(): string[] {
+export function formatRefreshProgress(
+  status: string,
+  elapsedMs: number | null | undefined,
+): string {
+  const duration = formatQueryDuration(elapsedMs);
+  if (duration === "") return status;
+  return m.shared_refresh_age_with_duration({ age: status, duration });
+}
+
+/**
+ * Every age variant, and every progress text a page can show in its place,
+ * paired with every duration unit at its widest, so the label box is
+ * measured once against the widest localized phrase it can show and never
+ * changes width afterwards.
+ */
+export function refreshStatusWidthSamples(statuses: readonly string[] = []): string[] {
   const durations = queryDurationWidthSamples();
-  return refreshAgeWidthSamples().flatMap((age) =>
+  return [...refreshAgeWidthSamples(), ...statuses].flatMap((age) =>
     durations.map((duration) => m.shared_refresh_age_with_duration({ age, duration })),
   );
 }

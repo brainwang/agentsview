@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { m } from "../../i18n/index.js";
+  import { formatCount } from "../../utils/format.js";
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
+  import { formatDateTime, m } from "../../i18n/index.js";
   import { onMount, untrack } from "svelte";
   import {
     activity,
@@ -17,6 +19,7 @@
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
+  import FilterChip from "../shared/FilterChip.svelte";
   import { Card, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import RefreshControl from "../shared/RefreshControl.svelte";
   import {
@@ -34,6 +37,7 @@
   import ConcurrencyTimeline from "./ConcurrencyTimeline.svelte";
   import SessionsTable from "./SessionsTable.svelte";
   import Breakdowns from "./Breakdowns.svelte";
+  import { shortenId } from "../../utils/shortId.js";
   import ActivityInsight from "./ActivityInsight.svelte";
 
   // Date-only (local) bounds for the inline insight panel, derived from the
@@ -50,6 +54,20 @@
       ? localDateStr(new Date(new Date(activity.report.range_end).getTime() - 1))
       : "",
   );
+  // The report's last data point while its period is still in progress, in the
+  // report's timezone so it matches the timeline clock labels.
+  const inProgressAsOf = $derived.by(() => {
+    const report = activity.report;
+    if (!report?.partial || !report.as_of) return "";
+    const d = new Date(report.as_of);
+    if (Number.isNaN(d.getTime())) return "";
+    return formatDateTime(d, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      timeZone: report.timezone,
+    });
+  });
   const activityPanelDate = $derived(currentActivityPanelDate());
   const activityDateSignature = $derived(dateSignature(activityPanelDate));
   let activityYokeReady = $state(false);
@@ -76,9 +94,15 @@
     }
   });
 
+  // The last sessions request the user started: a time range, a sort, or the
+  // next page. Retry repeats it, so a failed sort or range change is retried
+  // instead of loading the next page of the list still on screen.
+  let retrySessions: (() => void) | null = null;
+
   async function selectRange(
     sel: { start: number; end: number; label: string } | null,
   ) {
+    retrySessions = () => void selectRange(sel);
     const generation = activity.reportGeneration;
     if (
       await activity.loadSessionPage({
@@ -94,7 +118,13 @@
     sort: import("../../api/activity-report.js").ActivitySessionSort,
     direction: "asc" | "desc",
   ) {
+    retrySessions = () => void sortSessions(sort, direction);
     await activity.loadSessionPage({ sort, direction });
+  }
+
+  function loadMoreSessions(cursor: string) {
+    retrySessions = () => loadMoreSessions(cursor);
+    void activity.loadSessionPage({ cursor });
   }
 
   function reportProgressLabel(progress: ActivityReportProgress | null): string {
@@ -117,6 +147,15 @@
   const refreshStatus = $derived(
     activity.loading ? reportProgressLabel(activity.progress) : undefined,
   );
+  // Every progress label at its widest, so the refresh label box fits them
+  // with the running duration after them.
+  const refreshStatusSamples = [
+    m.activity_loading_report(),
+    m.activity_loading_sessions(),
+    m.activity_loading_usage(),
+    m.activity_report_progress({ count: 9_999_999 }),
+    m.activity_finalizing_report(),
+  ];
 
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   let today = $state(localDateStr(new Date()));
@@ -140,11 +179,11 @@
     {
       name: "",
       label: m.activity_all_agents(),
-      displayLabel: m.activity_all_agents(),
+      displayLabel: m.filter_dropdown_all(),
     },
     ...activity.agents.map((agent) => ({
       name: agent.name,
-      label: `${agent.name} (${agent.session_count})`,
+      label: `${agent.name} (${formatCount(agent.session_count)})`,
       displayLabel: agent.name,
       count: agent.session_count,
     })),
@@ -152,13 +191,6 @@
   // Machines sharing a friendly label get a short ID fragment so they stay
   // distinguishable. Full IDs are non-shrinking meta and would squeeze the
   // label to zero width in the compact menu, so unique labels get no meta.
-  function shortMachineId(machine: string, peers: string[]): string {
-    const head = machine.slice(0, 8);
-    if (peers.every((peer) => peer === machine || peer.slice(0, 8) !== head)) return head;
-    const tail = machine.slice(-8);
-    if (peers.every((peer) => peer === machine || peer.slice(-8) !== tail)) return `…${tail}`;
-    return machine;
-  }
   const machineOptions = $derived.by((): TypeaheadOption[] => {
     const byLabel = new Map<string, string[]>();
     for (const machine of activity.machines) {
@@ -169,12 +201,12 @@
       {
         name: "",
         label: m.activity_all_machines(),
-        displayLabel: m.activity_all_machines(),
+        displayLabel: m.filter_dropdown_all(),
       },
       ...activity.machines.map((machine) => {
         const label = sessions.machineLabel(machine);
         const peers = byLabel.get(label) ?? [];
-        const shortId = peers.length > 1 ? shortMachineId(machine, peers) : undefined;
+        const shortId = peers.length > 1 ? shortenId(machine, peers) : undefined;
         return {
           name: machine,
           label,
@@ -188,7 +220,7 @@
     {
       name: "all",
       label: m.activity_all_sessions(),
-      displayLabel: m.activity_all_sessions(),
+      displayLabel: m.filter_dropdown_all(),
     },
     {
       name: "interactive",
@@ -337,6 +369,7 @@
 
   function onMachineChange(value: string) {
     activity.setMachine(value);
+    if (!activity.machines.length) activity.loadFilterOptions();
     activity.load();
   }
 
@@ -391,59 +424,74 @@
       onSelect={applyRange}
     />
 
-    <ProjectTypeahead
-      projects={activity.projects}
-      value={activity.project}
-      onselect={onProjectSelect}
-    />
+    <FilterChip active={activity.project !== ""}>
+      <ProjectTypeahead
+        projects={activity.projects}
+        value={activity.project}
+        onselect={onProjectSelect}
+        triggerPrefix={`${m.analytics_col_project()}:`}
+        allLabel={m.filter_dropdown_all()}
+      />
+    </FilterChip>
 
-    <div class="toolbar-typeahead">
+    <FilterChip active={activity.agent !== ""}>
       <Typeahead
         options={agentOptions}
         value={activity.agent}
-        fallbackLabel={m.activity_all_agents()}
+        fallbackLabel={m.filter_dropdown_all()}
         placeholder={m.activity_filter_agents_placeholder()}
         title={m.activity_filter_by_agent()}
         emptyLabel={m.activity_no_matching_agents()}
+        triggerPrefix={`${m.analytics_col_agent()}:`}
         onselect={onAgentChange}
       />
-    </div>
+    </FilterChip>
 
-    <div class="toolbar-typeahead">
+    <FilterChip active={activity.machine !== ""}>
       <Typeahead
         options={machineOptions}
         value={activity.machine}
-        fallbackLabel={m.activity_all_machines()}
+        fallbackLabel={activity.machine || m.filter_dropdown_all()}
         placeholder={m.activity_filter_machines_placeholder()}
         title={m.activity_filter_by_machine()}
         emptyLabel={m.activity_no_matching_machines()}
+        triggerPrefix={`${m.sidebar_filters_machine()}:`}
         onselect={onMachineChange}
       />
-    </div>
+    </FilterChip>
 
-    <div class="toolbar-typeahead compact">
+    <FilterChip active={activity.automation !== "all"}>
       <Typeahead
         options={automationOptions}
         value={activity.automation}
-        fallbackLabel={m.activity_all_sessions()}
+        fallbackLabel={m.filter_dropdown_all()}
         placeholder={m.activity_filter_automation_placeholder()}
         title={m.activity_filter_by_automation()}
         emptyLabel={m.activity_no_automation_filters()}
+        triggerPrefix={`${m.analytics_col_sessions()}:`}
         onselect={onAutomationChange}
       />
-    </div>
+    </FilterChip>
 
     <div class="activity-refresh" aria-live="polite">
       <RefreshControl
         lastUpdatedAt={activity.lastUpdatedAt}
         queryDurationMs={activity.lastQueryDurationMs}
         querySteps={activity.lastQuerySteps}
+        liveQuery={activity.liveQuery}
         busy={activity.loading}
         status={refreshStatus}
+        statusWidthSamples={refreshStatusSamples}
         onRefresh={() => activity.load({ background: true })}
         label={m.activity_refresh()}
       />
     </div>
+
+    {#if inProgressAsOf}
+      <div class="activity-partial-note">
+        {m.activity_in_progress_as_of({ time: inProgressAsOf })}
+      </div>
+    {/if}
   </div>
 
   <div class="activity-content">
@@ -470,18 +518,50 @@
           error={activity.sessionsError}
           sortKey={activity.sessionsSort}
           sortDir={activity.sessionsDirection}
+          listVersion={activity.sessionsListVersion}
           onClearFilter={() => selectRange(null)}
           onSort={sortSessions}
-          onNext={(cursor) => activity.loadSessionPage({ cursor })}
+          onLoadMore={loadMoreSessions}
+          onRetry={() => retrySessions?.()}
         />
       </Card>
       <Card level="default" padding="none" class="chart-panel">
         <Breakdowns report={activity.report} />
       </Card>
     {:else if activity.loading}
-      <div class="status">{m.activity_loading_report()}</div>
+      <!-- First load only: placeholders in the loaded layout (stat cards,
+           chart, sessions table) so the page does not jump when the report
+           lands. The toolbar's refresh status carries the live progress. -->
+      <div class="activity-skeleton" role="status">
+        <span class="kit-sr-only">{m.activity_loading_report()}</span>
+        <div class="skeleton-stats" aria-hidden="true">
+          {#each Array(7) as _, i (i)}
+            <Card level="default" padding="none" class="skeleton-stat">
+              <span class="skeleton-bar skeleton-value"></span>
+              <span class="skeleton-bar skeleton-label"></span>
+            </Card>
+          {/each}
+        </div>
+        <Card level="default" padding="none" class="chart-panel skeleton-chart">
+          <div class="skeleton-row" aria-hidden="true">
+            <span class="skeleton-bar skeleton-tabs"></span>
+            <span class="skeleton-bar skeleton-control"></span>
+          </div>
+          <span class="skeleton-bar skeleton-plot" aria-hidden="true"></span>
+        </Card>
+        <Card level="default" padding="none" class="chart-panel skeleton-table">
+          <span class="skeleton-bar skeleton-heading" aria-hidden="true"></span>
+          {#each Array(5) as _, i (i)}
+            <div class="skeleton-row" aria-hidden="true">
+              <span class="skeleton-bar skeleton-cell-wide"></span>
+              <span class="skeleton-bar skeleton-cell"></span>
+              <span class="skeleton-bar skeleton-cell"></span>
+            </div>
+          {/each}
+        </Card>
+      </div>
     {:else if activity.error}
-      <div class="status error">
+      <div class="status error" {@attach errorTelemetry("analytics")}>
         <span>{activity.error}</span>
         <button class="retry-btn" onclick={() => activity.load()}>
           {m.shared_retry()}
@@ -529,16 +609,6 @@
     flex-shrink: 0;
   }
 
-  .toolbar-typeahead {
-    --typeahead-min-width: 132px;
-    --typeahead-max-width: 184px;
-  }
-
-  .toolbar-typeahead.compact {
-    --typeahead-min-width: 118px;
-    --typeahead-max-width: 150px;
-  }
-
   /* The control reserves its own text widths (see shared/RefreshControl),
    * so it needs no clamp here: the age box clips a long progress status
    * instead of pushing the toolbar around. */
@@ -546,6 +616,14 @@
     flex: 0 0 auto;
     max-width: 100%;
     min-width: 0;
+  }
+
+  /* Pinned to the right end of the toolbar, or of the wrapped last row. */
+  .activity-partial-note {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--accent-amber);
+    white-space: nowrap;
   }
 
   .activity-content {
@@ -560,6 +638,80 @@
   .activity-content :global(.chart-panel) {
     padding: 12px;
     min-width: 0;
+  }
+
+  /* ── First-load skeleton ──
+   * Neutral blocks sized like the loaded report. A slow opacity pulse
+   * (no sweep) signals progress; reduced motion holds it still. */
+  .activity-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .skeleton-stats {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .skeleton-stats :global(.skeleton-stat) {
+    flex: 1;
+    min-width: 120px;
+    min-height: 78px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .skeleton-stats :global(.skeleton-stat > .kit-card__body) {
+    display: contents;
+  }
+
+  .activity-content :global(.skeleton-chart),
+  .activity-content :global(.skeleton-table) {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .activity-content :global(.skeleton-chart > .kit-card__body),
+  .activity-content :global(.skeleton-table > .kit-card__body) {
+    display: contents;
+  }
+
+  .skeleton-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .skeleton-bar {
+    display: block;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+    animation: skeleton-pulse 1.8s ease-in-out infinite alternate;
+  }
+
+  .skeleton-value { width: 44px; height: 18px; }
+  .skeleton-label { width: 72px; height: 10px; }
+  .skeleton-tabs { width: 300px; height: 22px; }
+  .skeleton-control { width: 140px; height: 22px; margin-left: auto; }
+  .skeleton-plot { height: 190px; }
+  .skeleton-heading { width: 80px; height: 12px; }
+  .skeleton-cell-wide { flex: 2; height: 10px; }
+  .skeleton-cell { flex: 1; height: 10px; }
+
+  @keyframes skeleton-pulse {
+    from { opacity: 1; }
+    to { opacity: 0.5; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton-bar {
+      animation: none;
+    }
   }
 
   .status {

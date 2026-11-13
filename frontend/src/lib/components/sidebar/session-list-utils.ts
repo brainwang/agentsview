@@ -1,4 +1,5 @@
-import type { SessionGroup, SessionGroupInput } from "../../stores/sessions.svelte.js";
+import type { SessionGroup, SessionGroupInput } from "../../stores/sessionGroups.js";
+import { sessionAncestryMatcher } from "../../utils/session-ancestry.js";
 
 export const ITEM_HEIGHT = 42;
 const CHILD_ITEM_HEIGHT = 34;
@@ -113,29 +114,6 @@ function isTeammateByMessage(s: SessionGroupInput): boolean {
 }
 
 /**
- * Check if a session is a teammate, inheriting status from the
- * parent.  Continuation sessions of a teammate don't carry the
- * `<teammate-message>` tag themselves, but they belong to the
- * same teammate chain.
- */
-function isTeammate(s: SessionGroupInput, allSessions: SessionGroupInput[]): boolean {
-  if (isTeammateByMessage(s)) return true;
-  // Walk up the parent chain within the group to inherit.
-  if (s.parent_session_id) {
-    const visited = new Set<string>();
-    let cur: SessionGroupInput | undefined = s;
-    while (cur?.parent_session_id && !visited.has(cur.id)) {
-      visited.add(cur.id);
-      const parent = allSessions.find((p) => p.id === cur!.parent_session_id);
-      if (!parent) break;
-      if (isTeammateByMessage(parent)) return true;
-      cur = parent;
-    }
-  }
-  return false;
-}
-
-/**
  * Check if a session is a subagent (has relationship_type === "subagent").
  * Continuation/fork sessions are NOT subagents.
  */
@@ -150,22 +128,10 @@ function isSubagent(s: SessionGroupInput): boolean {
  * subagent stay under the "Subagents" group header instead of
  * being miscategorised as plain continuations.
  */
-export function isSubagentDescendant(
-  s: SessionGroupInput,
+export function subagentDescendantMatcher(
   groupSessions: SessionGroupInput[],
-): boolean {
-  if (isSubagent(s)) return true;
-  if (!s.parent_session_id) return false;
-  const visited = new Set<string>();
-  let cur: SessionGroupInput | undefined = s;
-  while (cur?.parent_session_id && !visited.has(cur.id)) {
-    visited.add(cur.id);
-    const parent = groupSessions.find((p) => p.id === cur!.parent_session_id);
-    if (!parent) break;
-    if (isSubagent(parent)) return true;
-    cur = parent;
-  }
-  return false;
+): (session: SessionGroupInput) => boolean {
+  return sessionAncestryMatcher(groupSessions, isSubagent);
 }
 
 /**
@@ -209,13 +175,15 @@ function emitGroupItems(
   // filtered-out ancestors don't break the parent-chain walk.
   const children = g.sessions.filter((s) => s.id !== g.primarySessionId);
   const ancestryPool = g.allSessions ?? g.sessions;
+  const isSubagentChild = subagentDescendantMatcher(ancestryPool);
+  const isTeammateChild = sessionAncestryMatcher(ancestryPool, isTeammateByMessage);
   const subagents: SessionGroupInput[] = [];
   const teammates: SessionGroupInput[] = [];
   const continuations: SessionGroupInput[] = [];
   for (const s of children) {
-    if (isSubagentDescendant(s, ancestryPool)) {
+    if (isSubagentChild(s)) {
       subagents.push(s);
-    } else if (isTeammate(s, ancestryPool)) {
+    } else if (isTeammateChild(s)) {
       teammates.push(s);
     } else {
       continuations.push(s);
@@ -241,7 +209,7 @@ function emitGroupItems(
     const hasFollowingGroup = subagents.length > 0 || teammates.length > 0;
     const isLast = i === continuations.length - 1 && !hasFollowingGroup;
     items.push({
-      id: `child:${s.id}`,
+      id: `child:${g.key}:${s.id}`,
       type: "session",
       label,
       count: 0,
@@ -286,7 +254,7 @@ function emitGroupItems(
       for (let i = 0; i < subagents.length; i++) {
         const s = subagents[i]!;
         items.push({
-          id: `child:${s.id}`,
+          id: `child:${g.key}:${s.id}`,
           type: "session",
           label,
           count: 0,
@@ -326,7 +294,7 @@ function emitGroupItems(
       for (let i = 0; i < teammates.length; i++) {
         const s = teammates[i]!;
         items.push({
-          id: `child:${s.id}`,
+          id: `child:${g.key}:${s.id}`,
           type: "session",
           label,
           count: 0,

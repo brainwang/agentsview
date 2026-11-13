@@ -51,54 +51,31 @@ type crushProjectsFile struct {
 	} `json:"projects"`
 }
 
-// crushProjectsDataDirs reads a Crush projects.json registry and returns
-// the per-project data directories it lists.
-func crushProjectsDataDirs(registryPath string) []string {
+// readCrushProjects reads roots and project attribution from one registry snapshot.
+func readCrushProjects(registryPath string) ([]string, map[string]string, error) {
 	data, err := os.ReadFile(registryPath)
 	if err != nil {
-		return nil
+		return nil, nil, err
 	}
 	var pf crushProjectsFile
 	if err := json.Unmarshal(data, &pf); err != nil {
-		return nil
+		return nil, nil, err
 	}
 	dirs := make([]string, 0, len(pf.Projects))
-	for _, project := range pf.Projects {
-		dir := strings.TrimSpace(project.DataDir)
-		if dir == "" {
-			continue
-		}
-		dirs = append(dirs, filepath.Clean(dir))
-	}
-	return dirs
-}
-
-// crushProjectDirsMapping reads a Crush projects.json registry and returns
-// a mapping from each data directory to its project path. The project path
-// is used for project attribution when the data directory does not follow
-// the default <project>/.crush layout.
-func crushProjectDirsMapping(registryPath string) map[string]string {
-	data, err := os.ReadFile(registryPath)
-	if err != nil {
-		return nil
-	}
-	var pf crushProjectsFile
-	if err := json.Unmarshal(data, &pf); err != nil {
-		return nil
-	}
 	mapping := make(map[string]string, len(pf.Projects))
 	for _, project := range pf.Projects {
 		dir := strings.TrimSpace(project.DataDir)
 		if dir == "" {
 			continue
 		}
+		dirs = append(dirs, filepath.Clean(dir))
 		path := strings.TrimSpace(project.Path)
 		if path == "" {
 			continue
 		}
 		mapping[filepath.Clean(dir)] = filepath.Clean(path)
 	}
-	return mapping
+	return dirs, mapping, nil
 }
 
 func crushProjectDir(dbPath string, projectMapping map[string]string) string {
@@ -109,7 +86,7 @@ func crushProjectDir(dbPath string, projectMapping map[string]string) string {
 	return filepath.Clean(filepath.Dir(dataDir))
 }
 
-func openCrushDB(dbPath string, stableSnapshot bool) (*sql.DB, error) {
+func openCrushDB(ctx context.Context, dbPath string, stableSnapshot bool) (*sql.DB, error) {
 	// Immutable mode is used only for explicit stable snapshots. Live
 	// reads must not fall back to it: a WAL-backed store opened with
 	// immutable=1 ignores the WAL and can return stale session contents.
@@ -122,7 +99,7 @@ func openCrushDB(dbPath string, stableSnapshot bool) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening crush sessions database %s: %w", dbPath, err)
 	}
-	if err := db.PingContext(context.Background()); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("opening crush sessions database %s: %w (WAL corruption is a possible cause; Crush must repair the store)", dbPath, err)
 	}
@@ -243,7 +220,7 @@ func forEachCrushSessionMeta(
 	if !IsRegularFile(dbPath) {
 		return nil
 	}
-	db, err := openCrushDB(dbPath, stableSnapshot)
+	db, err := openCrushDB(ctx, dbPath, stableSnapshot)
 	if err != nil {
 		return err
 	}
@@ -282,7 +259,7 @@ func crushSessionMeta(
 	if !IsRegularFile(dbPath) {
 		return dbBackedSessionMeta{}, false, nil
 	}
-	db, err := openCrushDB(dbPath, stableSnapshot)
+	db, err := openCrushDB(ctx, dbPath, stableSnapshot)
 	if err != nil {
 		return dbBackedSessionMeta{}, false, err
 	}
@@ -325,7 +302,7 @@ func parseCrushSession(
 	ctx context.Context, dbPath, sessionID, machine string,
 	stableSnapshot bool, projectMapping map[string]string,
 ) (*ParsedSession, []ParsedMessage, error) {
-	db, err := openCrushDB(dbPath, stableSnapshot)
+	db, err := openCrushDB(ctx, dbPath, stableSnapshot)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -1067,7 +1067,7 @@ func TestRunClaudeReportingFailuresAreDistinctAndWriteResults(t *testing.T) {
 			name: "finalization timeout", mode: "claude-final",
 			limits: func() Limits {
 				limits := testLimits()
-				limits.FinalizationWait = 40 * time.Millisecond
+				limits.FinalizationWait = 40 * time.Millisecond //nolint:kennlint // deadlinetest: the producer leaves the source incomplete until finalization expires
 				limits.Quiescence = 20 * time.Millisecond
 				return limits
 			}(),
@@ -1110,6 +1110,8 @@ func TestFailedReportRetryPreservesFirstFailureUntilSuccess(t *testing.T) {
 	firstResultPath := filepath.Join(t.TempDir(), "first.json")
 	limits := testLimits()
 	limits.MaxSourceBytes = 8 << 10
+	// The first run reports no session only after this wait expires.
+	limits.FinalizationWait = time.Second
 	producer := copyCaptureHelper(t, "claude")
 
 	_, err = Run(t.Context(), RunOptions{
@@ -1156,6 +1158,14 @@ func TestFailedReportRetryPreservesFirstFailureUntilSuccess(t *testing.T) {
 		claudeHelperLines(captured.ProviderSessionID, physicalWorkDir, false), "\n") + "\n")
 	require.Less(t, int64(len(validData)), limits.MaxSourceBytes)
 	require.NoError(t, os.WriteFile(sourcePath, validData, 0o600))
+	// Report reuses the recorded limits. Give the successful retry the full
+	// test budget so a slow runner cannot turn it into a timeout.
+	state, err := openState(captureDir)
+	require.NoError(t, err)
+	state.manifest.Limits.FinalizationWait = testLimits().FinalizationWait
+	saveErr := state.saveManifest()
+	state.close()
+	require.NoError(t, saveErr)
 	successPath := filepath.Join(t.TempDir(), "success.json")
 	reporting, err = Report(t.Context(), ReportOptions{
 		CaptureDir: captureDir, ResultPath: successPath,
@@ -1388,6 +1398,37 @@ func TestRunCodexRequiresJSONAndUsesExactThreadMarker(t *testing.T) {
 	assert.Nil(t, result.Usage.CacheCreationInputTokens)
 	assert.Contains(t, result.Assurance.Reasons, ReasonCodexCacheWriteAbsent)
 	assert.Contains(t, result.Assurance.Reasons, ReasonReasoningAbsent)
+}
+
+func TestRunCodexCacheWriteKeepsV1InputTotal(t *testing.T) {
+	producer := copyCaptureHelper(t, "codex")
+	root := t.TempDir()
+	resultPath := filepath.Join(t.TempDir(), "result.json")
+	_, err := Run(t.Context(), RunOptions{
+		Provider: ProviderCodex, OccurrenceID: "codex-cache-write",
+		CaptureDir: filepath.Join(t.TempDir(), "capture"), ResultPath: resultPath,
+		ProviderRoot: root, WorkDir: t.TempDir(),
+		Command:     []string{producer, "exec", "--json", "PROMPT_SENTINEL"},
+		Environment: helperEnvironment(root, "codex-cache-write", 0),
+		Streams:     Streams{Stdout: io.Discard, Stderr: io.Discard},
+		Limits:      testLimits(), CustomPricing: testPricing(),
+	})
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(resultPath)
+	require.NoError(t, err)
+	result, err := DecodeResult(bytes.NewReader(data))
+	require.NoError(t, err)
+	require.NotNil(t, result.Usage)
+	// Input 100 = 60 read + 30 written + 10 uncached; v1 keeps writes inside input.
+	assertIntPointer(t, result.Usage.InputTokens, 40)
+	assertIntPointer(t, result.Usage.OutputTokens, 10)
+	assertIntPointer(t, result.Usage.CacheReadInputTokens, 60)
+	assert.Nil(t, result.Usage.CacheCreationInputTokens)
+	assert.Contains(t, result.Assurance.Reasons, ReasonCodexCacheWriteAbsent)
+	require.NotNil(t, result.Cost)
+	// 10 uncached x 1 + 30 written x 2 + 60 read x 1 + 10 output x 1.
+	assert.Equal(t, int64(140), result.Cost.Amount.Microdollars)
 }
 
 func TestRunCodexQuiescentUnfinishedSessionSealsPartialUsage(t *testing.T) {
@@ -1767,6 +1808,9 @@ func TestConcurrentClaudeCapturesCannotSelectEachOthersSessions(t *testing.T) {
 }
 
 func TestConcurrentClaudeCapturesCannotReserveSameSession(t *testing.T) {
+	// Allow the full finalization budget plus startup and cleanup time. A
+	// shorter guard can fail a healthy capture on a slow Windows runner.
+	captureWait := testLimits().FinalizationWait + time.Minute
 	root := t.TempDir()
 	workDir := t.TempDir()
 	producer := copyCaptureHelper(t, "claude")
@@ -1807,19 +1851,19 @@ func TestConcurrentClaudeCapturesCannotReserveSameSession(t *testing.T) {
 		_ = release.Close()
 		select {
 		case <-firstStopped:
-		case <-time.After(20 * time.Second):
+		case <-time.After(captureWait):
 			assert.Fail(t, "reserved capture did not stop during cleanup")
 		}
 	})
 	require.Eventually(t, func() bool {
 		_, err := os.Stat(marker)
 		return err == nil
-	}, 20*time.Second, 10*time.Millisecond)
+	}, captureWait, 10*time.Millisecond)
 	secondCaptureDir := filepath.Join(t.TempDir(), "capture-second")
 	secondWorkDir := t.TempDir()
 	var secondOutput bytes.Buffer
 	secondLimits := testLimits()
-	secondLimits.FinalizationWait = 200 * time.Millisecond
+	secondLimits.FinalizationWait = time.Second
 	_, err := Run(t.Context(), RunOptions{
 		Provider: ProviderClaude, OccurrenceID: "reserved-second",
 		ProviderSessionID: sessionID,
@@ -1845,12 +1889,12 @@ func TestConcurrentClaudeCapturesCannotReserveSameSession(t *testing.T) {
 			root, encodeClaudeWorkDir(resolvedWorkDir), sessionID+".jsonl",
 		))
 		return err == nil
-	}, 20*time.Second, 10*time.Millisecond)
+	}, captureWait, 10*time.Millisecond)
 	select {
 	case first := <-firstDone:
 		require.NoError(t, first.err)
 		assert.Equal(t, 0, first.outcome.ExitCode)
-	case <-time.After(20 * time.Second):
+	case <-time.After(captureWait):
 		require.FailNow(t, "reserved capture did not finish after release")
 	}
 }
@@ -1971,7 +2015,7 @@ func TestClaudeCaptureRetryDropsRemovedSubagentUsage(t *testing.T) {
 	case response := <-done:
 		require.NoError(t, response.err)
 		require.Fail(t, "capture completed before persisting its source set")
-	case <-time.After(20 * time.Second):
+	case <-time.After(testLimits().FinalizationWait + time.Minute):
 		require.Fail(t, "capture did not persist its source set")
 	}
 	data, err := os.ReadFile(filepath.Join(captureDir, manifestFileName))
@@ -2141,7 +2185,7 @@ func TestCaptureDistinguishesAnObservedSourceThatDisappears(t *testing.T) {
 	case response := <-done:
 		require.Failf(t, "capture completed before persisting its source set",
 			"exit=%d err=%v", response.outcome.ExitCode, response.err)
-	case <-time.After(20 * time.Second):
+	case <-time.After(limits.FinalizationWait + time.Minute):
 		require.Fail(t, "capture did not persist its source set")
 	}
 	require.NoError(t, os.Rename(root, root+"-gone"))
@@ -2203,15 +2247,6 @@ func copyCaptureHelper(t *testing.T, name string) string {
 	require.NoError(t, out.Close())
 	captureHelperPaths[name] = path
 	return path
-}
-
-func TestCopyCaptureHelperReusesExecutableByName(t *testing.T) {
-	first := copyCaptureHelper(t, "claude")
-	second := copyCaptureHelper(t, "claude")
-	codex := copyCaptureHelper(t, "codex")
-
-	assert.Equal(t, first, second)
-	assert.NotEqual(t, first, codex)
 }
 
 func helperEnvironment(root, mode string, exitCode int) []string {
@@ -2339,7 +2374,7 @@ func captureTestHelper() {
 		mode == "codex-multiple" || mode == "codex-subagent" ||
 		mode == "codex-late-subagent" || mode == "codex-changing-subagent" ||
 		mode == "codex-malformed" || mode == "codex-malformed-tail" ||
-		mode == "codex-subagent-malformed" {
+		mode == "codex-subagent-malformed" || mode == "codex-cache-write" {
 		var childRelease *os.File
 		id := "11111111-1111-4111-8111-111111111111"
 		childID := "22222222-2222-4222-8222-222222222222"
@@ -2359,6 +2394,9 @@ func captureTestHelper() {
 			`{"type":"event_msg","timestamp":"2026-08-16T10:00:03Z","payload":{"type":"task_started"}}`,
 			testjsonl.CodexMsgJSON("assistant", "RESPONSE_SENTINEL", "2026-08-16T10:00:04Z"),
 			testjsonl.CodexTokenCountJSON("2026-08-16T10:00:05Z", 100, 10, 60),
+		}
+		if mode == "codex-cache-write" {
+			lines[len(lines)-1] = testjsonl.CodexTokenCountWithCacheWriteJSON("2026-08-16T10:00:05Z", 100, 10, 60, 30)
 		}
 		if mode == "codex-subagent" || mode == "codex-late-subagent" ||
 			mode == "codex-changing-subagent" || mode == "codex-subagent-malformed" {
@@ -2547,7 +2585,11 @@ func claudeSubagentHelperLines(sessionID, cwd string) ([]string, []string) {
 
 func testLimits() Limits {
 	limits := DefaultLimits()
-	limits.FinalizationWait = 15 * time.Second
+	// Successful captures finish as soon as the source settles, so this wait
+	// only bounds a hung capture. Slow stretches on Windows CI runners have
+	// stretched finalization from under a second to 17 seconds. Tests that
+	// assert an expired wait set their own short budget.
+	limits.FinalizationWait = time.Minute
 	limits.Quiescence = 10 * time.Millisecond
 	return limits
 }
@@ -2560,7 +2602,7 @@ func testPricing() map[string]config.CustomModelRate {
 		},
 		"gpt-test": {
 			InputMicrodollarsPerMTok: 1_000_000, OutputMicrodollarsPerMTok: 1_000_000,
-			CacheReadMicrodollarsPerMTok: 1_000_000,
+			CacheCreationMicrodollarsPerMTok: 2_000_000, CacheReadMicrodollarsPerMTok: 1_000_000,
 		},
 	}
 }

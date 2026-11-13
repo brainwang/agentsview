@@ -5,14 +5,18 @@ package vector
 import (
 	"net/url"
 
+	vecext "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// registerVec registers the cgo sqlite-vec extension with mattn/go-sqlite3.
+var registerVec = vecext.Auto
+
 // vectorDriverName selects the database/sql driver vectors.db opens with.
 // On Unix with cgo it is mattn/go-sqlite3 — the same driver as the main
-// archive — with the cgo sqlite-vec extension kit's sqlitevec.Register
-// loads. On Windows the cgo sqlite-vec bindings do not build, so
-// driver_modernc.go substitutes the pure-Go modernc driver instead.
+// archive — with the cgo sqlite-vec extension registerVec loads. On Windows
+// the cgo sqlite-vec bindings do not build, so driver_modernc.go substitutes
+// the pure-Go modernc driver instead.
 const vectorDriverName = "sqlite3"
 
 // vectorDSN builds the sqlite3 DSN for vectors.db. The rw path mirrors
@@ -37,6 +41,10 @@ func vectorDSN(path string, readOnly bool) string {
 		params.Set("mode", "ro")
 		params.Set("_busy_timeout", "5000")
 	} else {
+		// Message and Recall builds share this file. Reserve the writer before
+		// reading so a concurrent commit cannot invalidate a write snapshot.
+		params.Set("_txlock", "immediate")
+		params.Set("_stmt_cache_size", "64")
 		params.Set("_journal_mode", "WAL")
 		params.Set("_busy_timeout", "5000")
 		params.Set("_synchronous", "NORMAL")

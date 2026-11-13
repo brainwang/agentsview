@@ -3,14 +3,21 @@ package export
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"hash"
 	"math/big"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/pricing/catalog"
 )
 
 type PricingRowSource string
@@ -144,6 +151,7 @@ type PricingLookup struct {
 
 type PricingResolver struct {
 	rows                 []EffectivePricingRow
+	digest               string
 	byModel              map[string]ModelRates
 	lookupCache          map[string]PricingLookup
 	genAI                *pricingpkg.GenAIPrices
@@ -177,6 +185,22 @@ type pricingRecordKey struct {
 	cacheWrite, cacheWrite1h, cacheRead int64
 	bands                               string
 	adjustment                          string
+}
+
+// NewPricingResolverWithDigest is NewPricingResolver for a caller that has
+// already computed EffectivePricingDigest(rows); BuildBlock reuses digest
+// instead of canonicalizing every row again.
+func NewPricingResolverWithDigest(rows []EffectivePricingRow, digest string) *PricingResolver {
+	resolver := NewPricingResolver(rows)
+	resolver.digest = digest
+	return resolver
+}
+
+// Copy returns a resolver over the same rows and digest with empty lookup
+// caches. A resolver caches lookups without locking, so each goroutine that
+// resolves prices needs its own copy.
+func (r *PricingResolver) Copy() *PricingResolver {
+	return NewPricingResolverWithDigest(r.rows, r.digest)
 }
 
 func NewPricingResolver(rows []EffectivePricingRow) *PricingResolver {
@@ -247,8 +271,14 @@ func (r *PricingResolver) ResolveBilled(providerID, reportedModel, canonicalMode
 // timestamp before applying one exact provider adjustment.
 func (r *PricingResolver) ResolveBilledAt(providerID, reportedModel, canonicalModel string, timestamp time.Time) (string, PricingLookup, error) {
 	pricedModel, lookup := r.ResolveAt(reportedModel, canonicalModel, timestamp)
+	if r == nil || !lookup.OK || lookup.Rates.Source == PricingRowSourceCustom {
+		return pricedModel, lookup, nil
+	}
+	if providerID == pricingpkg.OpenAIPriorityProviderID {
+		return pricedModel, r.withPriorityTier(lookup, pricedModel), nil
+	}
 	policy, ok := pricingpkg.BillingPolicyFor(providerID)
-	if !ok || !lookup.OK || lookup.Rates.Source == PricingRowSourceCustom {
+	if !ok {
 		return pricedModel, lookup, nil
 	}
 	rates, err := scaleModelRates(lookup.Rates, policy.Numerator, policy.Denominator)
@@ -258,6 +288,28 @@ func (r *PricingResolver) ResolveBilledAt(providerID, reportedModel, canonicalMo
 	lookup.Rates = rates
 	lookup.Adjustment = policy.Service + "@" + policy.Version
 	return pricedModel, lookup, nil
+}
+
+func (r *PricingResolver) withPriorityTier(lookup PricingLookup, pricedModel string) PricingLookup {
+	pattern, rates, ok := r.priorityRow(pricedModel)
+	if !ok {
+		return lookup
+	}
+	lookup.Rates = rates
+	lookup.Rates.Bands = slices.Clone(rates.Bands)
+	lookup.Pattern = pattern
+	lookup.Adjustment = pricingpkg.OpenAIPriorityProviderID
+	return lookup
+}
+
+// priorityRow returns the LiteLLM priority row and rates for a model.
+func (r *PricingResolver) priorityRow(model string) (string, ModelRates, bool) {
+	base := r.Lookup(model)
+	pattern := catalog.PriorityPattern(base.Pattern)
+	if rates, ok := r.byModel[pattern]; base.OK && ok {
+		return pattern, rates, true
+	}
+	return "", ModelRates{}, false
 }
 
 func scaleModelRates(r ModelRates, numerator, denominator int64) (ModelRates, error) {
@@ -333,6 +385,7 @@ func (r *PricingResolver) ResolveAt(
 	if r == nil {
 		return reportedModel, PricingLookup{}
 	}
+	reportedModel, canonicalModel = r.aliasPricingInputs(reportedModel, canonicalModel, timestamp)
 	pricedModel, lookup := r.resolveAt(reportedModel, canonicalModel, timestamp)
 	if lookup.OK && !isPlaceholderOllamaCloudRate(lookup) {
 		return pricedModel, lookup
@@ -350,6 +403,114 @@ func (r *PricingResolver) ResolveAt(
 		return pricedModel, baseLookup
 	}
 	return pricedModel, lookup
+}
+
+// aliasPricingInputs selects the target before applying its built-in aliases.
+func (r *PricingResolver) aliasPricingInputs(reported, canonical string, at time.Time) (string, string) {
+	if rates, ok := r.byModel[reported]; ok && rates.Source == PricingRowSourceCustom {
+		return reported, canonical
+	}
+	if target := pricingpkg.ConfiguredAliasTarget(reported); target != "" {
+		canonical = pricingpkg.CanonicalModelForDate(target, at)
+		if canonical == "" {
+			canonical = target
+		}
+		return target, canonical
+	}
+	return reported, canonical
+}
+
+// DependencyFingerprint hashes what ResolveAt/ResolveBilledAt can return at any timestamp, minus UpdatedAt.
+func (r *PricingResolver) DependencyFingerprint(
+	providerID, reportedModel, canonicalModel string,
+) (string, error) {
+	digest := sha256.New()
+	writeField := func(value string) {
+		_, _ = fmt.Fprintf(digest, "%d:%s", len(value), value)
+	}
+	writeLookup := func(pricedModel string, lookup PricingLookup) {
+		writeField(pricedModel)
+		writeField(lookup.Pattern)
+		writeField(strconv.FormatBool(lookup.OK))
+		writeField(lookup.Adjustment)
+		writePricingRatesFingerprint(digest, lookup.Rates)
+	}
+	pricedModel, lookup := r.ResolveAt(reportedModel, canonicalModel, time.Time{})
+	writeLookup(pricedModel, lookup)
+	billedModel, billed, err := r.ResolveBilledAt(
+		providerID, reportedModel, canonicalModel, time.Time{})
+	if err != nil {
+		return "", err
+	}
+	writeLookup(billedModel, billed)
+	if r == nil {
+		return hex.EncodeToString(digest.Sum(nil)), nil
+	}
+	// writeLadder skips GenAI when a custom rate shadows it, as resolveAt does.
+	genAISourceWritten := false
+	writeLadder := func(reported, canonical string) (PricingLookup, bool, bool) {
+		priced, flat, custom := r.resolveFlat(reported, canonical)
+		writeLookup(priced, flat)
+		if custom || r.genAI == nil {
+			return flat, custom, false
+		}
+		if !genAISourceWritten {
+			writeField(string(r.genAISource))
+			genAISourceWritten = true
+		}
+		matched := false
+		candidates := genAICandidatesFor(reported, canonical,
+			genAIFallbackModel(priced, flat))
+		for _, candidate := range candidates.items[:candidates.count] {
+			fingerprint := r.genAI.ModelFingerprint(candidate.provider, candidate.model)
+			matched = matched || fingerprint != "none"
+			writeField(candidate.provider)
+			writeField(candidate.model)
+			writeField(candidate.priced)
+			writeField(fingerprint)
+		}
+		return flat, custom, matched
+	}
+	selectedReported, earlierCanonical := r.aliasPricingInputs(reportedModel, canonicalModel, pricingpkg.KimiModelEraCutoff.Add(-time.Nanosecond))
+	reportedModel, canonicalModel = r.aliasPricingInputs(reportedModel, canonicalModel, time.Time{})
+	if earlierCanonical != canonicalModel {
+		writeLadder(selectedReported, earlierCanonical)
+	}
+	mainFlat, mainCustom, mainGenAI := writeLadder(reportedModel, canonicalModel)
+	// ResolveAt tries Ollama bases only when the main ladder can come back unusable.
+	if mainCustom || (mainFlat.OK && !isPlaceholderOllamaCloudRate(mainFlat) && !mainGenAI) {
+		return hex.EncodeToString(digest.Sum(nil)), nil
+	}
+	var bases []string
+	for _, model := range []string{reportedModel, canonicalModel, pricedModel} {
+		base := pricingpkg.OllamaCloudBaseModel(model)
+		if base != model && !slices.Contains(bases, base) {
+			bases = append(bases, base)
+		}
+	}
+	for _, base := range bases {
+		writeLadder(base, base)
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func writePricingRatesFingerprint(digest hash.Hash, rates ModelRates) {
+	bands := slices.Clone(rates.Bands)
+	slices.SortStableFunc(bands, func(left, right PricingBand) int {
+		return cmp.Compare(left.AboveInputTokens, right.AboveInputTokens)
+	})
+	_, _ = fmt.Fprintf(digest, "%d:%s|%d,%d,%d,%d,%d|%d",
+		len(rates.Source), rates.Source,
+		rates.InputPerMTok.Microdollars, rates.OutputPerMTok.Microdollars,
+		rates.CacheWritePerMTok.Microdollars,
+		rates.CacheWrite1hPerMTok.Microdollars,
+		rates.CacheReadPerMTok.Microdollars, len(bands))
+	for _, band := range bands {
+		_, _ = fmt.Fprintf(digest, "|%d,%d,%d,%d,%d,%d",
+			band.AboveInputTokens, band.InputPerMTok.Microdollars,
+			band.OutputPerMTok.Microdollars, band.CacheWritePerMTok.Microdollars,
+			band.CacheWrite1hPerMTok.Microdollars, band.CacheReadPerMTok.Microdollars)
+	}
 }
 
 // isPlaceholderOllamaCloudRate reports whether a lookup found only a zero-rate
@@ -377,35 +538,38 @@ func isPlaceholderOllamaCloudRate(lookup PricingLookup) bool {
 func (r *PricingResolver) resolveAt(
 	reportedModel, canonicalModel string, timestamp time.Time,
 ) (string, PricingLookup) {
+	pricedModel, flatLookup, custom := r.resolveFlat(reportedModel, canonicalModel)
+	if custom || timestamp.IsZero() {
+		return pricedModel, flatLookup
+	}
+	if pricedModel, rates, ok := r.resolveGenAI(
+		reportedModel, canonicalModel,
+		genAIFallbackModel(pricedModel, flatLookup), timestamp,
+	); ok {
+		return pricedModel, rates
+	}
+	return pricedModel, flatLookup
+}
+
+// resolveFlat reports custom=true when a custom rate ends resolution before GenAI.
+func (r *PricingResolver) resolveFlat(
+	reportedModel, canonicalModel string,
+) (string, PricingLookup, bool) {
 	if rates, ok := r.byModel[reportedModel]; ok &&
 		rates.Source == PricingRowSourceCustom {
 		return reportedModel, PricingLookup{
 			Rates:   rates,
 			Pattern: reportedModel,
 			OK:      true,
-		}
+		}, true
 	}
 	pricedModel := canonicalModel
 	if pricedModel == "" {
 		pricedModel = reportedModel
 	}
 	flatLookup := r.Lookup(pricedModel)
-	if flatLookup.OK && flatLookup.Rates.Source == PricingRowSourceCustom {
-		return pricedModel, flatLookup
-	}
-	if !timestamp.IsZero() {
-		var genAIFallbackModel string
-		if flatLookup.OK &&
-			pricingpkg.EffortTierBaseModel(pricedModel) != pricedModel {
-			genAIFallbackModel = flatLookup.Pattern
-		}
-		if pricedModel, rates, ok := r.resolveGenAI(
-			reportedModel, canonicalModel, genAIFallbackModel, timestamp,
-		); ok {
-			return pricedModel, rates
-		}
-	}
-	return pricedModel, flatLookup
+	return pricedModel, flatLookup,
+		flatLookup.OK && flatLookup.Rates.Source == PricingRowSourceCustom
 }
 
 func (r *PricingResolver) resolveGenAI(
@@ -414,21 +578,69 @@ func (r *PricingResolver) resolveGenAI(
 	if r.genAI == nil {
 		return "", PricingLookup{}, false
 	}
+	candidates := genAICandidatesFor(reportedModel, canonicalModel, fallbackModel)
+	for _, candidate := range candidates.items[:candidates.count] {
+		resolved, ok := r.genAI.Resolve(
+			candidate.provider, candidate.model, timestamp,
+		)
+		if !ok {
+			continue
+		}
+		return candidate.priced, PricingLookup{
+			Rates: ModelRates{
+				InputPerMTok:        resolved.InputPerMTok,
+				OutputPerMTok:       resolved.OutputPerMTok,
+				CacheWritePerMTok:   resolved.CacheCreationPerMTok,
+				CacheWrite1hPerMTok: resolved.CacheCreation1hPerMTok,
+				CacheReadPerMTok:    resolved.CacheReadPerMTok,
+				UpdatedAt:           r.genAIUpdatedAt,
+				Source:              r.genAISource,
+				Bands:               genAIPricingBands(resolved.Bands),
+			},
+			Pattern: resolved.ModelPattern,
+			OK:      true,
+		}, true
+	}
+	return "", PricingLookup{}, false
+}
+
+// genAIFallbackModel is the flat row resolveGenAI also tries for an effort-tier model.
+func genAIFallbackModel(pricedModel string, flatLookup PricingLookup) string {
+	if flatLookup.OK &&
+		pricingpkg.EffortTierBaseModel(pricedModel) != pricedModel {
+		return flatLookup.Pattern
+	}
+	return ""
+}
+
+type genAICandidate struct {
+	provider string
+	model    string
+	priced   string
+}
+
+// genAICandidates is a fixed array (four aliases, two candidates each) to stay off the heap.
+type genAICandidates struct {
+	items [8]genAICandidate
+	count int
+}
+
+// genAICandidatesFor is shared with DependencyFingerprint so the two cannot drift.
+func genAICandidatesFor(
+	reportedModel, canonicalModel, fallbackModel string,
+) genAICandidates {
 	type modelAlias struct {
 		lookup string
 		priced string
 	}
-	type modelCandidate struct {
-		provider string
-		model    string
-		priced   string
-	}
-	models := []modelAlias{{lookup: reportedModel, priced: reportedModel}}
+	var aliasStorage [4]modelAlias
+	models := append(aliasStorage[:0],
+		modelAlias{lookup: reportedModel, priced: reportedModel})
 	if canonicalModel != "" && canonicalModel != reportedModel {
-		models = []modelAlias{
-			{lookup: canonicalModel, priced: canonicalModel},
-			{lookup: reportedModel, priced: reportedModel},
-		}
+		models = append(models[:0],
+			modelAlias{lookup: canonicalModel, priced: canonicalModel},
+			modelAlias{lookup: reportedModel, priced: reportedModel},
+		)
 	}
 	pricedModel := canonicalModel
 	if pricedModel == "" {
@@ -449,42 +661,21 @@ func (r *PricingResolver) resolveGenAI(
 			priced: pricedModel,
 		})
 	}
-	for _, model := range models {
-		provider, unqualified := genAIProviderAndModel(model.lookup)
-		candidates := []modelCandidate{{provider, unqualified, model.priced}}
-		if provider != "" || unqualified != model.lookup {
-			candidates = append(candidates, modelCandidate{
-				model:  model.lookup,
-				priced: model.priced,
-			})
-		}
-		for _, candidate := range candidates {
-			if candidate.model == "" {
-				continue
-			}
-			resolved, ok := r.genAI.Resolve(
-				candidate.provider, candidate.model, timestamp,
-			)
-			if !ok {
-				continue
-			}
-			return candidate.priced, PricingLookup{
-				Rates: ModelRates{
-					InputPerMTok:        resolved.InputPerMTok,
-					OutputPerMTok:       resolved.OutputPerMTok,
-					CacheWritePerMTok:   resolved.CacheCreationPerMTok,
-					CacheWrite1hPerMTok: resolved.CacheCreation1hPerMTok,
-					CacheReadPerMTok:    resolved.CacheReadPerMTok,
-					UpdatedAt:           r.genAIUpdatedAt,
-					Source:              r.genAISource,
-					Bands:               genAIPricingBands(resolved.Bands),
-				},
-				Pattern: resolved.ModelPattern,
-				OK:      true,
-			}, true
+	var out genAICandidates
+	add := func(candidate genAICandidate) {
+		if candidate.model != "" {
+			out.items[out.count] = candidate
+			out.count++
 		}
 	}
-	return "", PricingLookup{}, false
+	for _, model := range models {
+		provider, unqualified := genAIProviderAndModel(model.lookup)
+		add(genAICandidate{provider, unqualified, model.priced})
+		if provider != "" || unqualified != model.lookup {
+			add(genAICandidate{model: model.lookup, priced: model.priced})
+		}
+	}
+	return out
 }
 
 func genAIProviderAndModel(model string) (string, string) {
@@ -534,27 +725,19 @@ func (r *PricingResolver) RecordResolvedComputedRequest(
 	lookup PricingLookup,
 	inputTokens, cacheWriteTokens, cacheReadTokens int,
 ) {
-	if r == nil || reportedModel == "" || pricedModel == "" {
-		return
+	var threshold *int
+	if band, ok := lookup.Rates.RequestBand(inputTokens, cacheWriteTokens, cacheReadTokens); ok {
+		threshold = &band
 	}
-	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.computed = true
-	if !lookup.OK {
-		return
-	}
-	band, ok := lookup.Rates.pricingBandForTokens(
-		inputTokens,
-		cacheWriteTokens,
-		cacheReadTokens,
-	)
-	if !ok {
-		rec.baseRequestCount++
-		return
-	}
-	if rec.bandRequestCounts == nil {
-		rec.bandRequestCounts = make(map[int]int)
-	}
-	rec.bandRequestCounts[band.AboveInputTokens]++
+	r.accumulateResolved(reportedModel, pricedModel, lookup, false, true, 1, 0, threshold)
+}
+
+// RequestBand returns the input threshold of the band that prices a request
+// with these input-side tokens, or false when the base rates price it.
+// RecordResolvedCounts takes it to record many such requests at once.
+func (r ModelRates) RequestBand(inputTokens, cacheWriteTokens, cacheReadTokens int) (int, bool) {
+	band, ok := r.pricingBandForTokens(inputTokens, cacheWriteTokens, cacheReadTokens)
+	return band.AboveInputTokens, ok
 }
 
 func (r *PricingResolver) RecordComputedAggregate(model string, lookup PricingLookup) {
@@ -564,15 +747,7 @@ func (r *PricingResolver) RecordComputedAggregate(model string, lookup PricingLo
 func (r *PricingResolver) RecordResolvedComputedAggregate(
 	reportedModel, pricedModel string, lookup PricingLookup,
 ) {
-	if r == nil || reportedModel == "" || pricedModel == "" {
-		return
-	}
-	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.computed = true
-	if !lookup.OK {
-		return
-	}
-	rec.aggregateRowCount++
+	r.accumulateResolved(reportedModel, pricedModel, lookup, false, true, 0, 1, nil)
 }
 
 func (r *PricingResolver) RecordReported(model string, lookup PricingLookup) {
@@ -582,21 +757,42 @@ func (r *PricingResolver) RecordReported(model string, lookup PricingLookup) {
 func (r *PricingResolver) RecordResolvedComputed(
 	reportedModel, pricedModel string, lookup PricingLookup,
 ) {
-	if r == nil || reportedModel == "" || pricedModel == "" {
-		return
-	}
-	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.computed = true
+	r.accumulateResolved(reportedModel, pricedModel, lookup, false, true, 0, 0, nil)
 }
 
 func (r *PricingResolver) RecordResolvedReported(
 	reportedModel, pricedModel string, lookup PricingLookup,
 ) {
+	r.accumulateResolved(reportedModel, pricedModel, lookup, true, false, 0, 0, nil)
+}
+
+// RecordResolvedCounts records provenance for pre-aggregated usage rows.
+func (r *PricingResolver) RecordResolvedCounts(reportedModel, pricedModel string, lookup PricingLookup, reported, requests, aggregates int, band *int) {
+	if reported+requests+aggregates == 0 {
+		return
+	}
+	r.accumulateResolved(reportedModel, pricedModel, lookup, reported > 0, requests+aggregates > 0, requests, aggregates, band)
+}
+
+func (r *PricingResolver) accumulateResolved(reportedModel, pricedModel string, lookup PricingLookup, reported, computed bool, requests, aggregates int, band *int) {
 	if r == nil || reportedModel == "" || pricedModel == "" {
 		return
 	}
 	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.reported = true
+	rec.reported = rec.reported || reported
+	rec.computed = rec.computed || computed
+	if !lookup.OK {
+		return
+	}
+	rec.aggregateRowCount += aggregates
+	if band == nil {
+		rec.baseRequestCount += requests
+	} else if requests > 0 {
+		if rec.bandRequestCounts == nil {
+			rec.bandRequestCounts = make(map[int]int)
+		}
+		rec.bandRequestCounts[*band] += requests
+	}
 }
 
 // RecordUnattributedReported records an authoritative aggregate cost that
@@ -799,9 +995,12 @@ func (r *PricingResolver) BuildBlock() (PricingBlock, error) {
 	}
 	sort.Strings(fallbackModels)
 
-	digest, err := EffectivePricingDigest(r.rows)
-	if err != nil {
-		return PricingBlock{}, err
+	digest := r.digest
+	if digest == "" {
+		var err error
+		if digest, err = EffectivePricingDigest(r.rows); err != nil {
+			return PricingBlock{}, err
+		}
 	}
 
 	return PricingBlock{
@@ -1045,4 +1244,58 @@ func latestPricingRowUpdate(rows []EffectivePricingRow) *time.Time {
 		}
 	}
 	return latest
+}
+
+// UsageRate is how usage reported under one model and provider prices at
+// one instant: the catalog resolution that decides whether a recorded cost
+// is a price, and the billed resolution that prices tokens.
+type UsageRate struct {
+	CatalogModel string
+	Catalog      PricingLookup
+	BilledModel  string
+	Billed       PricingLookup
+	BilledErr    error
+}
+
+// UsageRateAt resolves the rates of usage reported under model through
+// providerID at timestamp, canonicalizing date-aliased models at that
+// instant. A zero timestamp resolves as usage without one.
+func (r *PricingResolver) UsageRateAt(providerID, model string, timestamp time.Time) UsageRate {
+	canonical := pricingpkg.CanonicalModelForDate(model, timestamp)
+	if canonical == "" {
+		canonical = model
+	}
+	var rate UsageRate
+	rate.CatalogModel, rate.Catalog = r.ResolveAt(model, canonical, timestamp)
+	rate.BilledModel, rate.Billed, rate.BilledErr = r.ResolveBilledAt(providerID, model, canonical, timestamp)
+	return rate
+}
+
+// Equal reports whether two rates price every usage row alike and record
+// the same resolutions.
+func (u UsageRate) Equal(o UsageRate) bool {
+	// Two failures that are not the same error do not merge, which costs
+	// only one more segment.
+	if !errors.Is(u.BilledErr, o.BilledErr) {
+		return false
+	}
+	return u.CatalogModel == o.CatalogModel && u.BilledModel == o.BilledModel &&
+		pricingLookupEqual(u.Catalog, o.Catalog) && pricingLookupEqual(u.Billed, o.Billed)
+}
+
+// PriceChanges returns, in order, every instant strictly between from and to
+// at which UsageRateAt can return a different rate for some model. The
+// resolver returns the same rate for every timestamp between two adjacent
+// instants.
+func (r *PricingResolver) PriceChanges(from, to time.Time) []time.Time {
+	var out []time.Time
+	if r != nil {
+		out = r.genAI.PriceChanges(from, to)
+	}
+	if cutoff := pricingpkg.KimiModelEraCutoff; cutoff.After(from) && cutoff.Before(to) {
+		out = append(out, cutoff)
+		slices.SortFunc(out, time.Time.Compare)
+		out = slices.CompactFunc(out, time.Time.Equal)
+	}
+	return out
 }

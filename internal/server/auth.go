@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.kenn.io/agentsview/internal/rawsync"
 )
@@ -19,6 +21,8 @@ const (
 	// their restrictions.
 	ctxKeyRemoteAuth contextKey = iota
 	ctxKeyRawSyncIdentity
+	ctxKeyRestrictedIngress
+	ctxKeyRestrictedIngressPrefix
 )
 
 // isRemoteAuth returns true if the request was authenticated as a
@@ -41,7 +45,7 @@ func isRemoteAuth(r *http.Request) bool {
 // genuinely local attacker spoofing these headers only denies themselves, so
 // the check fails closed.
 func isLocalhostRequest(r *http.Request) bool {
-	if hasForwardingHeader(r) {
+	if restrictedIngress(r.Context()) || hasForwardingHeader(r) {
 		return false
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -78,6 +82,10 @@ func (s *Server) protectedPath(path string) bool {
 // when require_auth is on. Non-protected routes such as static
 // assets are never gated.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return s.authMiddlewareRequired(next, false)
+}
+
+func (s *Server) authMiddlewareRequired(next http.Handler, force bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Static assets are always served.
 		if !s.protectedPath(r.URL.Path) {
@@ -88,16 +96,19 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		// Read config once for all checks below.
 		s.mu.RLock()
 		token := s.cfg.AuthToken
-		authRequired := s.cfg.RequireAuth
+		authRequired := force || s.cfg.RequireAuth
 		writeTimeout := s.cfg.WriteTimeout
 		s.mu.RUnlock()
+		if force && (writeTimeout <= 0 || writeTimeout > 5*time.Second) {
+			writeTimeout = 5 * time.Second
+		}
 
 		// CORS preflight requests (OPTIONS) never include credentials.
 		// Let them through so the browser can negotiate CORS before
 		// sending the authenticated request. When auth is required,
 		// mark OPTIONS as authenticated so the CORS middleware
 		// allows the preflight for cross-origin clients.
-		if r.Method == http.MethodOptions {
+		if r.Method == http.MethodOptions && !force {
 			if s.isRawSyncOwnAuthPath(r.URL.Path) || authRequired && token != "" {
 				ctx := context.WithValue(r.Context(), ctxKeyRemoteAuth, true)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -134,10 +145,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			handlerCtx := authCtx
-			if r.Method == http.MethodPatch && isRawSyncUploadPath(r.URL.Path) {
-				// Upload authentication stays bounded by WriteTimeout, but body
-				// transfer and checksum finalization use the client's request
-				// lifetime plus the route's extended transport read deadline.
+			if force || (r.Method == http.MethodPatch && isRawSyncUploadPath(r.URL.Path)) {
+				// Authentication stays bounded, while request processing uses the
+				// request lifetime. Uploads need it for body transfer and checksum;
+				// restricted raw-sync handlers may perform longer custody work.
 				cancel()
 				handlerCtx = baseCtx
 			}
@@ -167,6 +178,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 					http.StatusInternalServerError)
 				return
 			}
+			if force {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
 			http.Error(w,
 				"server misconfiguration: auth required but no token set",
 				http.StatusInternalServerError)
@@ -175,9 +190,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 		// Check Bearer token in Authorization header. The ?token=
 		// query param fallback is restricted to SSE endpoints
-		// (see isSSEPath) because EventSource cannot set custom
-		// headers. All other endpoints must use the Authorization
-		// header.
+		// (see isSSEPath) for third-party clients built on native
+		// EventSource, which cannot set custom headers. The bundled
+		// frontend always sends the header. All other endpoints must
+		// use the Authorization header.
 		var provided string
 		auth := r.Header.Get("Authorization")
 		if t, ok := strings.CutPrefix(auth, "Bearer "); ok {
@@ -189,7 +205,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		if provided != token {
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			setCORSOnAuthError(w, r)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -207,7 +223,8 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 // Authorization header. The query-param fallback exists because
 // browser EventSource cannot set headers.
 func isSSEPath(path string) bool {
-	return strings.HasSuffix(path, "/watch") || path == "/api/v1/events"
+	return strings.HasSuffix(path, "/watch") || path == "/api/v1/events" ||
+		path == "/api/v1/changes/stream"
 }
 
 func isRemoteSyncPath(path string) bool {
@@ -228,6 +245,9 @@ func (s *Server) isRawSyncOwnAuthPath(path string) bool {
 	if path == "/api/v1/raw-sync/status" {
 		return s.rawSyncStatus != nil
 	}
+	if s.rawSyncJobHealth != nil && path == "/api/v1/raw-sync/health" {
+		return true
+	}
 	if s.rawSyncCustody == nil {
 		return false
 	}
@@ -240,7 +260,13 @@ func (s *Server) isRawSyncOwnAuthPath(path string) bool {
 
 func (s *Server) authenticateRawSyncRequest(
 	r *http.Request,
-) (rawsync.AuthIdentity, error) {
+) (identity rawsync.AuthIdentity, resultErr error) {
+	defer func() {
+		if resultErr == nil && s.rawSyncTenant != "" && identity.TenantID != s.rawSyncTenant {
+			identity = rawsync.AuthIdentity{}
+			resultErr = rawsync.ErrUnauthorized
+		}
+	}()
 	secret, err := rawSyncBearer(r.Header.Get("Authorization"))
 	if err != nil {
 		return rawsync.AuthIdentity{}, err
@@ -259,6 +285,13 @@ func (s *Server) authenticateRawSyncRequest(
 			r.Context(), secret, rawsync.ScopeCommit,
 		)
 	case "/api/v1/raw-sync/status":
+		return s.rawSyncDeviceAuth.AuthenticateToken(
+			r.Context(), secret, rawsync.ScopeStatus,
+		)
+	case "/api/v1/raw-sync/health":
+		if s.rawSyncJobHealth == nil {
+			return rawsync.AuthIdentity{}, rawsync.ErrUnauthorized
+		}
 		return s.rawSyncDeviceAuth.AuthenticateToken(
 			r.Context(), secret, rawsync.ScopeStatus,
 		)

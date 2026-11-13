@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/readbase"
 )
 
 // DuckDB implementation of the conversation-unit seam. Orchestration —
@@ -21,12 +22,12 @@ var _ db.UnitBoundsQuerier = (*Store)(nil)
 // duckUnitSessionChunk caps sessions per NearestUserBoundaries statement,
 // matching SQLite's unitSessionChunk semantics: a session binds 2 variables
 // (idx, session_id).
-const duckUnitSessionChunk = duckMaxSQLVars / 2
+const duckUnitSessionChunk = readbase.MaxSQLVars / 2
 
 // duckUnitExtentChunk caps extent probes per RunExtents statement, matching
 // SQLite's unitExtentChunk semantics: a probe binds 6 variables (idx,
 // session_id, o, lo, hi, sc).
-const duckUnitExtentChunk = duckMaxSQLVars / 6
+const duckUnitExtentChunk = readbase.MaxSQLVars / 6
 
 // duckEmbeddableUserSQL is the DuckDB predicate matching an embeddable user
 // row under the given alias: user role, is_system = FALSE, and the DuckDB
@@ -105,6 +106,11 @@ func (s *Store) RunExtents(
 // the stop-narrowed interval. The member predicate is role + is_system only:
 // SystemPrefixSQL constrains user rows exclusively, so it is identically
 // TRUE for assistant rows and deliberately omitted there.
+//
+// The stop subqueries repeat the probe sessions as an IN filter. It is
+// implied by the correlation, but DuckDB decorrelates these subqueries into
+// joins and would otherwise evaluate the system-prefix check over every
+// message in the mirror before joining to the few probe sessions.
 func duckRunExtentSelectSQL() string {
 	stop := "((f.role = 'assistant' AND f.is_system = FALSE AND f.is_sidechain <> p.sc)" +
 		" OR (" + duckEmbeddableUserSQL("f") + "))"
@@ -114,6 +120,7 @@ func duckRunExtentSelectSQL() string {
 	   WHERE m.session_id = p.session_id AND m.ordinal <= p.o
 	     AND m.ordinal > COALESCE((SELECT f.ordinal FROM messages f
 	       WHERE f.session_id = p.session_id
+	         AND f.session_id IN (SELECT session_id FROM probes)
 	         AND f.ordinal > p.lo AND f.ordinal < p.o
 	         AND %[1]s
 	       ORDER BY f.ordinal DESC LIMIT 1), p.lo)
@@ -124,6 +131,7 @@ func duckRunExtentSelectSQL() string {
 	   WHERE m.session_id = p.session_id AND m.ordinal >= p.o
 	     AND m.ordinal < COALESCE((SELECT f.ordinal FROM messages f
 	       WHERE f.session_id = p.session_id
+	         AND f.session_id IN (SELECT session_id FROM probes)
 	         AND f.ordinal > p.o AND f.ordinal < p.hi
 	         AND %[1]s
 	       ORDER BY f.ordinal ASC LIMIT 1), p.hi)
@@ -158,7 +166,7 @@ func (s *Store) lookupDuckRunExtentChunk(
 
 // duckAnchorMetaChunk caps (session_id, ordinal) refs per anchor-meta lookup,
 // matching internal/db's enrichHitsChunk semantics (2 binds per ref).
-const duckAnchorMetaChunk = duckMaxSQLVars / 2
+const duckAnchorMetaChunk = readbase.MaxSQLVars / 2
 
 // duckAnchorKey identifies one (session_id, ordinal) anchor ref.
 type duckAnchorKey struct {
@@ -170,6 +178,8 @@ type duckAnchorKey struct {
 // anchor message row's classification columns — the DuckDB twin of
 // internal/db's contentAnchorMeta.
 type duckAnchorMeta struct {
+	machine         string
+	displayName     *string
 	relationship    string
 	parentSessionID string
 	role            sql.NullString
@@ -212,6 +222,8 @@ func (s *Store) deriveLexicalUnitsDuck(
 	}
 	for i := range matches {
 		matches[i].OrdinalRange = ranges[i]
+		matches[i].Machine = metas[i].machine
+		matches[i].DisplayName = metas[i].displayName
 		matches[i].Relationship = metas[i].relationship
 		matches[i].ParentSessionID = metas[i].parentSessionID
 		matches[i].Sidechain = anchors[i].Sidechain
@@ -278,7 +290,7 @@ func (s *Store) lookupAnchorMetaChunkDuck(
 	query := "WITH refs(session_id, ordinal) AS (VALUES " +
 		strings.Join(values, ", ") + ") " +
 		"SELECT r.session_id, r.ordinal, " +
-		"COALESCE(s.relationship_type, ''), COALESCE(s.parent_session_id, ''), " +
+		"s.relationship_type, COALESCE(s.parent_session_id, ''), s.machine, COALESCE(s.display_name, s.session_name), " +
 		"m.role, m.is_sidechain, " +
 		"CASE WHEN m.is_system = FALSE AND " +
 		db.DuckDBSystemPrefixSQL("m.content", "m.role") +
@@ -297,6 +309,7 @@ func (s *Store) lookupAnchorMetaChunkDuck(
 		var meta duckAnchorMeta
 		if err := rows.Scan(&key.sessionID, &key.ordinal,
 			&meta.relationship, &meta.parentSessionID,
+			&meta.machine, &meta.displayName,
 			&meta.role, &meta.sidechain, &meta.embeddable); err != nil {
 			return fmt.Errorf("scanning match anchor: %w", err)
 		}

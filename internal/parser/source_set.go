@@ -74,6 +74,16 @@ func (p *SourceSetProvider) DiscoverEach(
 	return discoverer.DiscoverEach(ctx, yield)
 }
 
+// DiscoverScopesEach preserves bounded traversal when the source set supports it.
+func (p *SourceSetProvider) DiscoverScopesEach(
+	ctx context.Context, scopes []ReconciliationScope, yield func(SourceRef) error,
+) error {
+	if scoped, ok := p.sources.(ScopedStreamingDiscoverer); ok {
+		return scoped.DiscoverScopesEach(ctx, scopes, yield)
+	}
+	return UnsupportedProviderFeatureError{Provider: p.Def.Type, Feature: ProviderFeatureScopedDiscovery}
+}
+
 func (p *SourceSetProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
@@ -148,6 +158,16 @@ func (p *SourceSetProvider) StoredSourceHintScopes(
 	return resolver.StoredSourceHintScopes(req)
 }
 
+func (p *SourceSetProvider) StoredMemberFreshnessContainer(
+	path string,
+) (string, bool) {
+	resolver, ok := p.sources.(StoredMemberFreshnessContainerResolver)
+	if !ok {
+		return "", false
+	}
+	return resolver.StoredMemberFreshnessContainer(path)
+}
+
 func (p *SourceSetProvider) FindSource(
 	ctx context.Context,
 	req FindSourceRequest,
@@ -170,6 +190,34 @@ func (p *SourceSetProvider) Parse(
 ) (ParseOutcome, error) {
 	req.Machine = firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	return p.sources.Parse(ctx, req)
+}
+
+// ParseEach parses req through p and passes every result to yield in order.
+// A container built by NewMultiSessionProviderFactory yields each member as
+// soon as it is parsed; every other provider parses through Parse first. The
+// returned outcome carries the source-level fields and no Results. A yield
+// error stops the parse and is returned unchanged.
+func ParseEach(
+	ctx context.Context, p Provider, req ParseRequest,
+	yield func(ParseResultOutcome) error,
+) (ParseOutcome, error) {
+	if sp, ok := p.(*SourceSetProvider); ok {
+		if streaming, ok := sp.sources.(multiSessionStreamingSourceSet); ok {
+			req.Machine = firstNonEmptyJSONLString(req.Machine, sp.Config.Machine)
+			return streaming.parseEach(ctx, req, yield)
+		}
+	}
+	outcome, err := p.Parse(ctx, req)
+	if err != nil {
+		return ParseOutcome{}, err
+	}
+	for _, result := range outcome.Results {
+		if err := yield(result); err != nil {
+			return ParseOutcome{}, err
+		}
+	}
+	outcome.Results = nil
+	return outcome, nil
 }
 
 func (p *SourceSetProvider) SourceForReconciliation(

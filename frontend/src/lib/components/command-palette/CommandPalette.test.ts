@@ -20,6 +20,7 @@ const {
   },
   mockSessions: {
     activeSessionId: null as string | null,
+    view: (row: unknown) => row,
     sessions: [] as Array<{
       id: string;
       project: string;
@@ -54,6 +55,7 @@ const {
     range: { mode: "relative" as const, days: 0 },
     setRange: vi.fn(),
     resetRange: vi.fn(),
+    endSession: vi.fn(),
   },
   mockRouter: {
     navigateToSession: vi.fn(),
@@ -192,17 +194,23 @@ describe("CommandPalette", () => {
     mockSessions.sessions = [makeSession("s1", "cursor"), makeSession("s2", "unknown")];
   });
 
-  it("uses agentColor for recent-session dots including fallback", async () => {
+  it("names each recent session's agent in its agent ink, including fallback", async () => {
     const component = mount(CommandPalette, {
       target: document.body,
     });
 
     await tick();
 
-    const dots = Array.from(document.querySelectorAll<HTMLElement>(".item-dot"));
-    expect(dots).toHaveLength(2);
-    expect(dots[0]?.getAttribute("style")).toContain("var(--accent-black)");
-    expect(dots[1]?.getAttribute("style")).toContain("var(--accent-blue)");
+    const agents = Array.from(document.querySelectorAll<HTMLElement>(".item-agent"));
+    expect(agents).toHaveLength(2);
+    expect(agents[0]?.textContent).toBe("Cursor");
+    expect(agents[0]?.getAttribute("style")).toContain(
+      "--agent-ink: var(--accent-black-ink, var(--accent-black))",
+    );
+    expect(agents[1]?.textContent).toBe("Unknown");
+    expect(agents[1]?.getAttribute("style")).toContain(
+      "--agent-ink: var(--accent-blue-ink, var(--accent-blue))",
+    );
 
     unmount(component);
   });
@@ -248,7 +256,7 @@ describe("CommandPalette", () => {
     unmount(component);
   });
 
-  it("calls clear() and resetSort() on unmount via onDestroy", async () => {
+  it("ends the search session before clearing on unmount", async () => {
     const component = mount(CommandPalette, {
       target: document.body,
     });
@@ -257,6 +265,8 @@ describe("CommandPalette", () => {
 
     unmount(component);
 
+    expect(mockSearchStore.endSession).toHaveBeenCalledOnce();
+    expect(mockSearchStore.endSession).toHaveBeenCalledBefore(mockSearchStore.clear);
     expect(mockSearchStore.clear).toHaveBeenCalledOnce();
     expect(mockSearchStore.resetSort).toHaveBeenCalledOnce();
   });
@@ -571,6 +581,25 @@ describe("CommandPalette", () => {
     unmount(semantic);
   });
 
+  it("announces searching through a status region that is already mounted", async () => {
+    const component = mount(CommandPalette, { target: document.body });
+    await tick();
+    // Mounted and empty before any query.
+    const status = document.querySelector('[role="status"].palette-search-status');
+    expect(status).not.toBeNull();
+    expect(status?.textContent?.trim()).toBe("");
+
+    // The store mock is not reactive; entering the query is the change
+    // that re-renders the palette with the search running.
+    mockSearchStore.isSearching = true;
+    await enterSearchQuery();
+    // Same node, new text: live regions announce changes, not insertions.
+    expect(document.querySelector('[role="status"].palette-search-status')).toBe(status);
+    expect(status?.textContent?.trim()).toBe("Searching...");
+
+    unmount(component);
+  });
+
   it("renders loading before error, empty state, and results", async () => {
     mockSearchStore.isSearching = true;
     mockSearchStore.error = { detail: "backend detail", kind: "generic" };
@@ -578,7 +607,12 @@ describe("CommandPalette", () => {
     const component = mount(CommandPalette, { target: document.body });
     await enterSearchQuery();
 
-    expect(document.querySelector(".palette-empty")?.textContent).toContain("Searching");
+    const loading = document.querySelector(".palette-loading");
+    expect(loading?.querySelectorAll(".skeleton-row").length).toBeGreaterThan(0);
+    const status = document.querySelector('[role="status"].palette-search-status');
+    expect(status?.textContent?.trim()).toBe("Searching...");
+    expect(status?.closest('[aria-busy="true"]')).toBeNull();
+    expect(document.querySelector(".palette-results")?.getAttribute("aria-busy")).toBe("true");
     expect(document.querySelector(".palette-error")).toBeNull();
     expect(document.querySelector(".palette-item")).toBeNull();
 
@@ -587,7 +621,7 @@ describe("CommandPalette", () => {
 
   it("renders the localized error heading and exact backend detail before results", async () => {
     mockSearchStore.error = {
-      detail: "Run agentsview embeddings build --full-rebuild",
+      detail: "Run agentsview index embeddings build --full-rebuild",
       kind: "generic",
     };
     mockSearchStore.results = [makeSearchResult()];
@@ -597,7 +631,7 @@ describe("CommandPalette", () => {
     const error = document.querySelector(".palette-error");
     expect(error?.querySelector("strong")?.textContent).toBe("Search unavailable");
     expect(error?.querySelector("span")?.textContent).toBe(
-      "Run agentsview embeddings build --full-rebuild",
+      "Run agentsview index embeddings build --full-rebuild",
     );
     expect(document.querySelector(".palette-item")).toBeNull();
 
@@ -613,6 +647,40 @@ describe("CommandPalette", () => {
     expect(error?.querySelector("strong")?.textContent).toBe("Search unavailable");
     expect(error?.querySelector("span")?.textContent).toBe("Search failed. Please try again.");
 
+    unmount(component);
+  });
+
+  it.each(["generic", "timeout"] as const)("retries a %s search error", async (kind) => {
+    mockSearchStore.mode = kind === "timeout" ? "semantic" : "fulltext";
+    mockSearchStore.error = { detail: kind === "timeout" ? "request timed out" : null, kind };
+    const component = mount(CommandPalette, { target: document.body });
+    await enterSearchQuery();
+    const retry = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".palette-error button"),
+    ).find((button) => button.textContent?.trim() === "Retry");
+    expect(retry).toBeDefined();
+    retry!.focus();
+    retry!.click();
+    expect(document.activeElement).toBe(document.querySelector(".palette-input"));
+    expect(mockSearchStore.retry).toHaveBeenCalledOnce();
+    expect(mockRouter.navigateToSession).not.toHaveBeenCalled();
+
+    unmount(component);
+  });
+
+  it("keeps the first result selected after ArrowDown while stale results are hidden", async () => {
+    mockSearchStore.isSearching = true;
+    mockSearchStore.results = [makeSearchResult(), makeSearchResult({ session_id: "second" })];
+    const component = mount(CommandPalette, { target: document.body });
+    await enterSearchQuery();
+    const input = document.querySelector<HTMLInputElement>(".palette-input")!;
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(mockRouter.navigateToSession).not.toHaveBeenCalled();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    mockSearchStore.isSearching = false;
+    mockSearchStore.results = [makeSearchResult()];
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(mockRouter.navigateToSession).toHaveBeenCalledWith("codex:search123");
     unmount(component);
   });
 
@@ -686,7 +754,7 @@ describe("CommandPalette", () => {
     expect(mockSearchStore.resetRange).toHaveBeenCalledOnce();
   });
 
-  it("explains a semantic timeout and offers an explicit retry", async () => {
+  it("explains a semantic timeout", async () => {
     mockSearchStore.mode = "semantic";
     mockSearchStore.error = {
       detail: "request timed out",
@@ -702,22 +770,33 @@ describe("CommandPalette", () => {
     );
     expect(error?.textContent).not.toContain("request timed out");
 
-    const retry = Array.from(error?.querySelectorAll<HTMLButtonElement>("button") ?? []).find(
-      (button) => button.textContent?.trim() === "Retry",
-    );
-    expect(retry).toBeDefined();
-    retry?.click();
-    expect(mockSearchStore.retry).toHaveBeenCalledOnce();
-    expect(mockRouter.navigateToSession).not.toHaveBeenCalled();
-
     unmount(component);
+  });
+
+  it.each(["semantic", "hybrid"] as const)("offers server settings in %s mode", async (mode) => {
+    mockSearchStore.mode = mode;
+    const component = mount(CommandPalette, { target: document.body });
+    await enterSearchQuery();
+    const links = document.querySelectorAll<HTMLAnchorElement>(
+      'a[href="https://agentsview.io/docs/semantic-search/#named-embeddings-servers"]',
+    );
+    expect(links).toHaveLength(1);
+    expect(links[0]?.textContent).toBe("Server settings");
+    unmount(component);
+    mockSearchStore.error = {
+      detail: "semantic search unavailable",
+      kind: "semantic-unavailable",
+    };
+    const failedComponent = mount(CommandPalette, { target: document.body });
+    await enterSearchQuery();
+    expect(document.querySelector(".palette-server-settings")).toBeNull();
+    unmount(failedComponent);
   });
 
   it("renders the semantic setup panel instead of the raw error for semantic-unavailable", async () => {
     mockSearchStore.mode = "semantic";
     mockSearchStore.error = {
-      detail:
-        "semantic search not available: enable [vector] in config.toml and run 'agentsview embeddings build'",
+      detail: "semantic search unavailable",
       kind: "semantic-unavailable",
     };
     const component = mount(CommandPalette, { target: document.body });
@@ -728,6 +807,40 @@ describe("CommandPalette", () => {
 
     unmount(component);
   });
+
+  it.each([
+    [
+      "while it is off",
+      { enabled: true, provider: "built-in", missing_bytes: 295000000, busy: false },
+      true,
+    ],
+    [
+      "not while Turn on runs",
+      { enabled: false, provider: "", missing_bytes: 0, busy: true },
+      false,
+    ],
+  ] as const)(
+    "fetches setup once across keyword queries and shows the footer hint %s",
+    async (_name, setup, shown) => {
+      mockEmbeddingsService.getApiV1EmbeddingsStatus.mockResolvedValue({
+        running: false,
+        done: 0,
+        total: 0,
+        eta_milliseconds: 0,
+        setup: { ...setup, action: "turn-on", installing: false },
+      });
+      const component = mount(CommandPalette, { target: document.body });
+      await enterSearchQuery();
+      for (let i = 0; i < 10; i++) await tick();
+      expect(document.body.textContent?.includes("Search by meaning is off")).toBe(shown);
+      await enterSearchQuery("another query");
+      for (let i = 0; i < 10; i++) await tick();
+      if (shown) {
+        expect(mockEmbeddingsService.getApiV1EmbeddingsStatus).toHaveBeenCalledTimes(1);
+      }
+      unmount(component);
+    },
+  );
 
   it.each([
     [
@@ -767,7 +880,7 @@ describe("CommandPalette", () => {
       mockSearchStore.mode = "semantic";
       mockSearchStore.error = {
         detail:
-          "semantic search not available: enable [vector] in config.toml and run 'agentsview embeddings build'",
+          "semantic search not available: run 'agentsview index embeddings build' or turn it on in Settings → Embeddings → Turn on",
         kind: "semantic-unavailable",
       };
       const component = mount(CommandPalette, { target: document.body });
@@ -811,7 +924,7 @@ describe("CommandPalette", () => {
     mockSearchStore.mode = "semantic";
     mockSearchStore.error = {
       detail:
-        "semantic search not available: enable [vector] in config.toml and run 'agentsview embeddings build'",
+        "semantic search not available: run 'agentsview index embeddings build' or turn it on in Settings → Embeddings → Turn on",
       kind: "semantic-unavailable",
     };
     mockSessions.activeSessionId = "session-1";

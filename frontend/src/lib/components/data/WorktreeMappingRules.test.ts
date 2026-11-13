@@ -235,13 +235,15 @@ describe("WorktreeMappingRules", () => {
   it("cross-links target projects and shows the derived label for empty projects", async () => {
     dataService.getApiV1DataProjectRules.mockResolvedValue(
       response("remote-host", [
-        rule(),
+        rule({ project: "zeta-project", governed_sessions: 10 }),
         rule({
           id: 2,
           path_prefix: "/srv/parent",
           layout: "repo_dot_worktrees",
           project: "",
           original_project: "",
+          governed_sessions: 2,
+          updated_at: "2026-07-05T00:00:00Z",
         }),
       ]),
     );
@@ -249,14 +251,22 @@ describe("WorktreeMappingRules", () => {
     component = mountRules();
     await flush();
 
-    await fireEvent.click(screen.getByRole("button", { name: "canonical-project" }));
-    expect(onSelectProject).toHaveBeenCalledWith("canonical-project");
+    await fireEvent.click(screen.getByRole("button", { name: "zeta-project" }));
+    expect(onSelectProject).toHaveBeenCalledWith("zeta-project");
 
+    await fireEvent.click(screen.getByRole("button", { name: "Target project" }));
     const rows = document.querySelectorAll("tbody tr");
     expect(rows.length).toBe(2);
-    const derivedCell = rows[1]?.querySelector("td:nth-child(2)");
+    const derivedCell = rows[0]?.querySelector("td:nth-child(2)");
     expect(derivedCell?.textContent).toContain("repo.worktrees/branch");
     expect(derivedCell?.querySelector("button")).toBeNull();
+    expect(rows[1]?.querySelector("td:nth-child(2)")?.textContent).toBe("zeta-project");
+    const order = () =>
+      Array.from(document.querySelectorAll("tbody td:first-child"), (cell) => cell.textContent);
+    await fireEvent.click(screen.getByRole("button", { name: "Governed sessions" }));
+    expect(order()).toEqual(["/srv/worktrees/example", "/srv/parent"]);
+    await fireEvent.click(screen.getByRole("button", { name: "Updated" }));
+    expect(order()).toEqual(["/srv/parent", "/srv/worktrees/example"]);
   });
 
   it("requests the server default machine and falls back to local_machine", async () => {
@@ -356,9 +366,9 @@ describe("WorktreeMappingRules", () => {
 
     await flush();
 
-    const layoutButton = screen.getByRole("button", { name: /repo\.worktrees/ });
-    expect(layoutButton).toBeTruthy();
-    layoutButton?.click();
+    const layoutRadio = screen.getByRole("radio", { name: /repo\.worktrees/ });
+    expect(layoutRadio.getAttribute("aria-checked")).toBe("false");
+    layoutRadio.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const pathPrefixInput = screen.getByRole("textbox", { name: "Parent directory" });
@@ -423,6 +433,25 @@ describe("WorktreeMappingRules", () => {
       "remote-draft",
     );
     expect(document.body.textContent).not.toContain("local-project");
+  });
+
+  it("shows an apply failure beside Apply, above the list and the form", async () => {
+    dataService.getApiV1DataProjectRules.mockResolvedValue(response("remote-host", [rule()]));
+    settingsService.postApiV1SettingsWorktreeMappingsApply.mockRejectedValue(
+      new Error("apply failed"),
+    );
+    component = mountRules();
+    await flush();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Apply mappings" }));
+    await flush();
+
+    const message = screen.getByText("apply failed");
+    const table = document.querySelector("table")!;
+    const form = screen.getByRole("region", { name: "New mapping" });
+    expect(message.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(message.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByText("apply failed")).toHaveLength(1);
   });
 
   it("does not show a stale apply error after the selected machine changes", async () => {
@@ -571,7 +600,7 @@ describe("WorktreeMappingRules", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(settingsService.deleteApiV1SettingsWorktreeMappingsById).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog").textContent).toContain("source files still exist");
-    expect(screen.getByRole("dialog").textContent).toContain("Orphaned sessions");
+    expect(screen.getByRole("dialog").textContent).toContain("Sessions without source files");
 
     await fireEvent.click(screen.getByRole("button", { name: "Delete mapping" }));
     expect(settingsService.deleteApiV1SettingsWorktreeMappingsById).toHaveBeenCalledWith({
@@ -588,7 +617,7 @@ describe("WorktreeMappingRules", () => {
     await flush();
 
     await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-    await fireEvent.click(screen.getByRole("checkbox", { name: "Enabled" }));
+    await fireEvent.click(screen.getByRole("switch", { name: "Enabled" }));
     await fireEvent.click(screen.getByRole("button", { name: "Save mapping" }));
 
     expect(settingsService.putApiV1SettingsWorktreeMappingsById).not.toHaveBeenCalled();

@@ -36,9 +36,13 @@ vi.mock("../../api/generated/index", () => ({
     postApiV1SettingsWorktreeMappingsApply: api.applyMappings,
   },
 }));
-vi.mock("../../api/runtime.js", () => ({
-  isAbortError: () => false,
-}));
+vi.mock("../../api/runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../api/runtime.js")>();
+  return {
+    ...actual,
+    isAbortError: () => false,
+  };
+});
 vi.mock("../../stores/router.svelte.js", () => ({
   router: { params: {}, replaceParams: vi.fn() },
 }));
@@ -117,6 +121,13 @@ async function flush() {
   await tick();
   await Promise.resolve();
   await tick();
+}
+
+// Fake only the editors' preview debounce. jsdom drives animation frames and
+// focus fixup from one shared setInterval; faking setInterval strands that loop
+// on the fake clock, and every later requestAnimationFrame in the file hangs.
+function useFakeDebounceTimers() {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 }
 
 function deferred<T>() {
@@ -316,7 +327,7 @@ describe("DataPage", () => {
   };
 
   async function applyReclassification() {
-    vi.useFakeTimers();
+    useFakeDebounceTimers();
     const inventory = makeInventory([
       makeRow({ project_key: "k1", label: "wrong-project", sessions: 3 }),
       makeRow({ project_key: "k2", label: "target-project", sessions: 12 }),
@@ -333,7 +344,7 @@ describe("DataPage", () => {
     await flush();
 
     await fireEvent.click(screen.getByTitle("Project"));
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project (12)" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project 12" }));
     await vi.advanceTimersByTimeAsync(300);
     await flush();
     await fireEvent.click(screen.getByRole("button", { name: "Save correction" }));
@@ -359,7 +370,7 @@ describe("DataPage", () => {
   });
 
   it("keeps a mid-apply dismissal dismissed when the deferred apply refresh lands", async () => {
-    vi.useFakeTimers();
+    useFakeDebounceTimers();
     const before = makeInventory([
       makeRow({ project_key: "k1", label: "wrong-project", sessions: 3 }),
       makeRow({ project_key: "k2", label: "target-project", sessions: 12 }),
@@ -379,7 +390,7 @@ describe("DataPage", () => {
     await flush();
 
     await fireEvent.click(screen.getByTitle("Project"));
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project (12)" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project 12" }));
     await vi.advanceTimersByTimeAsync(300);
     await flush();
     await fireEvent.click(screen.getByRole("button", { name: "Save correction" }));

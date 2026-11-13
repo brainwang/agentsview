@@ -29,6 +29,11 @@ var automatedPrefixes = []string{
 	"# Fix Request",
 	"You are a helpful assistant working on a software project.",
 	"You are combining multiple code review outputs into a single GitHub PR comment.",
+	"You are combining multiple review outputs into a combined review of the reviewed material.",
+	"You are a test-value reviewer.",
+	"You are a time-series correctness reviewer.",
+	"# Fix Plan Request",
+	"# Rebase Fix Request",
 	"You are generating a changelog",
 	"<user_action>",
 	"Review the code changes introduced by commit ",
@@ -68,9 +73,9 @@ const AutomationEvidencePrefixBytes = userPatternMaxLen
 
 // IsAutomatedSessionMetadata classifies durable provider-owned session
 // metadata that explicitly identifies an automated invocation.
-func IsAutomatedSessionMetadata(agent, sessionKind string) bool {
+func IsAutomatedSessionMetadata(sessionKind string) bool {
 	switch sessionKind {
-	case parser.SessionKindNonInteractive, parser.SessionKindRoborev:
+	case parser.SessionKindRoborev:
 		return true
 	default:
 		return false

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 const (
 	tokenCoverageRepairMetadataKey        = "token_coverage_repair_v1"
 	sourceCurationBackfillMetadataKey     = "source_curation_baseline_backfill_v1"
+	codexThreadScopeMetadataKey           = "codex_thread_scope_v1"
+	dialogueDedupeMetadataKey             = "dialogue_dedupe_v1"
 	projectIdentityRemoteScrubMetadataKey = "git_remote_credentials_scrub_v1"
 	tokenCoverageBackfillBatchSize        = 1000
 )
@@ -118,6 +121,67 @@ SELECT
         ARRAY['server_tool_use', 'web_search_requests'],
         'web_search_requests')`
 
+// sessionPlanUsageDDL mirrors SQLite's session_plan_usage. Times stay
+// the archive's RFC 3339 text and groups its JSON text, so every backend
+// returns the same values; nothing range-queries these columns.
+const sessionPlanUsageDDL = `
+CREATE TABLE IF NOT EXISTS session_plan_usage (
+    session_id TEXT PRIMARY KEY,
+    has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE,
+    data_as_of TEXT,
+    data_status TEXT NOT NULL DEFAULT '',
+    usage_source TEXT NOT NULL DEFAULT '',
+    weekly_percent DOUBLE PRECISION,
+    five_hour_percent DOUBLE PRECISION,
+    credits TEXT,
+    groups_json TEXT NOT NULL DEFAULT '[]',
+    is_final BOOLEAN NOT NULL DEFAULT FALSE,
+    outcome_kind TEXT NOT NULL DEFAULT '',
+    outcome_at TEXT,
+    counted_under TEXT NOT NULL DEFAULT '',
+    has_coverage BOOLEAN NOT NULL DEFAULT FALSE,
+    last_capture_at TEXT,
+    uncaptured_turns INT NOT NULL DEFAULT 0,
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id) ON DELETE CASCADE
+);
+`
+
+const commitLinksDDL = `
+CREATE TABLE IF NOT EXISTS commit_links (
+    session_id TEXT NOT NULL, sha TEXT NOT NULL,
+    branch TEXT NOT NULL, subject TEXT NOT NULL, repository TEXT NOT NULL,
+    message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL, tool_use_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL, turn_ordinal INTEGER, turn_text TEXT NOT NULL,
+    project TEXT NOT NULL, retained BOOLEAN NOT NULL, PRIMARY KEY(session_id,sha)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_links_sha ON commit_links(sha);
+`
+
+// imageTextDDL holds the archive's successful image extractions at portable
+// source coordinates, one row per image and processor.
+const imageTextDDL = `
+CREATE TABLE IF NOT EXISTS image_text (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL, message_ordinal INTEGER NOT NULL,
+    call_index INTEGER NOT NULL, event_index INTEGER NOT NULL, image_index INTEGER NOT NULL,
+    image_hash TEXT NOT NULL, processor TEXT NOT NULL, provider TEXT NOT NULL,
+    model TEXT NOT NULL, revision TEXT NOT NULL, text TEXT NOT NULL,
+    PRIMARY KEY(session_id,source_kind,message_ordinal,call_index,event_index,image_index,processor)
+);
+`
+
+const retainedCommitLinksDDL = `
+CREATE TABLE IF NOT EXISTS retained_commit_links (
+    source_archive_id TEXT NOT NULL, session_id TEXT NOT NULL, sha TEXT NOT NULL,
+    branch TEXT NOT NULL, subject TEXT NOT NULL, repository TEXT NOT NULL,
+    message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL, tool_use_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL, PRIMARY KEY(source_archive_id,session_id,sha)
+);
+CREATE INDEX IF NOT EXISTS idx_retained_commit_links_session_sha ON retained_commit_links(session_id,sha);
+CREATE INDEX IF NOT EXISTS idx_retained_commit_links_sha ON retained_commit_links(sha);
+`
+
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
 //
@@ -143,6 +207,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_label        TEXT NOT NULL DEFAULT '',
     entrypoint         TEXT NOT NULL DEFAULT '',
     session_kind       TEXT NOT NULL DEFAULT '',
+    -- JSON array of parser-derived pull request links; '' when none.
+    pr_links           TEXT NOT NULL DEFAULT '',
+    -- Sorted user labels pushed from the SQLite archive.
+    labels             TEXT[] NOT NULL DEFAULT '{}',
     first_message      TEXT,
     display_name       TEXT,
     source_display_name TEXT,
@@ -152,6 +220,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at           TIMESTAMPTZ,
     deleted_at         TIMESTAMPTZ,
     source_deleted_at  TIMESTAMPTZ,
+    trash_includes_codex_pages BOOLEAN NOT NULL DEFAULT FALSE,
+    source_trash_includes_codex_pages BOOLEAN NOT NULL DEFAULT FALSE,
     deletion_cause     TEXT,
     message_count      INT NOT NULL DEFAULT 0,
     user_message_count INT NOT NULL DEFAULT 0,
@@ -187,6 +257,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     no_code_context_count     INT NOT NULL DEFAULT 0,
     runaway_tool_loop_count   INT NOT NULL DEFAULT 0,
     termination_status        TEXT,
+    friction_count            INT NOT NULL DEFAULT 0,
+    friction_rules_version    TEXT NOT NULL DEFAULT '',
+    friction_hash             TEXT NOT NULL DEFAULT '',
     transcript_revision       TEXT NOT NULL DEFAULT '0',
     source_archive_id          TEXT NOT NULL DEFAULT '',
     source_database_generation TEXT NOT NULL DEFAULT '',
@@ -204,6 +277,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
     thinking_text  TEXT NOT NULL DEFAULT '',
+    dialogue_text  TEXT,
     timestamp      TIMESTAMPTZ,
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -268,16 +342,17 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_session
 
 CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
     ON usage_events (occurred_at);
-
+` + sessionPlanUsageDDL + sessionUsageTotalsDDL + `
 CREATE TABLE IF NOT EXISTS cursor_usage_events (
     id BIGSERIAL PRIMARY KEY,
+    agent TEXT NOT NULL DEFAULT 'cursor',
     occurred_at TIMESTAMPTZ NOT NULL,
     model TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT '',
-    input_tokens INT NOT NULL DEFAULT 0,
-    output_tokens INT NOT NULL DEFAULT 0,
-    cache_write_tokens INT NOT NULL DEFAULT 0,
-    cache_read_tokens INT NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
     charged_microdollars BIGINT NOT NULL DEFAULT 0,
     cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
     user_id TEXT NOT NULL DEFAULT '',
@@ -305,6 +380,10 @@ CREATE TABLE IF NOT EXISTS starred_sessions (
 
 CREATE TABLE IF NOT EXISTS excluded_sessions (
     id         TEXT PRIMARY KEY,
+    include_codex_pages BOOLEAN NOT NULL DEFAULT FALSE,
+    owner_marker TEXT,
+    machine TEXT,
+    agent TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -511,6 +590,9 @@ CREATE INDEX IF NOT EXISTS idx_source_worktree_project_mapping_scopes_scope
     );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
+    observed_outcome TEXT,
+    observed_repeat TEXT,
+    sequence_ending TEXT,
     id                    BIGSERIAL PRIMARY KEY,
     session_id            TEXT NOT NULL,
     tool_name             TEXT NOT NULL,
@@ -563,6 +645,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_result_events_dedup
         session_id, tool_call_message_ordinal,
         call_index, event_index
     );
+
+` + commitLinksDDL + retainedCommitLinksDDL + imageTextDDL + `
 
 CREATE TABLE IF NOT EXISTS secret_findings (
     id               BIGINT GENERATED ALWAYS AS IDENTITY
@@ -618,6 +702,83 @@ CREATE INDEX IF NOT EXISTS idx_insights_lookup
 CREATE INDEX IF NOT EXISTS idx_insights_cache
     ON insights (cache_key, created_at DESC)
     WHERE cache_key <> '';
+
+`
+
+// frictionReviewDDL adds daily state without altering the shipped findings schema.
+const frictionReviewDDL = `
+CREATE TABLE IF NOT EXISTS diagnostic_events (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    message TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    occurred_at_exact TEXT NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_events_occurred ON diagnostic_events (occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_friction_activity
+    ON sessions(COALESCE(ended_at, started_at))
+    WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS friction_digests (
+    date             TEXT PRIMARY KEY,
+    timezone         TEXT NOT NULL,
+    rules_version    TEXT NOT NULL,
+    built_at         TIMESTAMPTZ NOT NULL,
+    revision         INTEGER NOT NULL DEFAULT 1,
+    sessions_scanned INTEGER NOT NULL,
+    snapshot_json    TEXT NOT NULL,
+    summary_json     TEXT NOT NULL,
+    markdown         TEXT NOT NULL,
+    markdown_sha256  TEXT NOT NULL,
+    run_id           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friction_digest_sessions (
+    subject_id   TEXT PRIMARY KEY,
+    date         TEXT NOT NULL,
+    subject_kind TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_digest_sessions_date
+    ON friction_digest_sessions (date);
+
+CREATE TABLE IF NOT EXISTS friction_patterns (
+    fingerprint      TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    first_seen_date  TEXT NOT NULL,
+    last_seen_date   TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL,
+    session_count    INTEGER NOT NULL,
+    last_subject_id  TEXT NOT NULL,
+    last_ordinal     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_patterns_last_seen
+    ON friction_patterns (last_seen_date);
+
+CREATE TABLE IF NOT EXISTS friction_issue_links (
+    fingerprint       TEXT PRIMARY KEY,
+    kata_instance_uid TEXT NOT NULL,
+    kata_project_uid  TEXT NOT NULL,
+    issue_uid         TEXT NOT NULL,
+    qualified_id      TEXT NOT NULL,
+    web_url           TEXT NOT NULL DEFAULT '',
+    source            TEXT NOT NULL,
+    linked_at         TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friction_filing_state (
+    fingerprint     TEXT PRIMARY KEY,
+    state           TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    first_failed_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
+    last_error      TEXT NOT NULL DEFAULT '',
+    updated_at      TIMESTAMPTZ NOT NULL
+);
 `
 
 func migrateMoneyColumnsPG(
@@ -898,6 +1059,54 @@ func ensureUsageJSONHelper(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// lockSyncMetadataRow holds a row lock on the sync_metadata row named key
+// until tx ends, creating the row first if needed. A row lock is used instead
+// of pg_advisory_xact_lock because supported CockroachDB versions do not
+// implement advisory locks, and sync_metadata lives in the target schema, so
+// the lock is schema-scoped.
+func lockSyncMetadataRow(ctx context.Context, tx *sql.Tx, key string) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value) VALUES ($1, '')
+		 ON CONFLICT (key) DO NOTHING`,
+		key,
+	); err != nil {
+		return fmt.Errorf("creating sync_metadata lock row %q: %w", key, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`SELECT value FROM sync_metadata WHERE key = $1 FOR UPDATE`,
+		key,
+	); err != nil {
+		return fmt.Errorf("locking sync_metadata row %q: %w", key, err)
+	}
+	return nil
+}
+
+func accountUsageTokensWidePG(ctx context.Context, db pgProjectIdentityExecer) bool {
+	var wide bool
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) = 4 FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = 'cursor_usage_events'
+		  AND column_name IN ('input_tokens', 'output_tokens',
+		                      'cache_write_tokens', 'cache_read_tokens')
+		  AND data_type = 'bigint'`).Scan(&wide)
+	return err == nil && wide
+}
+
+func migrateAccountUsageCountersPG(ctx context.Context, db pgProjectIdentityExecer) error {
+	if accountUsageTokensWidePG(ctx, db) {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE cursor_usage_events
+		ALTER COLUMN input_tokens TYPE BIGINT,
+		ALTER COLUMN output_tokens TYPE BIGINT,
+		ALTER COLUMN cache_write_tokens TYPE BIGINT,
+		ALTER COLUMN cache_read_tokens TYPE BIGINT`); err != nil {
+		return fmt.Errorf("widening PG account usage counters: %w", err)
+	}
+	return nil
+}
+
 // EnsureSchema creates the schema (if needed), then runs
 // idempotent CREATE TABLE / ALTER TABLE statements. The schema
 // parameter is the unquoted schema name (e.g. "agentsview").
@@ -929,6 +1138,12 @@ func EnsureSchema(
 	if _, err := db.ExecContext(ctx, coreDDL); err != nil {
 		return fmt.Errorf("creating pg tables: %w", err)
 	}
+	if _, err := db.ExecContext(ctx, frictionDDL); err != nil {
+		return fmt.Errorf("creating pg friction tables: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, frictionReviewDDL); err != nil {
+		return fmt.Errorf("creating pg friction review tables: %w", err)
+	}
 	if err := ensureRawIngestSchemaPG(ctx, db); err != nil {
 		return err
 	}
@@ -946,448 +1161,7 @@ func EnsureSchema(
 	)
 
 	// Idempotent column additions for forward compatibility.
-	alters := []columnMigration{
-		{
-			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
-			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
-			"adding model_pricing.cache_creation_1h_microdollars_per_mtok",
-		},
-		{
-			"model_pricing_bands", "cache_creation_1h_microdollars_per_mtok",
-			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
-			"adding model_pricing_bands.cache_creation_1h_microdollars_per_mtok",
-		},
-		{
-			"sessions", "project_assigned",
-			`project_assigned BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.project_assigned",
-		},
-		{
-			"sessions", "transcript_revision",
-			`transcript_revision TEXT NOT NULL DEFAULT '0'`,
-			"adding sessions.transcript_revision",
-		},
-		{
-			"sessions", "owner_marker",
-			`owner_marker TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.owner_marker",
-		},
-		{
-			"sessions", "deleted_at",
-			`deleted_at TIMESTAMPTZ`,
-			"adding sessions.deleted_at",
-		},
-		{
-			"sessions", "created_at",
-			`created_at TIMESTAMPTZ`,
-			"adding sessions.created_at",
-		},
-		{
-			"sessions", "source_display_name",
-			`source_display_name TEXT`,
-			"adding sessions.source_display_name",
-		},
-		{
-			"sessions", "source_deleted_at",
-			`source_deleted_at TIMESTAMPTZ`,
-			"adding sessions.source_deleted_at",
-		},
-		{
-			"sessions", "deletion_cause",
-			`deletion_cause TEXT`,
-			"adding sessions.deletion_cause",
-		},
-		{
-			"sessions", "parser_parent_session_id",
-			`parser_parent_session_id TEXT`,
-			"adding sessions.parser_parent_session_id",
-		},
-		{
-			"sessions", "total_output_tokens",
-			`total_output_tokens INT NOT NULL DEFAULT 0`,
-			"adding sessions.total_output_tokens",
-		},
-		{
-			"sessions", "peak_context_tokens",
-			`peak_context_tokens INT NOT NULL DEFAULT 0`,
-			"adding sessions.peak_context_tokens",
-		},
-		{
-			"sessions", "has_total_output_tokens",
-			`has_total_output_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_total_output_tokens",
-		},
-		{
-			"sessions", "has_peak_context_tokens",
-			`has_peak_context_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_peak_context_tokens",
-		},
-		{
-			"messages", "model",
-			`model TEXT NOT NULL DEFAULT ''`,
-			"adding messages.model",
-		},
-		{
-			"messages", "reasoning_effort",
-			`reasoning_effort TEXT NOT NULL DEFAULT ''`,
-			"adding messages.reasoning_effort",
-		},
-		{
-			"messages", "token_usage",
-			`token_usage TEXT NOT NULL DEFAULT ''`,
-			"adding messages.token_usage",
-		},
-		{
-			"messages", "context_tokens",
-			`context_tokens INT NOT NULL DEFAULT 0`,
-			"adding messages.context_tokens",
-		},
-		{
-			"messages", "output_tokens",
-			`output_tokens INT NOT NULL DEFAULT 0`,
-			"adding messages.output_tokens",
-		},
-		{
-			"messages", "provider_id",
-			`provider_id TEXT NOT NULL DEFAULT ''`,
-			"adding messages.provider_id",
-		},
-		{
-			"usage_events", "provider_id",
-			`provider_id TEXT NOT NULL DEFAULT ''`,
-			"adding usage_events.provider_id",
-		},
-		{
-			"messages", "has_context_tokens",
-			`has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.has_context_tokens",
-		},
-		{
-			"messages", "has_output_tokens",
-			`has_output_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.has_output_tokens",
-		},
-		{
-			"messages", "claude_message_id",
-			`claude_message_id TEXT NOT NULL DEFAULT ''`,
-			"adding messages.claude_message_id",
-		},
-		{
-			"messages", "claude_request_id",
-			`claude_request_id TEXT NOT NULL DEFAULT ''`,
-			"adding messages.claude_request_id",
-		},
-		{
-			"tool_calls", "call_index",
-			`call_index INT NOT NULL DEFAULT 0`,
-			"adding tool_calls.call_index",
-		},
-		{
-			"tool_calls", "file_path",
-			`file_path TEXT`,
-			"adding tool_calls.file_path",
-		},
-		{
-			"sessions", "prompt_evidence_discarded",
-			`prompt_evidence_discarded BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.prompt_evidence_discarded",
-		},
-		{
-			"sessions", "is_automated",
-			`is_automated BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.is_automated",
-		},
-		{
-			"sessions", "tool_failure_signal_count",
-			`tool_failure_signal_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.tool_failure_signal_count",
-		},
-		{
-			"sessions", "tool_retry_count",
-			`tool_retry_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.tool_retry_count",
-		},
-		{
-			"sessions", "edit_churn_count",
-			`edit_churn_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.edit_churn_count",
-		},
-		{
-			"sessions", "consecutive_failure_max",
-			`consecutive_failure_max INT NOT NULL DEFAULT 0`,
-			"adding sessions.consecutive_failure_max",
-		},
-		{
-			"sessions", "outcome",
-			`outcome TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding sessions.outcome",
-		},
-		{
-			"sessions", "outcome_confidence",
-			`outcome_confidence TEXT NOT NULL DEFAULT 'low'`,
-			"adding sessions.outcome_confidence",
-		},
-		{
-			"sessions", "ended_with_role",
-			`ended_with_role TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.ended_with_role",
-		},
-		{
-			"sessions", "final_failure_streak",
-			`final_failure_streak INT NOT NULL DEFAULT 0`,
-			"adding sessions.final_failure_streak",
-		},
-		{
-			"sessions", "signals_pending_since",
-			`signals_pending_since TEXT`,
-			"adding sessions.signals_pending_since",
-		},
-		{
-			"sessions", "compaction_count",
-			`compaction_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.compaction_count",
-		},
-		{
-			"sessions", "mid_task_compaction_count",
-			`mid_task_compaction_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.mid_task_compaction_count",
-		},
-		{
-			"sessions", "context_pressure_max",
-			`context_pressure_max DOUBLE PRECISION`,
-			"adding sessions.context_pressure_max",
-		},
-		{
-			"sessions", "health_score",
-			`health_score INT`,
-			"adding sessions.health_score",
-		},
-		{
-			"sessions", "health_grade",
-			`health_grade TEXT`,
-			"adding sessions.health_grade",
-		},
-		{
-			"sessions", "has_tool_calls",
-			`has_tool_calls BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_tool_calls",
-		},
-		{
-			"sessions", "has_context_data",
-			`has_context_data BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_context_data",
-		},
-		{
-			"sessions", "quality_signal_version",
-			`quality_signal_version INT NOT NULL DEFAULT 0`,
-			"adding sessions.quality_signal_version",
-		},
-		{
-			"sessions", "short_prompt_count",
-			`short_prompt_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.short_prompt_count",
-		},
-		{
-			"sessions", "unstructured_start",
-			`unstructured_start BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.unstructured_start",
-		},
-		{
-			"sessions", "missing_success_criteria_count",
-			`missing_success_criteria_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.missing_success_criteria_count",
-		},
-		{
-			"sessions", "missing_verification_count",
-			`missing_verification_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.missing_verification_count",
-		},
-		{
-			"sessions", "duplicate_prompt_count",
-			`duplicate_prompt_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.duplicate_prompt_count",
-		},
-		{
-			"sessions", "no_code_context_count",
-			`no_code_context_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.no_code_context_count",
-		},
-		{
-			"sessions", "runaway_tool_loop_count",
-			`runaway_tool_loop_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.runaway_tool_loop_count",
-		},
-		{
-			"sessions", "data_version",
-			`data_version INT NOT NULL DEFAULT 0`,
-			"adding sessions.data_version",
-		},
-		{
-			"sessions", "cwd",
-			`cwd TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.cwd",
-		},
-		{
-			"sessions", "git_branch",
-			`git_branch TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.git_branch",
-		},
-		{
-			"sessions", "source_session_id",
-			`source_session_id TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_session_id",
-		},
-		{
-			"sessions", "source_version",
-			`source_version TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_version",
-		},
-		{
-			"sessions", "transcript_fidelity",
-			`transcript_fidelity TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.transcript_fidelity",
-		},
-		{
-			"sessions", "parser_malformed_lines",
-			`parser_malformed_lines INT NOT NULL DEFAULT 0`,
-			"adding sessions.parser_malformed_lines",
-		},
-		{
-			"sessions", "is_truncated",
-			`is_truncated BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.is_truncated",
-		},
-		{
-			"messages", "source_type",
-			`source_type TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_type",
-		},
-		{
-			"messages", "source_subtype",
-			`source_subtype TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_subtype",
-		},
-		{
-			"messages", "prompt_source",
-			`prompt_source TEXT NOT NULL DEFAULT ''`,
-			"adding messages.prompt_source",
-		},
-		{
-			"messages", "source_uuid",
-			`source_uuid TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_uuid",
-		},
-		{
-			"messages", "source_parent_uuid",
-			`source_parent_uuid TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_parent_uuid",
-		},
-		{
-			"messages", "is_sidechain",
-			`is_sidechain BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.is_sidechain",
-		},
-		{
-			"messages", "is_compact_boundary",
-			`is_compact_boundary BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.is_compact_boundary",
-		},
-		{
-			"messages", "thinking_text",
-			`thinking_text TEXT NOT NULL DEFAULT ''`,
-			"adding messages.thinking_text",
-		},
-		{
-			"sessions", "termination_status",
-			`termination_status TEXT`,
-			"adding sessions.termination_status",
-		},
-		{
-			"sessions", "secret_leak_count",
-			`secret_leak_count INTEGER NOT NULL DEFAULT 0`,
-			"adding sessions.secret_leak_count",
-		},
-		{
-			"sessions", "secrets_rules_version",
-			`secrets_rules_version TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.secrets_rules_version",
-		},
-		{
-			"sessions", "session_name",
-			`session_name TEXT`,
-			"adding sessions.session_name",
-		},
-		{
-			"sessions", "agent_label",
-			`agent_label TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.agent_label",
-		},
-		{
-			"sessions", "entrypoint",
-			`entrypoint TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.entrypoint",
-		},
-		{
-			"sessions", "session_kind",
-			`session_kind TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.session_kind",
-		},
-		{
-			"source_project_identity_observations", "source_archive_id",
-			`source_archive_id TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.source_archive_id",
-		},
-		{
-			"source_project_identity_observations", "source_archive_salt",
-			`source_archive_salt TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.source_archive_salt",
-		},
-		{
-			"source_project_identity_observations", "repository_path",
-			`repository_path TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.repository_path",
-		},
-		{
-			"source_project_identity_observations", "worktree_relationship",
-			`worktree_relationship TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding source_project_identity_observations.worktree_relationship",
-		},
-		{
-			"source_project_identity_observations", "checkout_state",
-			`checkout_state TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding source_project_identity_observations.checkout_state",
-		},
-		{
-			"source_project_identity_observations", "git_branch",
-			`git_branch TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.git_branch",
-		},
-		{
-			"source_project_identity_observations", "remote_resolution",
-			`remote_resolution TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding source_project_identity_observations.remote_resolution",
-		},
-		{
-			"source_project_identity_observations", "remote_candidate_count",
-			`remote_candidate_count INT NOT NULL DEFAULT 0`,
-			"adding source_project_identity_observations.remote_candidate_count",
-		},
-		{
-			"sessions", "source_archive_id",
-			`source_archive_id TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_archive_id",
-		},
-		{
-			"sessions", "source_database_generation",
-			`source_database_generation TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_database_generation",
-		},
-		{
-			"sessions", "file_path",
-			`file_path TEXT`,
-			"adding sessions.file_path",
-		},
-	}
+	alters := schemaColumnMigrations()
 	step = time.Now()
 	existingColumns, err := loadExistingColumns(
 		ctx, db, alters,
@@ -1404,9 +1178,11 @@ func EnsureSchema(
 	if err := migrateMoneyColumnsPG(ctx, db, existingColumns); err != nil {
 		return err
 	}
+	if err := migrateAccountUsageCountersPG(ctx, db); err != nil {
+		return err
+	}
 	step = time.Now()
 	tokenCoverageColumnsAdded := false
-	sourceCurationColumnsAdded := false
 	addedColumns, err := ensureColumns(ctx, db, existingColumns, alters)
 	if err != nil {
 		return err
@@ -1416,8 +1192,6 @@ func EnsureSchema(
 		case "has_total_output_tokens", "has_peak_context_tokens",
 			"has_context_tokens", "has_output_tokens":
 			tokenCoverageColumnsAdded = true
-		case "source_display_name", "source_deleted_at":
-			sourceCurationColumnsAdded = true
 		}
 	}
 	log.Printf(
@@ -1426,26 +1200,6 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 		len(addedColumns),
 	)
-	step = time.Now()
-	sourceBackfilled, err := runSourceCurationBackfill(
-		ctx, db, sourceCurationColumnsAdded,
-	)
-	if err != nil {
-		return err
-	}
-	if sourceBackfilled {
-		log.Printf(
-			"pg schema: source curation baseline backfill"+
-				" completed in %s",
-			time.Since(step).Round(time.Millisecond),
-		)
-	} else {
-		log.Printf(
-			"pg schema: source curation baseline backfill"+
-				" check completed in %s (repair skipped)",
-			time.Since(step).Round(time.Millisecond),
-		)
-	}
 	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
 		return err
 	}
@@ -1483,6 +1237,17 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 	)
 	step = time.Now()
+	if err := dedupeStoredDialoguePG(ctx, db); err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: dialogue deduplication step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
+	if err := createMissingPreparationIndexesPG(ctx, db); err != nil {
+		return err
+	}
 	if err := createPartialIndexesPG(ctx, db); err != nil {
 		return err
 	}
@@ -1491,7 +1256,9 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 	)
 	step = time.Now()
-	createContentSearchIndexesPG(ctx, db)
+	if err := createContentSearchIndexesPG(ctx, db); err != nil {
+		log.Printf("pg schema: content search indexes unavailable, search will scan: %v", err)
+	}
 	log.Printf(
 		"pg schema: content search index step completed in %s",
 		time.Since(step).Round(time.Millisecond),
@@ -1507,6 +1274,7 @@ func EnsureSchema(
 		return err
 	}
 	if !runRepair {
+		ensureUsageChangeJournalPG(ctx, db)
 		log.Printf(
 			"pg schema: token coverage repair check completed"+
 				" in %s (repair skipped)",
@@ -1535,6 +1303,7 @@ func EnsureSchema(
 	if err := markTokenCoverageRepairDone(ctx, db); err != nil {
 		return err
 	}
+	ensureUsageChangeJournalPG(ctx, db)
 	log.Printf(
 		"pg schema: token coverage repair marker stored in %s",
 		time.Since(step).Round(time.Millisecond),
@@ -1546,10 +1315,46 @@ func EnsureSchema(
 	return nil
 }
 
+var preparationIndexesPG = []struct{ name, ddl string }{
+	{"idx_sessions_data_version", `CREATE INDEX IF NOT EXISTS idx_sessions_data_version ON sessions(data_version)`},
+	{"idx_sessions_parentless_workers", `CREATE INDEX IF NOT EXISTS idx_sessions_parentless_workers ON sessions(id) WHERE ` + db.ParentlessWorkerSQL},
+	{"idx_sessions_source_missing", `CREATE INDEX IF NOT EXISTS idx_sessions_source_missing ON sessions(id) WHERE deletion_cause = 'source_missing'`},
+	// Raw session ID lookups seek on the ID tail instead of scanning every
+	// session; see Store.FindSessionIDsByRawSuffix.
+	{"idx_sessions_id_tail", `CREATE INDEX IF NOT EXISTS idx_sessions_id_tail ON sessions((` + pgSessionIDTailExpr + `))`},
+}
+
+// createMissingPreparationIndexesPG serializes publishers upgrading the same
+// archive, since concurrent IF NOT EXISTS creation can still collide.
+func createMissingPreparationIndexesPG(ctx context.Context, pg *sql.DB) error {
+	missing := false
+	for _, index := range preparationIndexesPG {
+		missing = missing || !pgHasIndex(ctx, pg, index.name)
+	}
+	if !missing {
+		return nil
+	}
+	tx, err := pg.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning PG preparation index installation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockSyncMetadataRow(ctx, tx, "preparation_indexes_lock"); err != nil {
+		return err
+	}
+	for _, index := range preparationIndexesPG {
+		if _, err := tx.ExecContext(ctx, index.ddl); err != nil {
+			return fmt.Errorf("creating PG preparation index %s: %w", index.name, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // createPartialIndexesPG creates partial indexes on the PG schema.
 // Idempotent via IF NOT EXISTS.
-func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
+func createPartialIndexesPG(ctx context.Context, db pgSessionExecer) error {
 	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_sessions_raw_group ON sessions(raw_group_id) WHERE raw_group_id <> ''`,
 		// Match SQLite's bounded Activity terminal-event lookup, including
 		// completions that outlive a session's ended_at metadata.
 		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_terminal
@@ -1578,6 +1383,10 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 		 WHERE timestamp IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
+		// idx_sessions_labels backs the label filter's array containment,
+		// SQLite probes the session_labels primary key (session_id, label).
+		`CREATE INDEX IF NOT EXISTS idx_sessions_labels
+		 ON sessions USING GIN (labels)`,
 		// idx_tool_calls_file_path backs the cross-session Recent Edits feed.
 		// Created here, after the file_path column migration, mirroring the
 		// SQLite partial index so legacy schemas migrate cleanly.
@@ -1601,74 +1410,43 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// createContentSearchIndexesPG adds a pg_trgm GIN index on messages.content so
-// the content search (ILIKE '%pattern%') is index-accelerated instead of
-// sequentially scanning the messages table as history grows.
-//
-// It is best-effort and never fails schema setup. pg_trgm is a trusted
-// extension on PostgreSQL 13+, but a role without CREATE privilege (or a
-// managed instance that blocks it) must still get a working — if slower —
-// store. Each statement runs in its own implicit transaction, so a failed
-// CREATE EXTENSION does not poison the rest of EnsureSchema. The gin_trgm_ops
-// operator class lives in whatever schema pg_trgm was installed in, which may
-// not be on the connection search_path (Open sets it to the target schema
-// only), so the opclass is schema-qualified to the extension's namespace.
-func createContentSearchIndexesPG(ctx context.Context, db *sql.DB) {
-	if _, err := db.ExecContext(ctx,
-		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
-	); err != nil {
-		log.Printf(
-			"pg schema: pg_trgm unavailable, content search will scan: %v", err,
-		)
-		return
+// createContentSearchIndexesPG accelerates content, dialogue, and thinking
+// substring searches. Callers decide whether unavailable pg_trgm is fatal.
+// The opclass is qualified because the extension can live outside search_path.
+func createContentSearchIndexesPG(ctx context.Context, pg interface {
+	pgSessionExecer
+	hostedQuerier
+},
+) error {
+	if _, err := pg.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS pg_trgm`); err != nil {
+		return err
 	}
 	var extSchema string
-	if err := db.QueryRowContext(ctx,
-		`SELECT n.nspname FROM pg_extension e
-		 JOIN pg_namespace n ON n.oid = e.extnamespace
-		 WHERE e.extname = 'pg_trgm'`,
-	).Scan(&extSchema); err != nil {
-		log.Printf("pg schema: locating pg_trgm schema failed: %v", err)
-		return
+	if err := pg.QueryRowContext(ctx, `SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'`).Scan(&extSchema); err != nil {
+		return err
 	}
 	quotedExt, err := quoteIdentifier(extSchema)
 	if err != nil {
-		log.Printf("pg schema: invalid pg_trgm schema %q: %v", extSchema, err)
-		return
+		return err
 	}
-	// fastupdate=off keeps the index bounded: the default fastupdate=on
-	// buffers inserts into a pending list that only VACUUM merges, which grows
-	// unbounded when continuous ingest starves autovacuum.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		`CREATE INDEX IF NOT EXISTS idx_messages_content_trgm
-		 ON messages USING gin (content %s.gin_trgm_ops)
-		 WITH (fastupdate = off)`, quotedExt,
-	)); err != nil {
-		log.Printf(
-			"pg schema: creating messages.content trigram index failed: %v", err,
-		)
-		return
+	// Disable the pending list so continuous ingest cannot grow it unbounded.
+	for _, index := range []struct{ name, expression string }{
+		{"idx_messages_content_trgm", "content"},
+		{"idx_messages_dialogue_trgm", "(COALESCE(dialogue_text, content))"},
+		{"idx_messages_thinking_trgm", "thinking_text"},
+	} {
+		if _, err := pg.ExecContext(ctx, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON messages USING gin (%s %s.gin_trgm_ops) WITH (fastupdate = off)`, index.name, index.expression, quotedExt)); err != nil {
+			return err
+		}
 	}
-	// CREATE INDEX IF NOT EXISTS only applies WITH (fastupdate = off) on
-	// first creation. Re-apply on every boot so stores upgraded from a
-	// prior schema (which left fastupdate=on) also get the bounded index.
-	if _, err := db.ExecContext(ctx,
-		`ALTER INDEX idx_messages_content_trgm SET (fastupdate = off)`,
-	); err != nil {
-		log.Printf(
-			"pg schema: disabling fastupdate on messages.content trigram index failed: %v",
-			err,
-		)
-	}
+	// Existing content indexes may still have fastupdate enabled.
+	_, err = pg.ExecContext(ctx, `ALTER INDEX idx_messages_content_trgm SET (fastupdate = off)`)
+	return err
 }
 
-// backfillIsAutomatedPG verifies is_automated for all PG
-// sessions, correcting both false negatives (new patterns or
-// stale imported rows) and stale false positives (patterns
-// tightened since last run). The stored classifier hash records
-// which classifier wrote the current audit, but it is not a
-// complete integrity marker: rows can arrive from stale clients
-// after the hash was stamped.
+// backfillIsAutomatedPG corrects stale automation verdicts. Per-row
+// classifier stamps track freshness when available; deleting the global
+// metadata key requests a complete recheck.
 func backfillIsAutomatedPG(
 	ctx context.Context, pg *sql.DB,
 ) error {
@@ -1676,17 +1454,23 @@ func backfillIsAutomatedPG(
 	return err
 }
 
-// runSchemaDataRepairsPG runs the non-DDL correctness repairs that
+// runSchemaDataRepairsPG runs the correctness repairs that
 // EnsureSchema performs: it recomputes is_automated, backfills
 // source-curation baselines, scrubs stored project remotes, and repairs
-// token-coverage flags. These issue only row-level writes, so the
-// compatible-schema fast path can run them without the index and
-// column DDL that can block concurrent pg serve reads (issue #887).
+// token-coverage flags. The one-time automation tracking installation
+// holds an exclusive sessions lock until commit, blocking reads and writes.
+// Subsequent repairs use row-level writes.
 func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 	if err := backfillIsAutomatedPG(ctx, db); err != nil {
 		return err
 	}
 	if _, err := runSourceCurationBackfill(ctx, db, false); err != nil {
+		return err
+	}
+	if err := backfillCodexThreadScopePG(ctx, db); err != nil {
+		return err
+	}
+	if err := dedupeStoredDialoguePG(ctx, db); err != nil {
 		return err
 	}
 	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
@@ -1708,17 +1492,65 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 	return markTokenCoverageRepairDone(ctx, db)
 }
 
-// repairLegacySourceMissingDeletionPG restores mirror rows written while
-// source absence was represented as deletion. Source availability is local
-// SQLite sync state; PostgreSQL retains only user-owned deletion state.
-func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
+// dedupeStoredDialoguePG applies db.StoredDialogue to rows pushed before it:
+// a dialogue_text that repeats content on a message without thinking text
+// becomes NULL, which search already reads as content. The marker and the
+// UPDATE share one statement, so the rewrite runs once and a failure retries
+// it whole.
+func dedupeStoredDialoguePG(ctx context.Context, pg pgSessionExecer) error {
 	_, err := pg.ExecContext(ctx, `
+		WITH migration AS (
+			INSERT INTO sync_metadata (key, value) VALUES ($1, '1')
+			ON CONFLICT (key) DO NOTHING RETURNING key
+		)
+		UPDATE messages SET dialogue_text = NULL
+		WHERE dialogue_text = content AND thinking_text = ''
+		  AND EXISTS (SELECT 1 FROM migration)`, dialogueDedupeMetadataKey)
+	if err != nil {
+		return fmt.Errorf("removing duplicate dialogue text: %w", err)
+	}
+	return nil
+}
+
+// Backfill only thread deletion decisions present before per-file identities.
+// The marker and updates share one statement so retries cannot widen subsequent
+// per-file actions. Hosted raw curation uses separate tables and identities.
+func backfillCodexThreadScopePG(ctx context.Context, pg pgSessionExecer) error {
+	_, err := pg.ExecContext(ctx, `
+		WITH migration AS (
+			INSERT INTO sync_metadata (key, value) VALUES ($1, '1')
+			ON CONFLICT (key) DO NOTHING RETURNING key
+		), exclusions AS (
+			UPDATE excluded_sessions SET include_codex_pages = TRUE
+			WHERE id ~ $2 AND EXISTS (SELECT 1 FROM migration)
+			RETURNING id
+		)
+		UPDATE sessions SET trash_includes_codex_pages = TRUE,
+			source_trash_includes_codex_pages = (source_deleted_at IS NOT NULL)
+		WHERE id ~ $2 AND agent IN ('codex', 'traex', 'augure-code')
+		  AND provenance_kind = 'legacy' AND deleted_at IS NOT NULL
+		  AND deletion_cause IS DISTINCT FROM 'source_missing'
+		  AND EXISTS (SELECT 1 FROM migration)`, codexThreadScopeMetadataKey,
+		`(^|~)(codex|traex|augure-code):[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	if err != nil {
+		return fmt.Errorf("preserving legacy Codex deletion scope: %w", err)
+	}
+	return nil
+}
+
+const repairLegacySourceMissingDeletionSQL = `
 		UPDATE sessions
 		SET deleted_at = NULL,
 		    source_deleted_at = NULL,
 		    deletion_cause = NULL,
 		    updated_at = NOW()
-		WHERE deletion_cause = 'source_missing'`)
+		WHERE deletion_cause = 'source_missing'`
+
+// repairLegacySourceMissingDeletionPG restores mirror rows written while
+// source absence was represented as deletion. Source availability is local
+// SQLite sync state; PostgreSQL retains only user-owned deletion state.
+func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
+	_, err := pg.ExecContext(ctx, repairLegacySourceMissingDeletionSQL)
 	if err != nil {
 		return fmt.Errorf("repairing legacy PG source-missing deletions: %w", err)
 	}
@@ -1726,7 +1558,7 @@ func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error 
 }
 
 func backfillSourceCurationBaselines(
-	ctx context.Context, pg *sql.DB,
+	ctx context.Context, pg pgSessionExecer,
 ) error {
 	if _, err := pg.ExecContext(ctx,
 		`UPDATE sessions
@@ -1750,7 +1582,7 @@ func backfillSourceCurationBaselines(
 }
 
 func runSourceCurationBackfill(
-	ctx context.Context, db *sql.DB, sourceCurationColumnsAdded bool,
+	ctx context.Context, db pgProjectIdentityExecer, sourceCurationColumnsAdded bool,
 ) (bool, error) {
 	runRepair, err := shouldRunSourceCurationBackfill(
 		ctx, db, sourceCurationColumnsAdded,
@@ -1771,7 +1603,7 @@ func runSourceCurationBackfill(
 }
 
 func shouldRunSourceCurationBackfill(
-	ctx context.Context, db *sql.DB, sourceCurationColumnsAdded bool,
+	ctx context.Context, db pgProjectIdentityExecer, sourceCurationColumnsAdded bool,
 ) (bool, error) {
 	if sourceCurationColumnsAdded {
 		return true, nil
@@ -1793,7 +1625,7 @@ func shouldRunSourceCurationBackfill(
 }
 
 func markSourceCurationBackfillDone(
-	ctx context.Context, db *sql.DB,
+	ctx context.Context, db pgSessionExecer,
 ) error {
 	_, err := db.ExecContext(ctx,
 		`INSERT INTO sync_metadata (key, value)
@@ -1945,36 +1777,6 @@ func markProjectIdentityRemoteScrubDone(
 	return nil
 }
 
-func batchUpdateAutomatedPG(
-	ctx context.Context, pg *sql.DB,
-	ids []string, val bool,
-) error {
-	const batchSize = 500
-	for i := 0; i < len(ids); i += batchSize {
-		end := min(i+batchSize, len(ids))
-		batch := ids[i:end]
-		pb := &paramBuilder{}
-		valPh := pb.add(val)
-		phs := make([]string, len(batch))
-		for j, id := range batch {
-			phs[j] = pb.add(id)
-		}
-		_, err := pg.ExecContext(ctx,
-			"UPDATE sessions SET is_automated = "+valPh+
-				" WHERE id IN ("+
-				strings.Join(phs, ",")+
-				")",
-			pb.args...,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"updating is_automated in PG: %w", err,
-			)
-		}
-	}
-	return nil
-}
-
 func loadExistingColumns(
 	ctx context.Context, db pgSessionQueryer, alters []columnMigration,
 	extraTables ...string,
@@ -2041,7 +1843,7 @@ func loadExistingColumns(
 }
 
 func ensureColumns(
-	ctx context.Context, db *sql.DB,
+	ctx context.Context, db pgProjectIdentityExecer,
 	existing map[string]map[string]bool,
 	migrations []columnMigration,
 ) ([]string, error) {
@@ -2099,6 +1901,35 @@ func ensureColumns(
 		for _, migration := range adds.migrations {
 			existing[adds.table][migration.column] = true
 			added = append(added, migration.column)
+		}
+	}
+	if existing["excluded_sessions"]["include_codex_pages"] {
+		// Thread scope compares the source deletion baseline, including on
+		// hosted upgrades that do not call EnsureSchema.
+		sourceCurationColumnsAdded := slices.Contains(added, "source_display_name") ||
+			slices.Contains(added, "source_deleted_at")
+		step := time.Now()
+		sourceBackfilled, err := runSourceCurationBackfill(
+			ctx, db, sourceCurationColumnsAdded,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if sourceBackfilled {
+			log.Printf(
+				"pg schema: source curation baseline backfill"+
+					" completed in %s",
+				time.Since(step).Round(time.Millisecond),
+			)
+		} else {
+			log.Printf(
+				"pg schema: source curation baseline backfill"+
+					" check completed in %s (repair skipped)",
+				time.Since(step).Round(time.Millisecond),
+			)
+		}
+		if err := backfillCodexThreadScopePG(ctx, db); err != nil {
+			return nil, err
 		}
 	}
 	return added, nil
@@ -2440,7 +2271,7 @@ func inferTokenCoverage(
 }
 
 // CheckSchemaCompat verifies that the PG schema has all columns
-func pgHasTable(ctx context.Context, db *sql.DB, name string) bool {
+func pgHasTable(ctx context.Context, db hostedQuerier, name string) bool {
 	var n int
 	err := db.QueryRowContext(ctx,
 		"SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1",
@@ -2485,7 +2316,7 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT source_display_name, source_deleted_at, deletion_cause
+		`SELECT source_display_name, source_deleted_at, deletion_cause, source_trash_includes_codex_pages, owner_marker
 		 FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -2494,7 +2325,7 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT id FROM excluded_sessions LIMIT 0`)
+		`SELECT id, include_codex_pages, owner_marker, machine, agent FROM excluded_sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"excluded_sessions table missing required columns: %w", err,
@@ -2510,7 +2341,7 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT call_index, file_path FROM tool_calls LIMIT 0`)
+		`SELECT call_index, file_path, observed_outcome, observed_repeat, sequence_ending FROM tool_calls LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"tool_calls table missing required columns: %w",
@@ -2519,7 +2350,7 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT session_id, ordinal, role, content, thinking_text,
+		`SELECT session_id, ordinal, role, content, thinking_text, dialogue_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, reasoning_effort, token_usage,
 			context_tokens, output_tokens, provider_id,
@@ -2604,6 +2435,26 @@ func CheckSchemaCompat(
 		)
 	}
 
+	_, err = db.ExecContext(ctx,
+		`SELECT session_id, `+planUsageColumns+`
+		 FROM session_plan_usage LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"session_plan_usage table missing required columns: %w",
+			err,
+		)
+	}
+
+	_, err = db.ExecContext(ctx,
+		`SELECT session_id, `+sessionUsageTotalColumns+`
+		 FROM session_usage_totals LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"session_usage_totals table missing required columns: %w",
+			err,
+		)
+	}
+
 	hasModelPricing := true
 	_, err = db.ExecContext(ctx,
 		`SELECT input_microdollars_per_mtok,
@@ -2661,7 +2512,7 @@ func CheckSchemaCompat(
 
 	if pgHasTable(ctx, db, "cursor_usage_events") {
 		_, err = db.ExecContext(ctx,
-			`SELECT id, occurred_at, model, kind,
+			`SELECT id, agent, occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
 				charged_microdollars, cursor_token_fee_microdollars,
@@ -2736,28 +2587,42 @@ func CheckSchemaCompat(
 		return fmt.Errorf(
 			"sync_metadata table missing required columns: %w", err)
 	}
+	_, err = db.ExecContext(ctx,
+		`SELECT session_id, source_kind, message_ordinal, call_index, event_index,
+			image_index, image_hash, processor, provider, model, revision, text
+		 FROM image_text LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf("image_text table missing required columns: %w", err)
+	}
 	return nil
 }
 
-// checkPushSchemaCompat verifies session ownership columns used only by push.
+// checkPushSchemaCompat verifies session columns written only by push.
 // CheckSchemaCompat also checks sync_metadata because PG serve reads machine
 // display labels from it.
 func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx,
-		`SELECT owner_marker, prompt_evidence_discarded FROM sessions LIMIT 0`)
+		`SELECT prompt_evidence_discarded FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
-			"sessions table missing push ownership columns: %w", err)
+			"sessions table missing push columns: %w", err)
+	}
+	_, err = db.ExecContext(ctx,
+		`SELECT friction_count, friction_rules_version, friction_hash FROM sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"sessions table missing friction columns: %w", err)
 	}
 	return nil
 }
 
 // pushSchemaCurrent reports whether the PG schema has everything a push
 // needs. CheckSchemaCompat covers the read and PG serve write paths but does
-// not require push-only sessions.owner_marker (verified by
+// not require push-only sessions.prompt_evidence_discarded (verified by
 // checkPushSchemaCompat), model_pricing (always queried by syncModelPricing)
 // or cursor_usage_events (written by syncCursorUsageEvents), so probe those
-// explicitly. It also requires the cursor dedup index, which the cursor usage
+// explicitly. Friction findings are also written by push-only paths.
+// It also requires the cursor dedup index, which the cursor usage
 // insert relies on for ON CONFLICT dedup. When any of these is missing the
 // caller must run EnsureSchema so push migrates the schema instead of failing
 // or duplicating rows.
@@ -2768,7 +2633,9 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	if err := checkPushSchemaCompat(ctx, db); err != nil {
 		return false
 	}
-	if !pgHasTable(ctx, db, "model_pricing") ||
+	if !pgHasTable(ctx, db, "commit_links") ||
+		!pgHasTable(ctx, db, "retained_commit_links") ||
+		!pgHasTable(ctx, db, "model_pricing") ||
 		!pgHasTable(ctx, db, "model_pricing_bands") ||
 		!pgHasTable(ctx, db, "genai_pricing") ||
 		!pgHasTable(ctx, db, "source_archives") ||
@@ -2778,7 +2645,14 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 		!pgHasTable(ctx, db, "source_session_project_identity_snapshot_scopes") ||
 		!pgHasTable(ctx, db, "source_worktree_project_mappings") ||
 		!pgHasTable(ctx, db, "source_worktree_project_mapping_scopes") ||
-		!pgHasTable(ctx, db, "cursor_usage_events") {
+		!pgHasTable(ctx, db, "diagnostic_events") ||
+		!pgHasTable(ctx, db, "friction_digests") ||
+		!pgHasTable(ctx, db, "friction_digest_sessions") ||
+		!pgHasTable(ctx, db, "friction_patterns") ||
+		!pgHasTable(ctx, db, "friction_issue_links") ||
+		!pgHasTable(ctx, db, "friction_filing_state") ||
+		!pgHasTable(ctx, db, "cursor_usage_events") ||
+		!pgHasTable(ctx, db, "friction_findings") {
 		return false
 	}
 	// bulkInsertCursorUsageEvents dedups via a targetless ON CONFLICT
@@ -2787,17 +2661,24 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	// so repeated pushes cannot duplicate cursor usage rows.
 	// A push may provision the schema for a read-only serve role. Include
 	// the Activity index so that upgrading through push installs it too.
-	return pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup") &&
+	return accountUsageTokensWidePG(ctx, db) &&
+		pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup") &&
 		pgHasIndex(ctx, db, "idx_tool_result_events_terminal")
 }
 
 // CheckDataVersionCompat rejects PG datasets containing rows written by a
 // newer agentsview parser. PG does not have SQLite's global user_version, so
-// the highest session data_version is the compatibility marker.
+// sessions carry the parser version.
 func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
+	return checkDataVersionCompat(ctx, pg)
+}
+
+const maxDataVersionSQL = `SELECT COALESCE(MAX(data_version), 0) FROM sessions`
+
+func checkDataVersionCompat(ctx context.Context, pg hostedQuerier) error {
 	var version int
 	err := pg.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(data_version), 0) FROM sessions`,
+		maxDataVersionSQL,
 	).Scan(&version)
 	if err != nil {
 		if isUndefinedTable(err) || isUndefinedColumn(err) {
@@ -2806,10 +2687,7 @@ func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
 		return fmt.Errorf("checking PG data version: %w", err)
 	}
 	if version > db.CurrentDataVersion() {
-		return &db.DataVersionTooNewError{
-			DatabaseVersion: version,
-			BinaryVersion:   db.CurrentDataVersion(),
-		}
+		return &db.DataVersionTooNewError{DatabaseVersion: version, BinaryVersion: db.CurrentDataVersion()}
 	}
 	return nil
 }

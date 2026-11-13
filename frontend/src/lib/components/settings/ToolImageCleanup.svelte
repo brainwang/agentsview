@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Button, Modal, TextInput } from "@kenn-io/kit-ui";
+  import { formatCount } from "../../utils/format.js";
+  import { Button, Modal, TableHeaderCell, TableSort, TextInput } from "@kenn-io/kit-ui";
   import { onDestroy } from "svelte";
   import { getLocale, m } from "../../i18n/index.js";
   import { DataService } from "../../api/generated/index";
@@ -19,6 +20,13 @@
   let errorText = $state("");
   let mayHavePartiallyApplied = $state(false);
   let unavailableReason = $state<string | null>(null);
+  const sort = new TableSort<NonNullable<DbStripImagesReport["projects"]>[number]>({
+    project: row => row.project || m.shared_none(),
+    sessions: { value: row => row.sessions, firstDirection: "desc" },
+    payloads: { value: row => row.payloads, firstDirection: "desc" },
+    stored: { value: row => row.stored_bytes, firstDirection: "desc" },
+    decoded: { value: row => row.decoded_bytes, firstDirection: "desc" },
+  });
   const previewRead = new LatestRead();
   let disposed = false;
 
@@ -47,10 +55,6 @@
       unitDisplay: "short",
       maximumFractionDigits: 0,
     }).format(0);
-  }
-
-  function formatCount(value: number): string {
-    return new Intl.NumberFormat(getLocale()).format(value);
   }
 
   function onFilterInput() {
@@ -162,30 +166,34 @@
 <div class="tool-image-cleanup">
   <p class="intro">{m.settings_image_cleanup_intro()}</p>
 
-  <div class="filter-row">
-    <label class="filter-label" for="tic-project">
-      {m.settings_image_cleanup_project_label()}
-    </label>
-    <TextInput
-      id="tic-project"
-      placeholder={m.settings_image_cleanup_project_placeholder()}
-      bind:value={projectFilter}
-      disabled={phase === "applying"}
-      oninput={onFilterInput}
-    />
-    <label class="filter-label" for="tic-before">
-      {m.settings_image_cleanup_before_label()}
-    </label>
-    <TextInput
-      id="tic-before"
-      placeholder={m.settings_image_cleanup_before_placeholder()}
-      bind:value={beforeFilter}
-      disabled={phase === "applying"}
-      oninput={onFilterInput}
-    />
+  <div class="filter-rows">
+    <div class="setting-row">
+      <label class="setting-label" for="tic-project">
+        {m.settings_image_cleanup_project_label()}
+      </label>
+      <TextInput
+        id="tic-project"
+        placeholder={m.settings_image_cleanup_project_placeholder()}
+        bind:value={projectFilter}
+        disabled={phase === "applying"}
+        oninput={onFilterInput}
+      />
+    </div>
+    <div class="setting-row">
+      <label class="setting-label" for="tic-before">
+        {m.settings_image_cleanup_before_label()}
+      </label>
+      <TextInput
+        id="tic-before"
+        placeholder={m.settings_image_cleanup_before_placeholder()}
+        bind:value={beforeFilter}
+        disabled={phase === "applying"}
+        oninput={onFilterInput}
+      />
+    </div>
   </div>
 
-  <div class="action-row">
+  <div class="action-row control-offset">
     <Button onclick={runPreview} disabled={previewBusy}>
       {phase === "previewing"
         ? m.settings_image_cleanup_previewing()
@@ -241,15 +249,15 @@
           <table class="project-table">
             <thead>
               <tr>
-                <th>{m.settings_image_cleanup_column_project()}</th>
-                <th>{m.settings_image_cleanup_column_sessions()}</th>
-                <th>{m.settings_image_cleanup_column_payloads()}</th>
-                <th>{m.settings_image_cleanup_column_stored()}</th>
-                <th>{m.settings_image_cleanup_column_decoded()}</th>
+                <TableHeaderCell label={m.settings_image_cleanup_column_project()} {sort} column="project" />
+                <TableHeaderCell label={m.settings_image_cleanup_column_sessions()} {sort} column="sessions" numeric />
+                <TableHeaderCell label={m.settings_image_cleanup_column_payloads()} {sort} column="payloads" numeric />
+                <TableHeaderCell label={m.settings_image_cleanup_column_stored()} {sort} column="stored" numeric />
+                <TableHeaderCell label={m.settings_image_cleanup_column_decoded()} {sort} column="decoded" numeric />
               </tr>
             </thead>
             <tbody>
-              {#each preview.projects as proj (proj.project)}
+              {#each sort.sort(preview.projects) as proj (proj.project)}
                 <tr>
                   <td class="project-name">{proj.project || m.shared_none()}</td>
                   <td>{formatCount(proj.sessions)}</td>
@@ -339,19 +347,29 @@
     margin: 0;
   }
 
-  .filter-row {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    column-gap: 12px;
-    row-gap: 8px;
-    align-items: center;
+  /* Filter rows use the shared settings grid from SettingsPage, so the
+     inputs start on the same control column as every other panel. */
+  .filter-rows {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
   }
 
-  .filter-label {
+  .setting-label {
     font-size: 12px;
     font-weight: 500;
     color: var(--text-secondary);
-    white-space: nowrap;
+  }
+
+  /* The Preview action starts on the control column's edge. */
+  .control-offset {
+    padding-left: calc(var(--setting-label-width, 222px) + 12px);
+  }
+
+  @media (max-width: 640px) {
+    .control-offset {
+      padding-left: 0;
+    }
   }
 
   .action-row {
@@ -375,8 +393,9 @@
 
   .status-grid {
     display: grid;
-    grid-template-columns: auto 1fr;
-    column-gap: 16px;
+    /* Same label column as the other settings rows. */
+    grid-template-columns: var(--setting-label-width, 222px) minmax(0, 1fr);
+    column-gap: 12px;
     row-gap: 6px;
     align-items: start;
   }
@@ -412,7 +431,7 @@
     min-width: 0;
   }
 
-  .project-table th,
+  .project-table :global(th),
   .project-table td {
     padding: 4px 8px;
     text-align: left;
@@ -420,7 +439,7 @@
     white-space: nowrap;
   }
 
-  .project-table th {
+  .project-table :global(th) {
     font-weight: 600;
     color: var(--text-secondary);
     background: var(--bg-inset);
@@ -428,6 +447,11 @@
 
   .project-table td {
     color: var(--text-primary);
+  }
+
+  .project-table :global(th.kit-th--numeric),
+  .project-table td:not(:first-child) {
+    text-align: right;
   }
 
   .project-name {

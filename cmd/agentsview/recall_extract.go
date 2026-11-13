@@ -33,8 +33,10 @@ type extractDistillation struct {
 	Quiet     time.Duration
 	Backoff   time.Duration
 	Backstop  time.Duration
-	Server    string
-	Profile   string
+	// Concurrency is the resolved server's parallel session count.
+	Concurrency int
+	Server      string
+	Profile     string
 }
 
 // resolveExtractDistillation validates cfg and resolves it into a runnable
@@ -110,11 +112,12 @@ func resolveExtractDistillation(
 			Model:      cfg.Model,
 			Deployment: cfg.Deployment,
 		},
-		Quiet:    quiet,
-		Backoff:  backoff,
-		Backstop: backstop,
-		Server:   serverName,
-		Profile:  profile.Name,
+		Quiet:       quiet,
+		Backoff:     backoff,
+		Backstop:    backstop,
+		Concurrency: server.Concurrency,
+		Server:      serverName,
+		Profile:     profile.Name,
 	}, nil
 }
 
@@ -134,6 +137,7 @@ func buildExtractManager(
 		Identity:       dist.Identity,
 		QuietPeriod:    dist.Quiet,
 		FailureBackoff: dist.Backoff,
+		Concurrency:    dist.Concurrency,
 
 		AllowCandidateFindings: cfg.AllowCandidateFindings(),
 	})
@@ -143,12 +147,12 @@ func buildExtractManager(
 // section is disabled it returns a reconcile-only scheduler if a generation
 // exists, and nil when none does.
 func setupRecallExtraction(
-	cfg config.Config, database *db.DB, idle *server.IdleTracker,
+	ctx context.Context, cfg config.Config, database *db.DB, idle *server.IdleTracker,
 ) (*extractScheduler, error) {
 	if !cfg.Recall.Extract.Enabled {
 		database.SetExtractCandidateFindingsAllowed(
 			cfg.Recall.Extract.AllowCandidateFindings())
-		return setupExtractReconcileOnly(database, idle)
+		return setupExtractReconcileOnly(ctx, database, idle)
 	}
 	dist, err := resolveExtractDistillation(cfg.Recall.Extract)
 	if err != nil {
@@ -177,9 +181,9 @@ func setupRecallExtraction(
 // extraction was never run, so there is nothing to retract and a
 // default-disabled daemon starts no scheduler.
 func setupExtractReconcileOnly(
-	database *db.DB, idle *server.IdleTracker,
+	ctx context.Context, database *db.DB, idle *server.IdleTracker,
 ) (*extractScheduler, error) {
-	generations, err := database.ExtractGenerations(context.Background())
+	generations, err := database.ExtractGenerations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("checking for extraction generations: %w", err)
 	}
@@ -212,7 +216,7 @@ const extractReconcileDebounce = 2 * time.Second
 func openWritableExtractDB(
 	ctx context.Context, cfg config.Config,
 ) (*db.DB, *writeOwnerLock, error) {
-	tr, err := detectTransport(cfg.DataDir, cfg.AuthToken, 0)
+	tr, err := detectClientTransportContext(ctx, &cfg, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -240,7 +244,7 @@ func loadExtractConfig(cmd *cobra.Command) (config.Config, error) {
 			"recall extract %s does not support --server: extraction runs "+
 				"against the local archive", cmd.Name())
 	}
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeRecall)
 	if err != nil {
 		return config.Config{}, fmt.Errorf("loading config: %w", err)
 	}
@@ -252,8 +256,12 @@ func newRecallExtractCommand() *cobra.Command {
 	var dryRun bool
 	var chunkMaxChars int
 	cmd := &cobra.Command{
-		Use:          "extract",
-		Short:        "Extract recall entries from session transcripts",
+		Use:   "extract",
+		Short: "Extract recall entries from session transcripts",
+		Long: "Manage extraction recipes that propose recalled knowledge from session content. " +
+			"Inspect status and preview candidates before choosing an active recipe or running extraction; accepted recall records remain a separate reviewed layer.",
+		Example: "  agentsview recall extract status\n" +
+			"  agentsview recall extract preview --session <id>",
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -363,7 +371,7 @@ type extractRunResult struct {
 func newRecallExtractStatusCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "status",
-		Short:        "Show extraction coverage for the configured generation",
+		Short:        "Show Recall processing progress for the current settings",
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -529,6 +537,7 @@ func newRecallExtractDoctorCommand() *cobra.Command {
 			}
 			fmt.Fprintf(out, "Server: %s (%s)\n",
 				dist.Server, config.RedactedEndpoint(dist.Client.BaseURL))
+			fmt.Fprintf(out, "Concurrency: %d\n", dist.Concurrency)
 			fmt.Fprintf(out, "Profile: %s\n", dist.Profile)
 			fmt.Fprintf(out, "Segmenter: %s (max_window_chars=%d)\n",
 				dist.Segmenter.Name(), dist.Segmenter.MaxWindowChars)

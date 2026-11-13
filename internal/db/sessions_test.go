@@ -2,6 +2,10 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,42 +90,50 @@ func TestFindSessionIDsByPartialLiteralCaseSensitive(t *testing.T) {
 	assert.NotContains(t, got, "ABCdef")
 }
 
-func TestFindSessionIDsByRawSuffix(t *testing.T) {
+// TestSessionIDTail checks the Go tail against the SQLite expression that
+// idx_sessions_id_tail indexes. If they disagree, raw ID lookups seek the
+// wrong index entry and miss sessions.
+func TestSessionIDTail(t *testing.T) {
 	d := testDB(t)
-	insertSession(t, d, "plain-id", "exact")
-	insertSession(t, d, "codex:uuid", "agent")
-	insertSession(t, d, "host~uuid", "host")
-	insertSession(t, d, "host~uuid-fork", "fork")
-	insertSession(t, d, "host~P-E", "entry")
-	insertSession(t, d, "host~wild_%_literal", "wild")
-	insertSession(t, d, "host~trashed", "trash")
-	require.NoError(t, d.SoftDeleteSession(t.Context(), "host~trashed"))
+	for _, tc := range []struct{ id, want string }{
+		{"uuid", "uuid"},
+		{"codex:uuid", "uuid"},
+		{"host~uuid", "uuid"},
+		{"host~codex:uuid", "uuid"},
+		{"kimi:project-hash:session-uuid", "session-uuid"},
+		{"a:b~c", "c"},
+		{"a~b:c", "c"},
+		{"a:xa:x", "x"},
+		{"host~trailing:", ""},
+		{"trailing~", ""},
+		{":", ""},
+		{"wild_%_literal", "wild_%_literal"},
+		{"caf\u00e9:th\u00e9", "th\u00e9"},
+	} {
+		assert.Equal(t, tc.want, SessionIDTail(tc.id), "Go tail of %q", tc.id)
+		var got string
+		require.NoError(t, d.getReader().QueryRow(t.Context(),
+			`SELECT `+sqliteSessionIDTailExpr+` FROM (SELECT ? AS id)`, tc.id,
+		).Scan(&got))
+		assert.Equal(t, tc.want, got, "SQLite tail of %q", tc.id)
+	}
+}
 
-	ctx := t.Context()
-	got, err := d.FindSessionIDsByRawSuffix(ctx, "uuid", 2)
+func TestFindSessionIDsByRawSuffixSeeksTailIndex(t *testing.T) {
+	d := testDB(t)
+	rows, err := d.getReader().QueryContext(t.Context(),
+		`EXPLAIN QUERY PLAN `+rawSuffixLookupSQL, "uuid", 5, "uuid")
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"codex:uuid", "host~uuid"}, got)
-	uuidIDs := append([]string(nil), got...)
-
-	got, err = d.FindSessionIDsByRawSuffix(ctx, "plain-id", 2)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"plain-id"}, got)
-	exactIDs := append([]string(nil), got...)
-
-	got, err = d.FindSessionIDsByRawSuffix(ctx, "wild_%_literal", 2)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"host~wild_%_literal"}, got)
-	wildcardIDs := append([]string(nil), got...)
-
-	got, err = d.FindSessionIDsByRawSuffix(ctx, "trashed", 2)
-	require.NoError(t, err)
-	assert.Empty(t, got)
-	trashedIDs := append([]string(nil), got...)
-
-	got, err = d.FindSessionIDsByRawSuffix(ctx, "E", 2)
-	require.NoError(t, err)
-	assert.Empty(t, got)
-	t.Logf("head: sqlite_uuid=%v exact=%v wildcard=%v trashed=%v entry=%v", uuidIDs, exactIDs, wildcardIDs, trashedIDs, got)
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan = append(plan, detail)
+	}
+	require.NoError(t, rows.Err())
+	assert.Contains(t, plan, "SEARCH sessions USING INDEX idx_sessions_id_tail (<expr>=?)")
 }
 
 func TestListSessions_OutcomeFilter(t *testing.T) {
@@ -823,4 +835,135 @@ func TestSessionNameCOALESCEInGetSession(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, s.DisplayName)
 	assert.Equal(t, "Agent Title", *s.DisplayName, "session_name restored after clearing rename")
+}
+
+func TestRecentSessionSourcesFiltersToLiveLocalAgentSources(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	since := time.Date(2026, 7, 28, 15, 30, 0, 0, time.UTC)
+	add := func(id, agent, machine, endedAt, path string) {
+		insertSession(t, d, id, "project", func(s *Session) {
+			s.Agent = agent
+			s.Machine = machine
+			s.EndedAt = &endedAt
+			if path != "" {
+				size, mtime := int64(10), int64(20)
+				s.FilePath = &path
+				s.FileSize = &size
+				s.FileMtime = &mtime
+			}
+		})
+	}
+	add("codex:newest", "codex", "local", "2026-07-29T15:20:00.500Z", "/s/newest.jsonl")
+	add("codex:whole-second", "codex", "local", "2026-07-29T15:20:00Z", "/s/whole.jsonl")
+	add("codex:at-cutoff", "codex", "local", "2026-07-28T15:30:00Z", "/s/at-cutoff.jsonl")
+	add("codex:too-old", "codex", "local", "2026-07-28T15:29:59Z", "/s/too-old.jsonl")
+	add("claude-session", "claude", "local", "2026-07-29T15:00:00Z", "/s/claude.jsonl")
+	add("codex:remote", "codex", "laptop", "2026-07-29T15:00:00Z", "/s/remote.jsonl")
+	add("codex:no-path", "codex", "local", "2026-07-29T15:00:00Z", "")
+	add("codex:s3", "codex", "local", "2026-07-29T15:00:00Z", "s3://bucket/local/raw/codex/s3.jsonl")
+	add("codex:deleted", "codex", "local", "2026-07-29T15:00:00Z", "/s/deleted.jsonl")
+	add("codex:missing", "codex", "local", "2026-07-29T15:00:00Z", "/s/missing.jsonl")
+	require.NoError(t, d.SoftDeleteSession(ctx, "codex:deleted"))
+	_, err := d.getWriter().Exec(ctx,
+		`UPDATE sessions SET source_missing_at = ? WHERE id = ?`,
+		"2026-07-29T15:10:00Z", "codex:missing",
+	)
+	require.NoError(t, err)
+
+	sources, err := d.RecentSessionSources(ctx, "codex", []string{"local"}, since, 10)
+	require.NoError(t, err)
+	require.Len(t, sources, 3)
+	assert.Equal(t, "codex:newest", sources[0].ID)
+	assert.Equal(t, "/s/newest.jsonl", sources[0].FilePath)
+	assert.Equal(t, Ptr(int64(10)), sources[0].FileSize)
+	assert.Equal(t, Ptr(int64(20)), sources[0].FileMtime)
+	assert.Nil(t, sources[0].FileInode)
+	assert.Equal(t, "2026-07-29T15:20:00.500Z", sources[0].EndedAt)
+	assert.Equal(t, "codex:whole-second", sources[1].ID)
+	assert.Equal(t, "codex:at-cutoff", sources[2].ID)
+
+	limited, err := d.RecentSessionSources(ctx, "codex", []string{"local"}, since, 1)
+	require.NoError(t, err)
+	require.Len(t, limited, 1)
+	assert.Equal(t, "codex:newest", limited[0].ID)
+
+	fractionalCutoff, err := d.RecentSessionSources(ctx, "codex", []string{"local"},
+		time.Date(2026, 7, 29, 15, 20, 0, 250_000_000, time.UTC), 10)
+	require.NoError(t, err)
+	require.Len(t, fractionalCutoff, 1)
+	assert.Equal(t, "codex:newest", fractionalCutoff[0].ID)
+
+	withPeer, err := d.RecentSessionSources(ctx, "codex",
+		[]string{"local", "laptop"}, since, 10)
+	require.NoError(t, err)
+	ids := make([]string, 0, len(withPeer))
+	for _, source := range withPeer {
+		ids = append(ids, source.ID)
+	}
+	assert.Equal(t, []string{
+		"codex:newest", "codex:whole-second", "codex:remote", "codex:at-cutoff",
+	}, ids)
+
+	none, err := d.RecentSessionSources(ctx, "codex", nil, since, 10)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}
+
+func TestRecentSessionSourcesUsesBoundedRangeAfterReopen(t *testing.T) {
+	for _, count := range []int{100, 10000} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			ctx := t.Context()
+			archivePath := filepath.Join(t.TempDir(), "archive.db")
+			database := testDBAtPath(t, archivePath, "recent sources")
+			_, err := database.getWriter().Exec(ctx, `
+				WITH RECURSIVE numbers(value) AS (
+					SELECT 1 UNION ALL SELECT value + 1 FROM numbers WHERE value < ?
+				)
+				INSERT INTO sessions(id, project, agent, machine, ended_at, file_path,
+				                     deleted_at, source_missing_at)
+				SELECT printf('old-%06d', value), 'project', 'codex', 'local',
+				       '2026-01-01T00:00:00Z', '/sessions/old.jsonl', NULL, NULL FROM numbers
+				UNION ALL
+				SELECT printf('deleted-%06d', value), 'project', 'codex', 'local',
+				       '2026-07-29T16:00:00Z', '/sessions/deleted.jsonl', '2026-07-29', NULL FROM numbers
+				UNION ALL
+				SELECT printf('missing-%06d', value), 'project', 'codex', 'local',
+				       '2026-07-29T16:00:00Z', '/sessions/missing.jsonl', NULL, '2026-07-29' FROM numbers
+				UNION ALL
+				SELECT printf('s3-%06d', value), 'project', 'codex', 'local',
+				       '2026-07-29T16:00:00Z', 's3://bucket/codex/s3.jsonl', NULL, NULL FROM numbers`, count)
+			require.NoError(t, err)
+			insertSession(t, database, "recent", "project", func(session *Session) {
+				session.Agent = "codex"
+				session.Machine = "local"
+				session.EndedAt = Ptr("2026-07-29T15:20:00.500Z")
+				session.FilePath = Ptr("/sessions/recent.jsonl")
+			})
+			_, err = database.getWriter().Exec(ctx, "DROP INDEX idx_sessions_recent_source_activity")
+			require.NoError(t, err)
+			require.NoError(t, database.Close())
+			database, err = Open(ctx, archivePath)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, database.Close()) })
+			_, err = database.getWriter().Exec(ctx, "ANALYZE")
+			require.NoError(t, err)
+			sources, err := database.RecentSessionSources(ctx, "codex", []string{"local"},
+				time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), 1)
+			require.NoError(t, err)
+			require.Len(t, sources, 1)
+			assert.Equal(t, "recent", sources[0].ID)
+			plan := strings.Join(explainQueryPlan(t, database,
+				fmt.Sprintf(recentSessionSourcesSQL, "(?)"),
+				"codex", "local", "2026-07-29T00:00:00Z", 1), "\n")
+			assert.Contains(t, plan, "SEARCH sessions USING INDEX idx_sessions_recent_source_activity")
+			assert.NotContains(t, plan, "TEMP B-TREE")
+
+			// Several machines sort only the rows each machine's range returns.
+			plan = strings.Join(explainQueryPlan(t, database,
+				fmt.Sprintf(recentSessionSourcesSQL, "(?,?)"),
+				"codex", "local", "peer", "2026-07-29T00:00:00Z", 1), "\n")
+			assert.Contains(t, plan, "SEARCH sessions USING INDEX idx_sessions_recent_source_activity")
+		})
+	}
 }

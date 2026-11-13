@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unique"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,18 +20,6 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
-
-func TestPaddedUTCBoundClampsBeforeYearOne(t *testing.T) {
-	t.Parallel()
-	assert.Equal(t,
-		"0001-01-01T00:00:00Z",
-		paddedUTCBound("0001-01-01T00:00:00Z", -14),
-	)
-	assert.Equal(t,
-		"2026-03-10T10:00:00Z",
-		paddedUTCBound("2026-03-11T00:00:00Z", -14),
-	)
-}
 
 type usageProbeDriver struct{}
 
@@ -199,6 +188,7 @@ func (c *usageProbeConn) QueryContext(
 				"cache_read_input_tokens",
 				"reasoning_tokens",
 				"cost_microdollars",
+				"cost_status",
 				"cost_source",
 				"claude_message_id",
 				"claude_request_id",
@@ -235,6 +225,7 @@ func usageProbeUsageRow(
 		int64(0),
 		int64(0),
 		nil,
+		"",
 		"",
 		"msg-dup",
 		"req-dup",
@@ -279,22 +270,6 @@ func TestPGGetDailyUsageReturnsDedupedSessionCounts(t *testing.T) {
 	assert.Equal(t, 1, result.SessionCounts.ByAgent["claude"])
 	assert.NotContains(t, countsByDisplay, "proj-b")
 	assert.Zero(t, result.SessionCounts.ByAgent["codex"])
-}
-
-func TestPGUsageDedupTokenForRowFallsBackToSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
-	got, ok := pgUsageDedupTokenForRow(
-		"message",
-		"claude-code",
-		"msg-dup",
-		"",
-		"source-dup",
-		"",
-	)
-	require.True(t, ok, "expected source_uuid fallback key")
-	assert.Equal(t, pgUsageDedupToken{
-		kind:  "source",
-		value: "claude-code:source-dup",
-	}, got)
 }
 
 func TestPGUsageAmountsPreserveSessionSummaryUsageEventTokens(t *testing.T) {
@@ -424,7 +399,7 @@ func TestPGUsageRowQueryPushesDateBoundsIntoUnion(t *testing.T) {
 		From:             "2024-06-01",
 		To:               "2024-06-30",
 		ExcludeAutomated: true,
-	})
+	}, db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
 	assert.NotContains(t, normalized, "and u.ts >=")
@@ -432,7 +407,8 @@ func TestPGUsageRowQueryPushesDateBoundsIntoUnion(t *testing.T) {
 	assert.NotContains(t, normalized, " or ")
 	assert.NotContains(t, normalized, "display_name")
 	assert.NotContains(t, normalized, "first_message")
-	assert.NotContains(t, normalized, "cost_status")
+	// Cost status decides whether a harness-recorded cost prices the row.
+	assert.Contains(t, normalized, "u.cost_status")
 	assert.Contains(t, normalized, "u.cost_source")
 	assert.Contains(t, normalized, "u.reasoning_tokens")
 	assert.NotContains(t, normalized, "user_message_count")
@@ -465,7 +441,7 @@ func TestPGDailyUsageDetailedQuerySelectsMachine(t *testing.T) {
 		db.UsageFilter{
 			From: "2026-07-15", To: "2026-07-15", Breakdowns: true,
 		},
-		false,
+		false, db.PostgresQueryDialect(),
 	))
 	assert.Contains(t, detailed, "u.machine")
 
@@ -473,7 +449,7 @@ func TestPGDailyUsageDetailedQuerySelectsMachine(t *testing.T) {
 	fast := strings.ToLower(pgDailyUsageRowQuery(
 		fastParams,
 		db.UsageFilter{From: "2026-07-15", To: "2026-07-15"},
-		false,
+		false, db.PostgresQueryDialect(),
 	))
 	assert.NotContains(t, fast, "u.machine")
 }
@@ -484,7 +460,7 @@ func TestPGBoundedDailyUsageRowsCTEProjectsReasoningTokens(t *testing.T) {
 		From: "2024-06-01",
 		To:   "2024-06-30",
 	}
-	query := pgDailyUsageRowsSQLForBounds(pb, f, pgUsageBoundsForFilter(pb, f))
+	query := pgDailyUsageRowsSQLForBounds(pb, f, pgUsageBoundsForFilter(pb, f), db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
 	assert.Contains(t, normalized, "usage_event_timestamp_rows as materialized")
@@ -548,7 +524,7 @@ func TestPGMatchingUsageRowsSQLForBoundsRelaxesTokenEligibility(t *testing.T) {
 		Model: "gpt-5.3-codex",
 	}
 	bounds := pgUsageBoundsForFilter(pb, f)
-	query := pgMatchingUsageRowsSQLForBounds(pb, f, bounds)
+	query := pgMatchingUsageRowsSQLForBounds(pb, f, bounds, db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
 	assert.Contains(t, normalized, "message_timestamp_rows as materialized")
@@ -571,12 +547,16 @@ func TestPGTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
 		From:     "2024-06-01",
 		To:       "2024-06-30",
 		Timezone: "America/New_York",
-	})
+	}, true, db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
+	assert.Contains(t, normalized, "coalesce(attributed.group_key, '') as group_key")
+	assert.Contains(t, normalized, "coalesce(attributed.session_name, '') as session_name")
+	assert.Contains(t, normalized, "attributed.started_at as group_started_at")
 	assert.NotContains(t, normalized, "display_name")
 	assert.NotContains(t, normalized, "first_message")
-	assert.NotContains(t, normalized, "cost_status")
+	// Cost status decides whether a harness-recorded cost prices the row.
+	assert.Contains(t, normalized, "u.cost_status")
 	assert.Contains(t, normalized, "u.cost_source")
 	assert.Contains(t, normalized, "u.reasoning_tokens")
 	assert.NotContains(t, normalized, "user_message_count")
@@ -670,14 +650,15 @@ func TestPGActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T
 				},
 			})
 
-			cost, priced, contributes, err := pgActivityReportRowStatus(
-				pgDailyUsageScanRow{
-					usageSource: "provider",
-					model:       "daimon-kimi-code",
-					ts:          sql.NullTime{Time: tt.timestamp, Valid: true},
-					pricingTS:   sql.NullTime{Time: tt.timestamp, Valid: true},
-					inputTokens: 1_000_000,
+			cost, priced, contributes, err := pgActivityReportRowStatusWithWebSearchRequests(
+				pgActivityUsageRow{
+					usageSource: unique.Make("provider"),
+					model:       unique.Make("daimon-kimi-code"),
+					providerID:  unique.Make(""),
+					us:          tt.timestamp.UnixMicro(),
+					input:       1_000_000,
 				},
+				0,
 				resolver,
 			)
 
@@ -714,20 +695,15 @@ func TestPGActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 		},
 	})
 
-	cost, priced, contributes, err := pgActivityReportRowStatus(
-		pgDailyUsageScanRow{
-			usageSource: "provider",
-			model:       "daimon-kimi-code",
-			ts: sql.NullTime{
-				Time:  pricingpkg.KimiModelEraCutoff,
-				Valid: true,
-			},
-			pricingTS: sql.NullTime{
-				Time:  pricingpkg.KimiModelEraCutoff,
-				Valid: true,
-			},
-			inputTokens: 1_000_000,
+	cost, priced, contributes, err := pgActivityReportRowStatusWithWebSearchRequests(
+		pgActivityUsageRow{
+			usageSource: unique.Make("provider"),
+			model:       unique.Make("daimon-kimi-code"),
+			providerID:  unique.Make(""),
+			us:          pricingpkg.KimiModelEraCutoff.UnixMicro(),
+			input:       1_000_000,
 		},
+		0,
 		resolver,
 	)
 
@@ -870,6 +846,71 @@ func TestPGDailyUsageAmountsPrefersExactCustomGPTReserve(t *testing.T) {
 	assert.Equal(t, pricingpkg.GPTReserveModelName, resolutions[0].PricedModel)
 }
 
+func TestPGDailyUsageAmountsPricesCodexAutoReviewAsLuna(t *testing.T) {
+	lunaCost := money.MustParseDollars("0.20")
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: pricingpkg.GPT56LunaCanonical,
+		Rates:        export.ModelRates{InputPerMTok: lunaCost},
+	}})
+
+	_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider",
+		model:       pricingpkg.CodexAutoReviewModelName,
+		inputTokens: 1_000_000,
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, lunaCost, cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, pricingpkg.CodexAutoReviewModelName)
+	resolutions := block.Models[pricingpkg.CodexAutoReviewModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotContains(t, block.Models, pricingpkg.GPT56LunaCanonical)
+}
+
+// TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview proves an
+// exact custom row beats the alias for both the provider-prefixed name and the
+// bare name users configure today.
+func TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview(t *testing.T) {
+	for _, model := range []string{
+		"openai/" + pricingpkg.CodexAutoReviewModelName,
+		pricingpkg.CodexAutoReviewModelName,
+	} {
+		t.Run(model, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+				{
+					ModelPattern: model,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("7"),
+						Source:       export.PricingRowSourceCustom,
+					},
+				},
+				{
+					ModelPattern: pricingpkg.GPT56LunaCanonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("0.20"),
+						Source:       export.PricingRowSourceFetched,
+					},
+				},
+			})
+
+			_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+				usageSource: "provider",
+				model:       model,
+				inputTokens: 1_000_000,
+			}, resolver)
+			require.NoError(t, err)
+			assert.Equal(t, money.MustParseDollars("7"), cost)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			resolutions := block.Models[model].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, model, resolutions[0].PricedModel)
+		})
+	}
+}
+
 func TestPGDailyUsageAmountsForwardsProviderToBilling(t *testing.T) {
 	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
 		ModelPattern: "posit-model",
@@ -910,4 +951,47 @@ func TestPGDailyUsageAmountsUsesBilledRatesForReportedCacheSavings(t *testing.T)
 	require.NoError(t, err)
 	assert.Equal(t, money.Money{Microdollars: 77}, cost)
 	assert.Equal(t, money.Money{Microdollars: 990_000}, savings)
+}
+
+func TestPGCompactActivityUsage(t *testing.T) {
+	stamp := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, source, tokens            string
+		input                           int
+		output, create, read, reasoning int
+		reported                        bool
+		costValid                       bool
+		noTime                          bool
+		wantTokens                      [5]int64
+		want1h                          int32
+		wantSearches                    int64
+	}{
+		{name: "one hour cache", source: "message", tokens: `{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":30,"cache_read_input_tokens":40,"reasoning_tokens":5,"cache_creation":{"ephemeral_1h_input_tokens":10}}`, wantTokens: [5]int64{100, 20, 30, 40, 5}, want1h: 10},
+		{name: "clamped one hour cache", source: "message", tokens: `{"cache_creation_input_tokens":4294967296,"cache_creation":{"ephemeral_1h_input_tokens":4294967296}}`, wantTokens: [5]int64{0, 0, 2_000_000}, want1h: 2_000_000},
+		{name: "large web search counter", source: "message", tokens: `{"server_tool_use":{"web_search_requests":4294967296}}`, wantSearches: 1 << 32},
+		{name: "provider counters", source: "provider", input: 110, output: 22, create: 33, read: 44, reasoning: 6, costValid: true, wantTokens: [5]int64{110, 22, 33, 44, 6}},
+		{name: "Copilot reported", source: "session", input: 100, reported: true, costValid: true, wantTokens: [5]int64{100}},
+		{name: "absent pricing time", source: "message", tokens: `{"input_tokens":10}`, noTime: true, wantTokens: [5]int64{10}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := pgDailyUsageScanRow{sessionID: "session-a", usageSource: tc.source, tokenJSON: tc.tokens, inputTokens: tc.input, outputTokens: tc.output, cacheCreationInputTokens: tc.create, cacheReadInputTokens: tc.read, reasoningTokens: tc.reasoning, model: "compact-model", ts: sql.NullTime{Time: stamp, Valid: true}, pricingTS: sql.NullTime{Time: stamp, Valid: !tc.noTime}}
+			scan.cost = sql.NullInt64{Int64: 777, Valid: tc.costValid}
+			if tc.reported {
+				scan.costSource = db.CopilotReportedCostSource
+			}
+			row := pgCompactActivityUsage(scan, unique.Make[string])
+			if tc.noTime {
+				assert.Equal(t, int64(1_781_431_200_000_000), row.us)
+			}
+			assert.Equal(t, tc.wantTokens, [5]int64{row.input, row.output, row.cacheCreate, row.cacheRead, row.reasoning})
+			assert.Equal(t, tc.want1h, row.cacheCreate1h)
+			assert.Equal(t, tc.wantSearches, row.webSearches)
+			assert.Equal(t, tc.reported, row.copilotReported)
+			assert.Equal(t, tc.noTime, row.pricingTimeAbsent)
+			assert.Equal(t, tc.costValid, row.costValid)
+			if tc.costValid {
+				assert.Equal(t, int64(777), row.cost)
+			}
+		})
+	}
 }

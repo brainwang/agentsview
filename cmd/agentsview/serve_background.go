@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +31,7 @@ var errServeStartupInProgress = errors.New(
 var (
 	waitForDaemonStartupForEnsure        = WaitForDaemonStartupContext
 	startServeBackgroundProcessForEnsure = startServeBackgroundProcess
+	startServeBackgroundForRun           = startServeBackground
 	startServeBackgroundProcessForRun    = startServeBackgroundProcess
 	backgroundServeProbeHook             func()
 )
@@ -36,8 +40,8 @@ type backgroundLaunchPolicy struct {
 	// ConfigOnly starts exclusively from persistent configuration. In
 	// particular, NoSync is a CLI/runtime option rather than a config key.
 	ConfigOnly bool
+	Persistent bool
 	Operation  string
-	Context    context.Context
 	Attached   bool
 	OnLaunch   func(pid int, logPath string)
 	OnProgress func(*startupState, time.Duration)
@@ -66,7 +70,11 @@ func (p backgroundLaunchPolicy) operation() string {
 // backgroundChildEnvVar marks the re-exec'd serve process as the child of a
 // background launch. The child reads it to keep the auth token out of
 // serve.log; the parent prints the token to the invoking terminal instead.
-const backgroundChildEnvVar = "AGENTSVIEW_BACKGROUND_CHILD"
+const (
+	backgroundChildEnvVar         = "AGENTSVIEW_BACKGROUND_CHILD"
+	persistentDaemonEnvVar        = "AGENTSVIEW_PERSISTENT_DAEMON"
+	updateRestartPersistentEnvVar = "AGENTSVIEW_UPDATE_RESTART_PERSISTENT"
+)
 
 // runningAsBackgroundChild reports whether this process was spawned by
 // runServeBackground.
@@ -118,12 +126,12 @@ func isBackgroundLaunchActive(dataDir string) bool {
 // is still in progress when no record appears in time. authToken may be empty
 // for a contender that has not loaded config; a require_auth daemon then
 // reports as in-progress rather than by URL.
-func reportBackgroundLaunchInProgress(dataDir, authToken string) {
+func reportBackgroundLaunchInProgress(ctx context.Context, dataDir, authToken string) {
 	waitForBackgroundLaunchOwner(
-		context.Background(), dataDir, authToken, backgroundServeReadyTimeout,
+		ctx, dataDir, authToken, backgroundServeReadyTimeout,
 	)
 	if rt := FindDaemonRuntime(dataDir, authToken); rt != nil &&
-		!rt.ReadOnly && !shouldUpgradeDaemonRuntime(rt, version) {
+		!rt.ReadOnly && !shouldReplaceDaemonRuntime(rt, version) {
 		fmt.Printf(
 			"agentsview already running at %s (pid %d)\n",
 			urlFromDaemonRuntime(rt),
@@ -157,7 +165,7 @@ func runServeBackgroundCommand(
 	if !ok {
 		// Another launch holds the lock and owns the config writes. Report
 		// without loading config so this process never touches config.toml.
-		reportBackgroundLaunchInProgress(dataDir, "")
+		reportBackgroundLaunchInProgress(cmd.Context(), dataDir, "")
 		return
 	}
 	defer func() { _ = launchLock.Unlock() }()
@@ -170,8 +178,12 @@ func runServeBackgroundCommand(
 func runServeBackground(ctx context.Context,
 	cfg config.Config, args []string, opts serveReplacementOptions,
 ) {
-	result, err := startServeBackground(ctx,
-		cfg, args, opts, backgroundLaunchPolicy{},
+	progress := &daemonLaunchProgressWriter{w: os.Stdout}
+	result, err := startServeBackgroundForRun(ctx,
+		cfg, args, opts, backgroundLaunchPolicy{
+			Persistent: os.Getenv(updateRestartPersistentEnvVar) == "true",
+			OnProgress: progress.progress,
+		},
 	)
 	if err != nil {
 		fatal("%v", err)
@@ -216,6 +228,7 @@ func startServeBackground(ctx context.Context,
 ) (backgroundLaunchResult, error) {
 	var result backgroundLaunchResult
 	operation := policy.operation()
+	cfg.PersistentDaemon = cfg.PersistentDaemon || policy.Persistent
 	if policy.ConfigOnly {
 		cfg.NoSync = false
 	}
@@ -246,7 +259,7 @@ func startServeBackground(ctx context.Context,
 	case serveReplacementAuto, serveReplacementExplicit:
 		waitedForExternalStartup := false
 		if waited, err := waitForExternalServeStartupBeforeReplacement(
-			context.Background(),
+			ctx,
 			cfg.DataDir,
 			cfg.AuthToken,
 			backgroundServeReadyTimeout,
@@ -318,7 +331,7 @@ func startServeBackground(ctx context.Context,
 	// is mid-startup and holds the start lock but has not yet published a
 	// runtime record. Wait for it instead of racing a second server.
 	if IsLocalDaemonActive(cfg.DataDir, cfg.AuthToken) {
-		reportBackgroundLaunchInProgress(cfg.DataDir, cfg.AuthToken)
+		reportBackgroundLaunchInProgress(ctx, cfg.DataDir, cfg.AuthToken)
 		return result, nil
 	}
 
@@ -328,6 +341,7 @@ func startServeBackground(ctx context.Context,
 		args = serveBackgroundChildArgs(args)
 	}
 	args = serveBackgroundArgsWithNoSync(args, cfg.NoSync)
+	logOffset := backgroundServeLogSize(cfg.DataDir)
 	child, logPath, err := startServeBackgroundProcessForRun(ctx, cfg, args)
 	result.LogPath = logPath
 	if err != nil {
@@ -344,12 +358,8 @@ func startServeBackground(ctx context.Context,
 		waitCh <- child.Wait()
 	}()
 
-	waitContext := policy.Context
-	if waitContext == nil {
-		waitContext = context.Background()
-	}
 	rt, err := waitForBackgroundServeReadyWithPolicy(
-		waitContext,
+		ctx,
 		cfg.DataDir,
 		cfg.AuthToken,
 		waitCh,
@@ -366,10 +376,8 @@ func startServeBackground(ctx context.Context,
 			)
 		}
 		result.errorIncludesLogPath = true
-		return result, fmt.Errorf(
-			"%s: server exited before becoming ready: %w\nLogs: %s",
-			operation, err, logPath,
-		)
+		return result, fmt.Errorf("%s: %w", operation,
+			backgroundServeExitError(err, logPath, logOffset))
 	}
 	result.Runtime = rt
 	return result, nil
@@ -417,10 +425,32 @@ func prepareBackgroundReplacement(ctx context.Context,
 	return nil
 }
 
+// Implicit launches re-exec serve with cfg.DataDir and no server config flags.
+// Validate what that child will load before stopping a healthy incumbent.
+func prepareAutoStartReplacement(ctx context.Context, cfg *config.Config, rt *DaemonRuntime) error {
+	effective, err := config.LoadReadOnlyAt(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("loading replacement config: %w", err)
+	}
+	// Preserve the caller's archive check and discovery credentials. Runtime
+	// NoSync adoption must reach the child arguments after validation.
+	effective.DBPath = cfg.DBPath
+	effective.AuthToken = cfg.AuthToken
+	effective.NoSync = cfg.NoSync
+	effective.PersistentDaemon = cfg.PersistentDaemon
+	if err := prepareBackgroundReplacement(ctx, &effective, rt, true); err != nil {
+		return err
+	}
+	cfg.NoSync = effective.NoSync
+	cfg.PersistentDaemon = effective.PersistentDaemon
+	return nil
+}
+
 func ensureBackgroundServe(
 	ctx context.Context,
 	cfg *config.Config,
 	waitTimeout time.Duration,
+	allowReplacement bool,
 ) (*DaemonRuntime, error) {
 	if cfg == nil {
 		return nil, errors.New("nil config")
@@ -459,7 +489,7 @@ func ensureBackgroundServe(
 		}
 		if rt := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken); rt != nil &&
 			!rt.ReadOnly {
-			if shouldUpgradeDaemonRuntime(rt, version) {
+			if allowReplacement && shouldReplaceDaemonRuntime(rt, version) {
 				return nil, errors.New("agentsview serve --background is already in progress")
 			}
 			return rt, nil
@@ -467,6 +497,9 @@ func ensureBackgroundServe(
 		if _, err := findIncompatibleWritableDaemonRuntime(
 			cfg.DataDir, cfg.AuthToken,
 		); err != nil {
+			if !allowReplacement {
+				return nil, longLivedDaemonCompatibilityError(err)
+			}
 			return nil, fmt.Errorf(
 				"incompatible daemon is already running: %w; run "+
 					"`agentsview daemon stop` before starting this version",
@@ -490,7 +523,7 @@ func ensureBackgroundServe(
 probeDaemon:
 	if rt := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken); rt != nil &&
 		!rt.ReadOnly {
-		if shouldUpgradeDaemonRuntime(rt, version) {
+		if allowReplacement && shouldReplaceDaemonRuntime(rt, version) {
 			if waited, err := waitForExternalServeStartupBeforeReplacement(
 				ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
 			); waited {
@@ -502,12 +535,12 @@ probeDaemon:
 			if serveReplacementTargetChanged(*cfg, rt) {
 				goto probeDaemon
 			}
-			if err := prepareBackgroundReplacement(ctx, cfg, rt, true); err != nil {
+			if err := prepareAutoStartReplacement(ctx, cfg, rt); err != nil {
 				return nil, err
 			}
 			if err := stopDaemonRuntimeForUpgrade(ctx, *cfg, rt); err != nil {
 				return nil, fmt.Errorf(
-					"stopping older daemon before restart: %w",
+					"stopping daemon with different version before restart: %w",
 					err,
 				)
 			}
@@ -522,7 +555,10 @@ probeDaemon:
 	if rt, err := findIncompatibleWritableDaemonRuntime(
 		cfg.DataDir, cfg.AuthToken,
 	); err != nil {
-		if rt != nil && shouldUpgradeIncompatibleDaemonRuntime(rt, version) {
+		if !allowReplacement {
+			return nil, longLivedDaemonCompatibilityError(err)
+		}
+		if rt != nil && shouldReplaceIncompatibleDaemonRuntime(rt, version) {
 			if waited, err := waitForExternalServeStartupBeforeReplacement(
 				ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
 			); waited {
@@ -534,12 +570,12 @@ probeDaemon:
 			if serveReplacementTargetChanged(*cfg, rt) {
 				goto probeDaemon
 			}
-			if err := prepareBackgroundReplacement(ctx, cfg, rt, true); err != nil {
+			if err := prepareAutoStartReplacement(ctx, cfg, rt); err != nil {
 				return nil, err
 			}
 			if stopErr := stopDaemonRuntimeForUpgrade(ctx, *cfg, rt); stopErr != nil {
 				return nil, fmt.Errorf(
-					"stopping older daemon before restart: %w",
+					"stopping daemon with different version before restart: %w",
 					stopErr,
 				)
 			}
@@ -566,7 +602,10 @@ probeDaemon:
 		if rt, err := findIncompatibleWritableDaemonRuntime(
 			cfg.DataDir, cfg.AuthToken,
 		); err != nil {
-			if rt != nil && shouldUpgradeIncompatibleDaemonRuntime(rt, version) {
+			if !allowReplacement {
+				return nil, longLivedDaemonCompatibilityError(err)
+			}
+			if rt != nil && shouldReplaceIncompatibleDaemonRuntime(rt, version) {
 				if waited, err := waitForExternalServeStartupBeforeReplacement(
 					ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
 				); waited {
@@ -578,12 +617,12 @@ probeDaemon:
 				if serveReplacementTargetChanged(*cfg, rt) {
 					goto probeDaemon
 				}
-				if err := prepareBackgroundReplacement(ctx, cfg, rt, true); err != nil {
+				if err := prepareAutoStartReplacement(ctx, cfg, rt); err != nil {
 					return nil, err
 				}
 				if stopErr := stopDaemonRuntimeForUpgrade(ctx, *cfg, rt); stopErr != nil {
 					return nil, fmt.Errorf(
-						"stopping older daemon before restart: %w",
+						"stopping daemon with different version before restart: %w",
 						stopErr,
 					)
 				}
@@ -601,14 +640,28 @@ probeDaemon:
 		}
 	}
 
+	// With no daemon visible, a held write lock means a server started here
+	// could not open the archive. The launch lock keeps a foreground serve and
+	// direct writers from taking the write lock during this probe.
+	lock, err := tryAcquireWriteOwnerLock(writeLockDataDir(*cfg))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"cannot auto-start the agentsview daemon: %w", err,
+		)
+	}
+	if err := lock.Close(); err != nil {
+		return nil, err
+	}
+
 	args := []string{"serve"}
 	args = serveBackgroundArgsWithNoSync(args, cfg.NoSync)
 	args = serveBackgroundArgsWithSkipInitialSync(args, cfg.SkipInitialSync)
+	logOffset := backgroundServeLogSize(cfg.DataDir)
 	child, logPath, err := startServeBackgroundProcessForEnsure(ctx, *cfg, args)
 	if err != nil {
 		return nil, err
 	}
-	progress := daemonLaunchProgressWriter{w: os.Stderr}
+	progress := daemonLaunchProgressWriter{w: daemonProgressWriter(ctx)}
 	progress.launch(child.Process.Pid, logPath)
 	waitCh := make(chan error, 1)
 	go func() {
@@ -623,10 +676,7 @@ probeDaemon:
 				childPID: child.Process.Pid, LogPath: logPath,
 			})
 		}
-		return nil, fmt.Errorf(
-			"server exited before becoming ready: %w; logs: %s",
-			err, logPath,
-		)
+		return nil, backgroundServeExitError(err, logPath, logOffset)
 	}
 	if rt == nil {
 		return nil, fmt.Errorf(
@@ -651,7 +701,7 @@ func waitForExternalServeStartup(
 	}
 	started := time.Now()
 	deadline := started.Add(waitTimeout)
-	progress := daemonLaunchProgressWriter{w: os.Stderr}
+	progress := daemonLaunchProgressWriter{w: daemonProgressWriter(ctx)}
 	var lastUpdate time.Time
 	for isExternalDaemonStarting(dataDir) {
 		if backgroundServeProbeHook != nil {
@@ -709,9 +759,12 @@ func waitForExternalServeStartupBeforeReplacement(
 	authToken string,
 	waitTimeout time.Duration,
 ) (bool, error) {
-	_, waited, err := waitForExternalServeStartup(
+	rt, waited, err := waitForExternalServeStartup(
 		ctx, dataDir, authToken, waitTimeout,
 	)
+	if rt != nil && rt.RuntimeFallback {
+		return false, err
+	}
 	if !waited {
 		return false, nil
 	}
@@ -807,28 +860,35 @@ func waitForBackgroundLaunchOwner(
 	waitTimeout time.Duration,
 ) {
 	deadline := time.Now().Add(waitTimeout)
-	for time.Now().Before(deadline) {
+	incumbent := FindDaemonRuntime(dataDir, authToken)
+	for {
+		// waitForExternalServeStartup treats a non-positive timeout as its
+		// default, so stop here rather than pass an expired deadline.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
 		if backgroundServeProbeHook != nil {
 			backgroundServeProbeHook()
 		}
 		if isExternalDaemonStarting(dataDir) {
 			_, _, _ = waitForExternalServeStartup(
-				ctx, dataDir, authToken, time.Until(deadline),
+				ctx, dataDir, authToken, remaining,
 			)
+		}
+		if ctx.Err() != nil {
 			return
 		}
-		if rt := FindDaemonRuntime(dataDir, authToken); rt != nil &&
-			!rt.ReadOnly {
+		if launchOwnerPublishedRuntime(FindDaemonRuntime(dataDir, authToken), incumbent) {
 			return
 		}
 		if IsLocalDaemonActive(dataDir, authToken) {
 			if WaitForDaemonStartupContext(
 				ctx, dataDir, time.Until(deadline), authToken,
+			) && launchOwnerPublishedRuntime(
+				FindDaemonRuntime(dataDir, authToken), incumbent,
 			) {
-				if rt := FindDaemonRuntime(dataDir, authToken); rt != nil &&
-					!rt.ReadOnly {
-					return
-				}
+				return
 			}
 			if err := ctx.Err(); err != nil {
 				return
@@ -861,6 +921,16 @@ func waitForBackgroundLaunchOwner(
 	}
 }
 
+// launchOwnerPublishedRuntime reports whether rt is a daemon the launch owner
+// finished starting. While the owner holds the launch lock it may be stopping
+// the incumbent (a restart) or an older daemon (a version replacement), so
+// neither counts until the lock clears.
+func launchOwnerPublishedRuntime(rt, incumbent *DaemonRuntime) bool {
+	return rt != nil && !rt.ReadOnly &&
+		!shouldReplaceDaemonRuntime(rt, version) &&
+		!sameDaemonReplacementTarget(rt, incumbent)
+}
+
 func adoptBackgroundLaunchConfig(cfg *config.Config) {
 	reloaded, err := config.LoadMinimal()
 	if err != nil {
@@ -879,6 +949,11 @@ func startServeBackgroundProcess(ctx context.Context,
 ) (*exec.Cmd, string, error) {
 	logPath := serveLogPath(cfg.DataDir)
 	if err := ctx.Err(); err != nil {
+		return nil, logPath, err
+	}
+	// Surface the actionable version error in the caller before re-exec hides
+	// it behind a child exit status. The child also checks before any writes.
+	if err := db.CheckDataVersion(ctx, cfg.DBPath); err != nil {
 		return nil, logPath, err
 	}
 	exe, err := os.Executable()
@@ -912,7 +987,7 @@ func startServeBackgroundProcess(ctx context.Context,
 	childArgs := serveBackgroundChildArgs(args)
 	// The daemon outlives the launcher; readiness still uses the caller context.
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), exe, childArgs...)
-	cmd.Env = append(os.Environ(), backgroundChildEnvVar+"=1")
+	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(env string) bool { return strings.HasPrefix(env, updateRestartPersistentEnvVar+"=") }), backgroundChildEnvVar+"=1", persistentDaemonEnvVar+"="+strconv.FormatBool(cfg.PersistentDaemon))
 	if cfg.DataDir != "" {
 		cmd.Env = append(cmd.Env, "AGENTSVIEW_DATA_DIR="+cfg.DataDir)
 	}
@@ -924,6 +999,34 @@ func startServeBackgroundProcess(ctx context.Context,
 		return nil, logPath, fmt.Errorf("starting server: %w", err)
 	}
 	return cmd, logPath, nil
+}
+
+func backgroundServeLogSize(dataDir string) int64 {
+	if info, err := os.Stat(serveLogPath(dataDir)); err == nil {
+		return info.Size()
+	}
+	return 0
+}
+
+func backgroundServeExitError(cause error, logPath string, logOffset int64) error {
+	err := fmt.Errorf("server exited before becoming ready: %w\nLogs: %s", cause, logPath)
+	logFile, openErr := os.Open(logPath)
+	if openErr != nil {
+		return err
+	}
+	defer logFile.Close()
+	info, statErr := logFile.Stat()
+	if statErr != nil {
+		return err
+	}
+	// Read only this launch's output, bounded even after a verbose startup.
+	const maxOutput = 8 * 1024
+	start := max(logOffset, info.Size()-maxOutput)
+	output, readErr := io.ReadAll(io.NewSectionReader(logFile, start, maxOutput))
+	if readErr != nil || len(strings.TrimSpace(string(output))) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w\n\n%s", err, strings.TrimSpace(string(output)))
 }
 
 func serveBackgroundChildArgs(args []string) []string {
@@ -941,6 +1044,7 @@ func adoptDaemonRuntimeLaunchOptions(cfg *config.Config, rt *DaemonRuntime) {
 	if cfg == nil || rt == nil {
 		return
 	}
+	cfg.PersistentDaemon = cfg.PersistentDaemon || rt.Persistent
 	if rt.NoSync {
 		cfg.NoSync = true
 	}
@@ -1005,7 +1109,7 @@ func waitForBackgroundServeReady(
 	waitCh <-chan error,
 	timeout time.Duration,
 ) (*DaemonRuntime, error) {
-	progress := daemonLaunchProgressWriter{w: os.Stderr}
+	progress := daemonLaunchProgressWriter{w: daemonProgressWriter(ctx)}
 	return waitForBackgroundServeReadyWithPolicy(
 		ctx, dataDir, authToken, waitCh, timeout,
 		backgroundServeReadyWaitPolicy{Observe: progress.progress},

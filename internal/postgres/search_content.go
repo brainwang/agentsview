@@ -8,19 +8,13 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/secrets"
-)
-
-const (
-	pgSnippetRadius = 60 // chars of context on each side of a match
 )
 
 // SearchContent implements content search for the PostgreSQL read-only store.
 // The "fts" mode falls back to ILIKE over message content, with one predicate
-// per prepared FTS term to preserve SQLite's implicit-AND semantics.
+// per literal word or phrase, preserving implicit AND and explicit Boolean operators.
 func (s *Store) SearchContent(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
@@ -45,7 +39,7 @@ func (s *Store) SearchContent(
 		if err := db.ValidateSemanticFilter(f); err != nil {
 			return db.ContentSearchPage{}, err
 		}
-		if s.getVectorSearcher() == nil {
+		if s.getVectorSearcher() == nil && (f.Mode != "hybrid" || !f.KeywordOnly) {
 			return db.ContentSearchPage{}, s.semanticUnavailableError()
 		}
 		if f.Mode == "semantic" {
@@ -57,11 +51,18 @@ func (s *Store) SearchContent(
 		return s.searchContentTermsPG(ctx, f)
 	}
 
+	if err := db.ValidateContentSearchScope(f.Scope); err != nil {
+		return db.ContentSearchPage{}, err
+	}
+
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
+		if f.Mode == "" || f.Mode == "substring" || f.Mode == "regex" {
+			f.Sources = append(f.Sources, "thinking")
+		}
 	}
 	for _, src := range f.Sources {
-		if src != "messages" && src != "tool_input" && src != "tool_result" {
+		if src != "messages" && src != "thinking" && src != "tool_input" && src != "tool_result" {
 			return db.ContentSearchPage{},
 				&db.SearchInputError{Msg: fmt.Sprintf("search: unknown source %q", src)}
 		}
@@ -97,7 +98,7 @@ func (s *Store) searchContentTermsPG(
 	if len(terms) == 0 {
 		return db.ContentSearchPage{}, nil
 	}
-	query, args, err := db.BuildTermsSearchSQL(f, terms, db.PostgresQueryDialect())
+	query, args, err := db.BuildTermsSearchSQL(f, terms, s.sessionDialect())
 	if err != nil {
 		return db.ContentSearchPage{}, err
 	}
@@ -136,7 +137,7 @@ func appendExcludeSessionIDsPG(
 func (s *Store) searchContentSubstringPG(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
-	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.PostgresQueryDialect())
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, s.sessionDialect())
 	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	escapedPat := escapeLike(f.Pattern)
@@ -148,7 +149,18 @@ func (s *Store) searchContentSubstringPG(
 
 	var branches []string
 	if pgHasSource(f, "messages") {
-		branches = append(branches, pgMessagesBranch(f, escapedPat, pb))
+		branch, err := pgMessagesBranch(f, escapedPat, pb)
+		if err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		branches = append(branches, branch)
+	}
+	if pgHasSource(f, "thinking") {
+		branch, err := pgThinkingBranch(f, escapedPat, pb)
+		if err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		branches = append(branches, branch)
 	}
 	if pgHasSource(f, "tool_input") {
 		branches = append(branches, pgToolInputBranch(f, escapedPat, pb))
@@ -156,6 +168,8 @@ func (s *Store) searchContentSubstringPG(
 	if pgHasSource(f, "tool_result") {
 		branches = append(branches, pgToolResultContentBranch(f, escapedPat, pb))
 		branches = append(branches, pgToolResultEventsBranch(f, escapedPat, pb))
+		predicate := fmt.Sprintf("it.text ILIKE '%%'||%s||'%%' ESCAPE E'\\\\'", pb.add("%"+escapedPat+"%"))
+		branches = append(branches, pgImageTextBranches(f, predicate, "snippet", "")...)
 	}
 	if len(branches) == 0 {
 		return db.ContentSearchPage{}, nil
@@ -164,10 +178,10 @@ func (s *Store) searchContentSubstringPG(
 	limitP := pb.add(f.Limit + 1)
 	offsetP := pb.add(f.Cursor)
 	query := "WITH scoped AS (SELECT id FROM sessions WHERE " + scopeWhere + ") " +
-		"SELECT session_id, project, agent, location, role, tool_name, " +
+		"SELECT session_id, project, agent, transcript_revision, location, role, tool_name, " +
 		"ordinal, ts, snippet FROM (" +
 		strings.Join(branches, " UNION ALL ") +
-		") sub ORDER BY sort_ts DESC NULLS LAST, session_id ASC, ordinal ASC, src ASC, row_id ASC " +
+		") sub ORDER BY sort_ts DESC NULLS LAST, session_id ASC, ordinal ASC, src ASC, row_id ASC, snippet ASC " +
 		"LIMIT " + limitP + " OFFSET " + offsetP
 
 	return s.scanPGContentMatches(ctx, query, pb.args, f.Limit, f.Cursor,
@@ -178,10 +192,13 @@ func (s *Store) searchContentSubstringPG(
 // Placeholders continue from pb's current position.
 func pgMessagesBranch(
 	f db.ContentSearchFilter, escapedPat string, pb *paramBuilder,
-) string {
-	contentPred := pgContentSearchPredicate(
-		"m.content", f, escapedPat, pb,
+) (string, error) {
+	contentPred, err := pgContentSearchPredicate(
+		"COALESCE(m.dialogue_text, m.content)", f, escapedPat, pb,
 	)
+	if err != nil {
+		return "", err
+	}
 
 	sysPred := "TRUE"
 	if f.ExcludeSystem {
@@ -189,50 +206,38 @@ func pgMessagesBranch(
 			db.PostgresSystemPrefixSQL("m.content", "m.role")
 	}
 
+	sysPred += " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
+
 	// Select the full content; the snippet is windowed and redacted in Go.
 	return fmt.Sprintf(`
-		SELECT m.session_id, s.project, s.agent, 'message' AS location,
+		SELECT m.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
 			m.timestamp AS ts,
-			m.content AS snippet, 0 AS src, 0::bigint AS row_id,
+			COALESCE(m.dialogue_text, m.content) AS snippet, 0 AS src, 0::bigint AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM messages m
 		JOIN sessions s ON s.id = m.session_id
 		JOIN scoped sc ON sc.id = m.session_id
 		WHERE %s
 		  AND %s`,
-		contentPred, sysPred)
+		contentPred, sysPred), nil
 }
 
 func pgContentSearchPredicate(
 	column string, f db.ContentSearchFilter, escapedPat string,
 	pb *paramBuilder,
-) string {
+) (string, error) {
 	if f.Mode != "fts" {
 		ilikePat := "%" + escapedPat + "%"
 		ilikeParam := pb.add(ilikePat)
 		return fmt.Sprintf(
 			"%s ILIKE '%%'||%s||'%%' ESCAPE E'\\\\'",
 			column, ilikeParam,
-		)
+		), nil
 	}
-
-	terms := db.FTSTerms(db.PrepareFTSQuery(f.Pattern))
-	clauses := make([]string, 0, len(terms))
-	for _, term := range terms {
-		if term == "" {
-			continue
-		}
-		termParam := pb.add(escapeLike(term))
-		clauses = append(clauses, fmt.Sprintf(
-			"%s ILIKE '%%'||%s||'%%' ESCAPE E'\\\\'",
-			column, termParam,
-		))
-	}
-	if len(clauses) == 0 {
-		return "FALSE"
-	}
-	return strings.Join(clauses, " AND ")
+	return pgFTSExpression(f.Pattern, column, pb)
 }
 
 // pgToolInputBranch builds the tool_input source branch SQL.
@@ -243,7 +248,9 @@ func pgToolInputBranch(
 	ilikeParam := pb.add(ilikePat)
 
 	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
+		SELECT tc.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'tool_input' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
 			m.timestamp AS ts,
 			tc.input_json AS snippet, 1 AS src, tc.id AS row_id,
@@ -254,7 +261,7 @@ func pgToolInputBranch(
 		JOIN messages m ON m.session_id = tc.session_id
 			AND m.ordinal = tc.message_ordinal
 		WHERE tc.input_json ILIKE '%%'||%s||'%%' ESCAPE E'\\'`,
-		ilikeParam)
+		ilikeParam) + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 }
 
 // pgToolResultContentBranch matches result_content when the call has no result
@@ -268,7 +275,9 @@ func pgToolResultContentBranch(
 	ilikeParam := pb.add(ilikePat)
 
 	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
+		SELECT tc.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
 			m.timestamp AS ts,
 			tc.result_content AS snippet, 2 AS src, tc.id AS row_id,
@@ -285,18 +294,21 @@ func pgToolResultContentBranch(
 			  AND tre.tool_use_id = tc.tool_use_id
 			  AND tc.tool_use_id <> ''
 		  )`,
-		ilikeParam)
+		ilikeParam) + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 }
 
 // pgToolResultEventsBranch matches tool_result_events.content.
 func pgToolResultEventsBranch(
 	f db.ContentSearchFilter, escapedPat string, pb *paramBuilder,
 ) string {
+	eventAnchorJoin := db.LexicalEventAnchorJoinSQL(f.Scope)
 	ilikePat := "%" + escapedPat + "%"
 	ilikeParam := pb.add(ilikePat)
 
 	return fmt.Sprintf(`
-		SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
+		SELECT tre.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'tool_result' AS location,
 			'assistant' AS role, '' AS tool_name,
 			tre.tool_call_message_ordinal AS ordinal,
 			tre.timestamp AS ts,
@@ -305,8 +317,9 @@ func pgToolResultEventsBranch(
 		FROM tool_result_events tre
 		JOIN sessions s ON s.id = tre.session_id
 		JOIN scoped sc ON sc.id = tre.session_id
+		`+eventAnchorJoin+`
 		WHERE tre.content ILIKE '%%'||%s||'%%' ESCAPE E'\\'`,
-		ilikeParam)
+		ilikeParam) + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 }
 
 // scanPGContentMatches runs query and assembles a ContentSearchPage. The
@@ -330,7 +343,7 @@ func (s *Store) scanPGContentMatches(
 		var body string
 		var ts *time.Time
 		if err := rows.Scan(
-			&m.SessionID, &m.Project, &m.Agent,
+			&m.SessionID, &m.Project, &m.Agent, &m.TranscriptRevision,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
 			&ts, &body,
 		); err != nil {
@@ -372,7 +385,7 @@ func (s *Store) searchContentRegexPG(
 		return db.ContentSearchPage{},
 			&db.SearchInputError{Msg: fmt.Sprintf("search: invalid regex: %v", err)}
 	}
-	lit := literalPrefixPG(f.Pattern)
+	lit := db.LiteralPrefix(f.Pattern)
 
 	rows, err := s.pgRegexCandidateRows(ctx, f, lit)
 	if err != nil {
@@ -382,14 +395,16 @@ func (s *Store) searchContentRegexPG(
 
 	out := make([]db.ContentMatch, 0)
 	seen := 0
+	var dedupe db.LegacyThinkingDedupe
 	for rows.Next() {
 		var m db.ContentMatch
 		var body string
+		var legacyThinking bool
 		var ts *time.Time
 		if err := rows.Scan(
-			&m.SessionID, &m.Project, &m.Agent,
+			&m.SessionID, &m.Project, &m.Agent, &m.TranscriptRevision,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&ts, &body,
+			&ts, &body, &legacyThinking,
 		); err != nil {
 			return db.ContentSearchPage{},
 				fmt.Errorf("scan pg regex candidate: %w", err)
@@ -401,11 +416,14 @@ func (s *Store) searchContentRegexPG(
 		if loc == nil {
 			continue
 		}
+		if dedupe.Suppress(m, legacyThinking) {
+			continue
+		}
 		if seen < f.Cursor {
 			seen++
 			continue
 		}
-		m.Snippet = pgBuildSnippet(f, body, loc[0], loc[1])
+		m.Snippet = f.BuildSnippet(body, loc[0], loc[1])
 		out = append(out, m)
 		if len(out) > f.Limit {
 			break
@@ -432,7 +450,7 @@ func (s *Store) searchContentRegexPG(
 func (s *Store) pgRegexCandidateRows(
 	ctx context.Context, f db.ContentSearchFilter, lit string,
 ) (*sql.Rows, error) {
-	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.PostgresQueryDialect())
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, s.sessionDialect())
 	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 
@@ -445,6 +463,9 @@ func (s *Store) pgRegexCandidateRows(
 	if pgHasSource(f, "messages") {
 		branches = append(branches, pgMessagesCandidateBranch(f, lit, pb))
 	}
+	if pgHasSource(f, "thinking") {
+		branches = append(branches, pgThinkingCandidateBranch(f, lit, pb))
+	}
 	if pgHasSource(f, "tool_input") {
 		branches = append(branches, pgToolInputCandidateBranch(f, lit, pb))
 	}
@@ -453,19 +474,22 @@ func (s *Store) pgRegexCandidateRows(
 			pgToolResultContentCandidateBranch(f, lit, pb))
 		branches = append(branches,
 			pgToolResultEventsCandidateBranch(f, lit, pb))
+		branches = append(branches, pgImageTextBranches(
+			f, pgPrefilterClause("it.text", lit, pb), "body", ", FALSE AS legacy_thinking")...)
 	}
 	if len(branches) == 0 {
 		q := "SELECT '' AS session_id, '' AS project, '' AS agent, " +
-			"'' AS location, '' AS role, '' AS tool_name, 0 AS ordinal, " +
-			"'' AS ts, '' AS body WHERE FALSE"
+			"'' AS transcript_revision, '' AS location, '' AS role, " +
+			"'' AS tool_name, 0 AS ordinal, " +
+			"NULL::timestamptz AS ts, '' AS body, FALSE AS legacy_thinking WHERE FALSE"
 		return s.pg.QueryContext(ctx, q)
 	}
 
 	query := "WITH scoped AS (SELECT id FROM sessions WHERE " + scopeWhere + ") " +
-		"SELECT session_id, project, agent, location, role, tool_name, " +
-		"ordinal, ts, body FROM (" +
+		"SELECT session_id, project, agent, transcript_revision, location, role, tool_name, " +
+		"ordinal, ts, body, legacy_thinking FROM (" +
 		strings.Join(branches, " UNION ALL ") +
-		") sub ORDER BY sort_ts DESC NULLS LAST, session_id ASC, ordinal ASC, src ASC, row_id ASC"
+		") sub ORDER BY sort_ts DESC NULLS LAST, session_id ASC, ordinal ASC, src ASC, row_id ASC, body ASC"
 	return s.pg.QueryContext(ctx, query, pb.args...)
 }
 
@@ -484,7 +508,7 @@ func pgPrefilterClause(col, lit string, pb *paramBuilder) string {
 func pgMessagesCandidateBranch(
 	f db.ContentSearchFilter, lit string, pb *paramBuilder,
 ) string {
-	prefilter := pgPrefilterClause("m.content", lit, pb)
+	prefilter := pgPrefilterClause("COALESCE(m.dialogue_text, m.content)", lit, pb)
 
 	sysPred := "TRUE"
 	if f.ExcludeSystem {
@@ -492,11 +516,14 @@ func pgMessagesCandidateBranch(
 			db.PostgresSystemPrefixSQL("m.content", "m.role")
 	}
 
+	sysPred += " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 	return fmt.Sprintf(`
-		SELECT m.session_id, s.project, s.agent, 'message' AS location,
+		SELECT m.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
 			m.timestamp AS ts,
-			m.content AS body, 0 AS src, 0::bigint AS row_id,
+			COALESCE(m.dialogue_text, m.content) AS body, 0 AS src, 0::bigint AS row_id, FALSE AS legacy_thinking,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM messages m
 		JOIN sessions s ON s.id = m.session_id
@@ -510,8 +537,9 @@ func pgToolInputCandidateBranch(
 	f db.ContentSearchFilter, lit string, pb *paramBuilder,
 ) string {
 	prefilter := pgPrefilterClause("tc.input_json", lit, pb)
+	prefilter += " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 
-	return "\n\t\tSELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,\n\t\t\t'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,\n\t\t\tm.timestamp AS ts,\n\t\t\ttc.input_json AS body, 1 AS src, tc.id AS row_id,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_calls tc\n\t\tJOIN sessions s ON s.id = tc.session_id\n\t\tJOIN scoped sc ON sc.id = tc.session_id\n\t\tJOIN messages m ON m.session_id = tc.session_id\n\t\t\tAND m.ordinal = tc.message_ordinal\n\t\tWHERE " + prefilter
+	return "\n\t\tSELECT tc.session_id, s.project, s.agent,\n\t\t\ts.transcript_revision,\n\t\t\t'tool_input' AS location, 'assistant' AS role, tc.tool_name,\n\t\t\ttc.message_ordinal AS ordinal, m.timestamp AS ts,\n\t\t\ttc.input_json AS body, 1 AS src, tc.id AS row_id, FALSE AS legacy_thinking,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_calls tc\n\t\tJOIN sessions s ON s.id = tc.session_id\n\t\tJOIN scoped sc ON sc.id = tc.session_id\n\t\tJOIN messages m ON m.session_id = tc.session_id\n\t\t\tAND m.ordinal = tc.message_ordinal\n\t\tWHERE " + prefilter
 }
 
 // pgToolResultContentCandidateBranch: candidate result_content rows (no events).
@@ -519,12 +547,15 @@ func pgToolResultContentCandidateBranch(
 	f db.ContentSearchFilter, lit string, pb *paramBuilder,
 ) string {
 	prefilter := pgPrefilterClause("tc.result_content", lit, pb)
+	prefilter += " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 
 	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
+		SELECT tc.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
 			m.timestamp AS ts,
-			tc.result_content AS body, 2 AS src, tc.id AS row_id,
+			tc.result_content AS body, 2 AS src, tc.id AS row_id, FALSE AS legacy_thinking,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
 		JOIN sessions s ON s.id = tc.session_id
@@ -545,34 +576,60 @@ func pgToolResultContentCandidateBranch(
 func pgToolResultEventsCandidateBranch(
 	f db.ContentSearchFilter, lit string, pb *paramBuilder,
 ) string {
+	eventAnchorJoin := db.LexicalEventAnchorJoinSQL(f.Scope)
 	prefilter := pgPrefilterClause("tre.content", lit, pb)
+	prefilter += " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 
-	return "\n\t\tSELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,\n\t\t\t'assistant' AS role, '' AS tool_name,\n\t\t\ttre.tool_call_message_ordinal AS ordinal,\n\t\t\ttre.timestamp AS ts,\n\t\t\ttre.content AS body, 3 AS src, tre.id AS row_id,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_result_events tre\n\t\tJOIN sessions s ON s.id = tre.session_id\n\t\tJOIN scoped sc ON sc.id = tre.session_id\n\t\tWHERE " + prefilter
+	return "\n\t\tSELECT tre.session_id, s.project, s.agent,\n\t\t\ts.transcript_revision,\n\t\t\t'tool_result' AS location, 'assistant' AS role, '' AS tool_name,\n\t\t\ttre.tool_call_message_ordinal AS ordinal, tre.timestamp AS ts,\n\t\t\ttre.content AS body, 3 AS src, tre.id AS row_id, FALSE AS legacy_thinking,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_result_events tre\n\t\tJOIN sessions s ON s.id = tre.session_id\n\t\tJOIN scoped sc ON sc.id = tre.session_id\n" + eventAnchorJoin + "\n\t\tWHERE " + prefilter
 }
 
-// pgSnippetBounds returns the rune-snapped byte window around [start,end),
-// mirroring snippetBounds in internal/db/search_content.go.
-func pgSnippetBounds(text string, start, end int) (int, int) {
-	lo := max(start-pgSnippetRadius, 0)
-	hi := min(end+pgSnippetRadius, len(text))
-	for lo < start && !utf8.RuneStart(text[lo]) {
-		lo++
-	}
-	for hi > end && hi < len(text) && !utf8.RuneStart(text[hi]) {
-		hi--
-	}
-	return lo, hi
-}
-
-// pgBuildSnippet windows body around [start,end) and, unless reveal is set,
-// masks secrets overlapping the window (including straddling ones) via
-// secrets.RedactWindow, so a pre-truncated snippet can never leak a fragment.
-func pgBuildSnippet(f db.ContentSearchFilter, body string, start, end int) string {
-	lo, hi := pgSnippetBounds(body, start, end)
-	if f.RevealSecrets {
-		return body[lo:hi]
-	}
-	return secrets.RedactWindow(body, lo, hi)
+// pgImageTextBranches search extracted image text as more tool_result content,
+// anchored like the result_content and event branches. A call or event can hold
+// several images, so the final text column breaks ordering ties.
+func pgImageTextBranches(f db.ContentSearchFilter, predicate, body, extra string) []string {
+	call := fmt.Sprintf(`
+		SELECT DISTINCT tc.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'tool_result' AS location,
+			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
+			m.timestamp AS ts,
+			it.text AS %[1]s, 5 AS src, tc.id AS row_id%[2]s,
+			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
+		FROM image_text it
+		JOIN tool_calls tc ON tc.session_id = it.session_id
+			AND tc.message_ordinal = it.message_ordinal
+			AND tc.call_index = it.call_index
+		JOIN sessions s ON s.id = tc.session_id
+		JOIN scoped sc ON sc.id = tc.session_id
+		JOIN messages m ON m.session_id = tc.session_id
+			AND m.ordinal = tc.message_ordinal
+		WHERE it.source_kind = 'tool_call' AND %[3]s
+		  AND NOT EXISTS (
+			SELECT 1 FROM tool_result_events tre
+			WHERE tre.session_id = tc.session_id
+			  AND tre.tool_use_id = tc.tool_use_id
+			  AND tc.tool_use_id <> ''
+		  )`, body, extra, predicate) + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
+	event := fmt.Sprintf(`
+		SELECT DISTINCT tre.session_id, s.project, s.agent,
+			s.transcript_revision,
+			'tool_result' AS location,
+			'assistant' AS role, '' AS tool_name,
+			tre.tool_call_message_ordinal AS ordinal,
+			tre.timestamp AS ts,
+			it.text AS %[1]s, 6 AS src, tre.id AS row_id%[2]s,
+			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
+		FROM image_text it
+		JOIN tool_result_events tre ON tre.session_id = it.session_id
+			AND tre.tool_call_message_ordinal = it.message_ordinal
+			AND tre.call_index = it.call_index
+			AND tre.event_index = it.event_index
+		JOIN sessions s ON s.id = tre.session_id
+		JOIN scoped sc ON sc.id = tre.session_id
+		%[4]s
+		WHERE it.source_kind = 'event' AND %[3]s`, body, extra, predicate, db.LexicalEventAnchorJoinSQL(f.Scope)) +
+		" AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
+	return []string{call, event}
 }
 
 // pgSubstringSnippet builds a substring-match snippet: it locates the
@@ -582,19 +639,62 @@ func pgBuildSnippet(f db.ContentSearchFilter, body string, start, end int) strin
 func pgSubstringSnippet(f db.ContentSearchFilter, body string) string {
 	if f.Mode == "fts" {
 		start, end := db.FTSSnippetRange(f.Pattern, body)
-		return pgBuildSnippet(f, body, start, end)
+		return f.BuildSnippet(body, start, end)
 	}
 	start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
-	return pgBuildSnippet(f, body, start, end)
+	return f.BuildSnippet(body, start, end)
 }
 
-// literalPrefixPG returns the required literal prefix from a regex pattern,
-// identical to the SQLite-side literalPrefix.
-func literalPrefixPG(pattern string) string {
-	re, err := regexp.Compile(pattern)
+// pgThinkingBranch suppresses a legacy thinking hit when its rendered message
+// already matched. Classified messages keep both independent source hits.
+func pgThinkingBranch(f db.ContentSearchFilter, escapedPat string, pb *paramBuilder) (string, error) {
+	predicate, err := pgContentSearchPredicate("m.thinking_text", f, escapedPat, pb)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	prefix, _ := re.LiteralPrefix()
-	return prefix
+	if pgHasSource(f, "messages") {
+		messagePredicate, err := pgContentSearchPredicate("m.content", f, escapedPat, pb)
+		if err != nil {
+			return "", err
+		}
+		predicate += " AND (m.dialogue_text IS NOT NULL OR NOT (" + messagePredicate + "))"
+	}
+	sysPred := "TRUE"
+	if f.ExcludeSystem {
+		sysPred = "m.is_system = FALSE AND " + db.PostgresSystemPrefixSQL("m.content", "m.role")
+	}
+	sysPred += " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
+	return fmt.Sprintf(`SELECT m.session_id, s.project, s.agent,
+        s.transcript_revision,
+        'thinking' AS location, m.role, '' AS tool_name, m.ordinal,
+        m.timestamp AS ts, m.thinking_text AS snippet,
+        4 AS src, 0::bigint AS row_id,
+        COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
+        FROM messages m JOIN sessions s ON s.id=m.session_id
+        JOIN scoped sc ON sc.id=m.session_id
+        WHERE %s AND %s`, predicate, sysPred), nil
+}
+
+func pgThinkingCandidateBranch(f db.ContentSearchFilter, lit string, pb *paramBuilder) string {
+	predicate := pgPrefilterClause("m.thinking_text", lit, pb)
+	sysPred := "TRUE"
+	if f.ExcludeSystem {
+		var prefix string
+		if f.SessionID != "" {
+			prefix = db.PostgresSystemPrefixSQLWithoutGuard("m.content", "m.role")
+		} else {
+			prefix = db.PostgresSystemPrefixSQL("m.content", "m.role")
+		}
+		sysPred = "m.is_system = FALSE AND " + prefix
+	}
+	sysPred += " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
+	return fmt.Sprintf(`SELECT m.session_id, s.project, s.agent,
+        s.transcript_revision,
+        'thinking' AS location, m.role, '' AS tool_name, m.ordinal,
+        m.timestamp AS ts, m.thinking_text AS body,
+        4 AS src, 0::bigint AS row_id, m.dialogue_text IS NULL AS legacy_thinking,
+        COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
+        FROM messages m JOIN sessions s ON s.id=m.session_id
+        JOIN scoped sc ON sc.id=m.session_id
+        WHERE %s AND m.thinking_text <> '' AND %s`, predicate, sysPred)
 }

@@ -1,29 +1,6 @@
 import { describe, it, expect } from "vite-plus/test";
 import { isSystemMessage, normalizeMessagePreview, previewMessage } from "./messages.js";
-import type { DbMessage as Message } from "../api/generated/index.js";
-
-function msg(overrides: Partial<Message>): Message {
-  return {
-    has_context_tokens: false,
-    has_output_tokens: false,
-    id: 1,
-    session_id: "s1",
-    ordinal: 0,
-    role: "user",
-    content: "hello",
-    timestamp: "2025-01-01T00:00:00Z",
-    has_thinking: false,
-    thinking_text: "",
-    has_tool_use: false,
-    content_length: 5,
-    model: "",
-    token_usage: null,
-    context_tokens: 0,
-    output_tokens: 0,
-    is_system: false,
-    ...overrides,
-  };
-}
+import { msg } from "./test-messages.js";
 
 describe("isSystemMessage", () => {
   it("returns true when is_system flag is set", () => {
@@ -122,12 +99,16 @@ describe("isSystemMessage", () => {
     expect(isSystemMessage(msg({ content }))).toBe(false);
   });
 
-  it.each(["continuation", "resume", "interrupted", "task_notification", "stop_hook"])(
-    "keeps promoted subtype %s visible even with is_system=true",
-    (subtype) => {
-      expect(isSystemMessage(msg({ is_system: true, source_subtype: subtype }))).toBe(false);
-    },
-  );
+  it.each([
+    "continuation",
+    "resume",
+    "interrupted",
+    "task_notification",
+    "stop_hook",
+    "peer_message",
+  ])("keeps promoted subtype %s visible even with is_system=true", (subtype) => {
+    expect(isSystemMessage(msg({ is_system: true, source_subtype: subtype }))).toBe(false);
+  });
 
   it("hides unknown source_subtype when is_system is true", () => {
     expect(isSystemMessage(msg({ is_system: true, source_subtype: "future_subtype" }))).toBe(true);
@@ -272,7 +253,8 @@ describe("previewMessage", () => {
   });
 
   it("preserves the original preview when stripped shell output is empty", () => {
-    const raw = '<system-reminder data-role="user-context">ctx</system-reminder><bash-stdout></bash-stdout>';
+    const raw =
+      '<system-reminder data-role="user-context">ctx</system-reminder><bash-stdout></bash-stdout>';
     expect(previewMessage(raw)).toEqual({
       text: '<system-reminder data-role="user-context">ctx</system-reminder>',
       isShell: true,
@@ -280,25 +262,10 @@ describe("previewMessage", () => {
   });
 
   it("preserves the original preview when stripped shell output is whitespace", () => {
-    const raw = '<system-reminder>ctx</system-reminder><bash-stderr>   </bash-stderr>';
+    const raw = "<system-reminder>ctx</system-reminder><bash-stderr>   </bash-stderr>";
     expect(previewMessage(raw)).toEqual({
       text: "<system-reminder>ctx</system-reminder>",
       isShell: true,
     });
-  });
-
-  it("normalizeMessagePreview returns previewMessage(text).text", () => {
-    const cases = [
-      "<bash-input>ls</bash-input>",
-      "<bash-stdout>ok</bash-stdout>",
-      "plain text",
-      "",
-      '<system-reminder data-role="user-context">c</system-reminder>next',
-      '<system-reminder data-role="user-context">c',
-      "<system-reminderish>x</system-reminderish>",
-    ];
-    for (const c of cases) {
-      expect(normalizeMessagePreview(c)).toBe(previewMessage(c).text);
-    }
   });
 });

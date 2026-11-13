@@ -47,7 +47,7 @@ func (e *Engine) openCodeStorageSessionPath(file parser.DiscoveredFile) string {
 	if isOpenCodeFormatSQLiteVirtualPath(file.Agent, file.Path) {
 		return ""
 	}
-	for _, dir := range e.agentDirs[file.Agent] {
+	for _, dir := range e.sources().agentDirs[file.Agent] {
 		if dir == "" {
 			continue
 		}
@@ -241,6 +241,18 @@ func (e *Engine) invalidateOpenCodeStorageSession(path string) {
 		e.storageTrustGens = make(map[string]uint64)
 	}
 	e.storageTrustGens[path]++
+}
+
+// InvalidateEventDependentTrust revokes freshness trust that only a watcher
+// event can revoke. A native watcher calls it after a stream lost events and
+// before it reconciles the affected root: a dropped notification can hide a
+// same-size, same-mtime child rewrite that the storage gate's stat signature
+// cannot see. It starts a new trust epoch, so a promotion captured before the
+// call cannot restore trust either. The reset is in memory only and touches
+// no other cache; each storage session re-earns trust on its next verified
+// parse.
+func (e *Engine) InvalidateEventDependentTrust() {
+	e.clearTrustedOpenCodeStorageSessions()
 }
 
 // clearTrustedOpenCodeStorageSessions drops every trusted session state

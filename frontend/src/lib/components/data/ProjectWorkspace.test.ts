@@ -32,10 +32,14 @@ vi.mock("../../api/generated/index", () => ({
     deleteApiV1SettingsSessionProjectAssignmentsBySessionId: api.clearSession,
   },
 }));
-vi.mock("../../api/runtime.js", () => ({
-  isAbortError: vi.fn(() => false),
-  isRemoteConnection: vi.fn(() => false),
-}));
+vi.mock("../../api/runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../api/runtime.js")>();
+  return {
+    ...actual,
+    isAbortError: vi.fn(() => false),
+    isRemoteConnection: vi.fn(() => false),
+  };
+});
 
 const candidate = {
   id: "candidate-1",
@@ -416,7 +420,7 @@ describe("ProjectWorkspace", () => {
     });
 
     await fireEvent.click(screen.getByTitle(m.data_session_assignment_target()));
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project (12)" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project 12" }));
     await flush();
     await fireEvent.click(screen.getByRole("button", { name: m.data_session_assignment_save() }));
     await flush();
@@ -454,7 +458,7 @@ describe("ProjectWorkspace", () => {
     await flush();
 
     await fireEvent.click(screen.getByTitle(m.data_session_assignment_target()));
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project (12)" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project 12" }));
     await flush();
     await fireEvent.click(screen.getByRole("button", { name: m.data_session_assignment_save() }));
     await flush();
@@ -485,7 +489,7 @@ describe("ProjectWorkspace", () => {
     await flush();
 
     await fireEvent.click(screen.getByTitle(m.data_session_assignment_target()));
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project (12)" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project 12" }));
     await flush();
     await fireEvent.click(screen.getByRole("button", { name: m.data_session_assignment_save() }));
     await flush();
@@ -502,7 +506,7 @@ describe("ProjectWorkspace", () => {
     api.listSessions.mockResolvedValueOnce({ sessions: [], total: 0 });
 
     await fireEvent.click(screen.getByTitle(m.data_session_assignment_target()));
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project (12)" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "target-project 12" }));
     await flush();
     await fireEvent.click(screen.getByRole("button", { name: m.data_session_assignment_save() }));
     await flush();
@@ -558,7 +562,7 @@ describe("ProjectWorkspace", () => {
     await flush();
 
     await fireEvent.click(screen.getByTitle(m.data_session_assignment_target()));
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "wrong-project (9)" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "wrong-project 9" }));
     await flush();
     const assignButton = screen.getByRole("button", {
       name: m.data_session_assignment_save(),

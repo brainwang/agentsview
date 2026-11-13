@@ -42,14 +42,17 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 // lineReader reads JSONL files line by line, skipping lines that
 // exceed maxLen rather than aborting. The buffer starts small and
 // grows on demand up to maxLen. After iteration, call Err() to
-// check for I/O errors (as opposed to normal EOF).
+// check for I/O errors (as opposed to normal EOF) and SkippedLines()
+// to count records the caller never saw.
 type lineReader struct {
-	r         *bufio.Reader
-	cr        *countingReader
-	maxLen    int
-	buf       []byte
-	err       error
-	bytesRead int64 // total bytes consumed (from countingReader)
+	r            *bufio.Reader
+	cr           *countingReader
+	maxLen       int
+	buf          []byte
+	err          error
+	bytesRead    int64 // total bytes consumed (from countingReader)
+	terminated   bool  // the returned line ended with a newline
+	skippedLines int   // oversized records dropped before reaching the caller
 }
 
 const maxPooledLineBufferSize = 256 << 10
@@ -80,6 +83,8 @@ func newLineReaderContext(
 	lr.buf = lr.buf[:0]
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
+	lr.skippedLines = 0
 	return lr
 }
 
@@ -98,6 +103,8 @@ func releaseLineReader(lr *lineReader) {
 	lr.maxLen = 0
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
+	lr.skippedLines = 0
 	lineReaderPool.Put(lr)
 }
 
@@ -137,6 +144,15 @@ func (lr *lineReader) Err() error {
 	return lr.err
 }
 
+// SkippedLines returns how many records the reader dropped without
+// returning them, because they exceeded maxLen. Blank lines are not
+// counted. Session parsers add this to ParsedSession.MalformedLines so
+// a session that lost records does not look complete; parsers that
+// require complete input reject the source when it is nonzero.
+func (lr *lineReader) SkippedLines() int {
+	return lr.skippedLines
+}
+
 // readLine reads a full line, returning "" for blank/oversized
 // lines and a non-nil error only at EOF or read failure.
 // updateBytesRead computes total bytes consumed by
@@ -149,6 +165,8 @@ func (lr *lineReader) updateBytesRead() {
 }
 
 func (lr *lineReader) readLineBytes() ([]byte, error) {
+	start := lr.bytesRead
+	lr.terminated = false
 	lr.buf = lr.buf[:0]
 	oversized := false
 
@@ -175,7 +193,9 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		// a second initialScanBufSize scratch buffer for every file.
 		if len(lr.buf) == 0 && !isPrefix {
 			lr.updateBytesRead()
+			lr.terminated = lr.bytesRead-start > int64(len(chunk))
 			if len(chunk) > lr.maxLen {
+				lr.skippedLines++
 				return nil, nil
 			}
 			return chunk, nil
@@ -184,6 +204,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		lr.buf = append(lr.buf, chunk...)
 
 		if len(lr.buf) > lr.maxLen {
+			lr.skippedLines++
 			oversized = true
 			lr.buf = lr.buf[:0]
 			if !isPrefix {
@@ -199,6 +220,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		}
 	}
 
+	lr.terminated = lr.bytesRead-start > int64(len(lr.buf))
 	return lr.buf, nil
 }
 
@@ -209,21 +231,30 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 // can use offset+consumed as a safe resume point even if the
 // file had a partially written line at EOF.
 func readJSONLFrom(
-	path string, offset int64, fn func(line string),
+	ctx context.Context, path string, offset int64, fn func(line string),
 ) (consumed int64, err error) {
+	consumed, _, err = readJSONLFromCounting(ctx, path, offset, fn)
+	return consumed, err
+}
+
+// readJSONLFromCounting is readJSONLFrom for full-file passes that report
+// loss: it also returns how many oversized records the reader skipped.
+func readJSONLFromCounting(
+	ctx context.Context, path string, offset int64, fn func(line string),
+) (consumed int64, skipped int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, fmt.Errorf("open %s: %w", path, err)
+		return 0, 0, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
 
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return 0, fmt.Errorf(
+		return 0, 0, fmt.Errorf(
 			"seek %s to %d: %w", path, offset, err,
 		)
 	}
 
-	lr := newLineReader(f, maxLineSize)
+	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
 		line, ok := lr.next()
@@ -237,5 +268,5 @@ func readJSONLFrom(
 			consumed = lr.bytesRead
 		}
 	}
-	return consumed, lr.Err()
+	return consumed, lr.SkippedLines(), lr.Err()
 }

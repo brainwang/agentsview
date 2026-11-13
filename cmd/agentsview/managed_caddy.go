@@ -164,16 +164,17 @@ func rewriteConfiguredPublicURLPort(
 }
 
 func validateServeConfig(cfg config.Config) error {
-	// A persistent non-loopback bind from config.toml exposes the
-	// API on every restart, so it must not silently ship without
-	// authentication. An explicit --host flag stays exempt: it is
-	// a deliberate, per-invocation choice and existing behavior.
+	// A persistent non-loopback bind from config.toml or the environment
+	// exposes the API on every restart, so it must not silently ship without
+	// authentication. An explicit --host flag stays exempt: it is a deliberate,
+	// per-invocation choice and existing behavior.
 	if !cfg.HostExplicit && !isLoopbackHost(cfg.Host) &&
 		!cfg.RequireAuth {
 		return fmt.Errorf(
-			"host = %q in config.toml exposes the API beyond this "+
-				"machine; set require_auth = true in config.toml to "+
-				"serve it with bearer-token authentication, or use "+
+			"host = %q exposes the API beyond this machine; set "+
+				"require_auth = true in config.toml or "+
+				"AGENTSVIEW_REQUIRE_AUTH=true to serve it with bearer-token "+
+				"authentication, or use "+
 				"the --host flag for a one-off unauthenticated bind",
 			cfg.Host,
 		)
@@ -326,7 +327,10 @@ func startManagedCaddy(
 		return nil, fmt.Errorf("validating managed caddy config: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Caddy outlives parent's cancellation on purpose: managedCaddy.Stop owns
+	// its lifetime, so the serve runtime stops it in order with the HTTP
+	// server shutdown and also releases the process guard.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	cmd := exec.CommandContext(
 		ctx,
 		cfg.Proxy.Bin,
@@ -414,6 +418,21 @@ func buildManagedCaddyfile(
 	b.WriteString("{\n")
 	b.WriteString("\tadmin off\n")
 	b.WriteString("\tauto_https off\n")
+	// Caddy logs the full request URI on proxy errors, and its output lands
+	// in the daemon log. Event streams accept the bearer token as ?token=
+	// for native EventSource clients, so drop that parameter from logs.
+	// Caddy before 2.8 needs the fields block and an explicit wrap encoder;
+	// JSON is what Caddy already writes when its output is not a terminal.
+	b.WriteString("\tlog default {\n")
+	b.WriteString("\t\tformat filter {\n")
+	b.WriteString("\t\t\twrap json\n")
+	b.WriteString("\t\t\tfields {\n")
+	b.WriteString("\t\t\t\trequest>uri query {\n")
+	b.WriteString("\t\t\t\t\tdelete token\n")
+	b.WriteString("\t\t\t\t}\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
 	b.WriteString("}\n\n")
 	b.WriteString(publicURL)
 	b.WriteString(" {\n")

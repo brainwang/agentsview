@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/url"
@@ -24,6 +25,15 @@ import (
 	"go.kenn.io/agentsview/internal/update"
 )
 
+type daemonProgressContextKey struct{}
+
+func daemonProgressWriter(ctx context.Context) io.Writer {
+	if w, ok := ctx.Value(daemonProgressContextKey{}).(io.Writer); ok {
+		return w
+	}
+	return os.Stderr
+}
+
 type transportMode int
 
 const (
@@ -36,6 +46,8 @@ type transportIntent int
 const (
 	transportIntentRead transportIntent = iota
 	transportIntentArchiveWrite
+	// Long-lived clients reconnect but never replace an existing daemon.
+	transportIntentLongLived
 )
 
 var errLocalDaemonUnreachable = errors.New(
@@ -56,6 +68,7 @@ var (
 // ensureBackgroundServe directly.
 func autoStartBackgroundServe(
 	ctx context.Context, cfg *config.Config, waitTimeout time.Duration,
+	allowReplacement bool,
 ) (*DaemonRuntime, error) {
 	if testing.Testing() {
 		return nil, errors.New(
@@ -63,7 +76,7 @@ func autoStartBackgroundServe(
 				"stub startBackgroundServeForTransport or set AGENTSVIEW_NO_DAEMON=1",
 		)
 	}
-	return ensureBackgroundServe(ctx, cfg, waitTimeout)
+	return ensureBackgroundServe(ctx, cfg, waitTimeout, allowReplacement)
 }
 
 // transport captures how to reach the session-data layer from a
@@ -86,12 +99,27 @@ type customPricingStore interface {
 }
 
 var openPGReadStore = func(
+	ctx context.Context,
 	cfg config.Config,
 	pgCfg config.PGConfig,
 ) (db.Store, func(), error) {
 	applyClassifierConfig(cfg)
+	if err := cfg.ValidatePGRawDerivation(pgCfg); err != nil {
+		return nil, nil, err
+	}
+	if pgCfg.RawTenant != "" {
+		store, err := postgres.NewHostedStore(ctx, pgCfg.URL, pgCfg.Schema, pgCfg.RawTenant, pgCfg.AllowInsecure)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err = applyRequiredCursorSecret(store, cfg); err != nil {
+			store.Close()
+			return nil, nil, err
+		}
+		return store, func() { _ = store.Close() }, nil
+	}
 	backend := pgReplica{}
-	store, err := backend.OpenStore(postgres.ReplicaTarget(pgCfg))
+	store, err := backend.OpenStore(ctx, postgres.ReplicaTarget(pgCfg))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -102,21 +130,38 @@ var openPGReadStore = func(
 	return store, func() { _ = store.Close() }, nil
 }
 
-// detectTransport picks the transport mode:
+// detectClientTransportContext probes an existing daemon using deployment
+// credentials, without applying unrelated deployment settings or auto-starting.
+// Keep the resolved token in cfg for the API client selected by this probe.
+func detectClientTransportContext(
+	ctx context.Context, cfg *config.Config, waitTimeout time.Duration,
+) (transport, error) {
+	if err := ctx.Err(); err != nil {
+		return transport{}, err
+	}
+	if err := cfg.ApplyDeploymentAuth(); err != nil {
+		return transport{}, fmt.Errorf("loading daemon auth: %w", err)
+	}
+	return detectTransportContext(ctx, cfg.DataDir, cfg.AuthToken, waitTimeout)
+}
+
+// loadDaemonClientConfig is the scoped minimal loader for clients which probe
+// daemon ownership directly rather than using transport discovery.
+func loadDaemonClientConfig(scope config.ValidationScope) (config.Config, error) {
+	cfg, err := config.LoadMinimalFor(scope)
+	if err == nil {
+		err = cfg.ApplyDeploymentAuth()
+	}
+	return cfg, err
+}
+
+// detectTransportContext picks the transport mode:
 //  1. If a kit runtime record points to a live daemon, use HTTP.
 //  2. If a daemon start lock exists, wait up to waitTimeout for the
 //     daemon to become ready, then try again.
 //  3. If a writable local daemon owns the SQLite archive but is not
 //     reachable by ping, use direct read-only access.
 //  4. Otherwise use direct access.
-func detectTransport(
-	dataDir string, authToken string, waitTimeout time.Duration,
-) (transport, error) {
-	return detectTransportContext(
-		context.Background(), dataDir, authToken, waitTimeout,
-	)
-}
-
 func detectTransportContext(
 	ctx context.Context,
 	dataDir string,
@@ -127,7 +172,7 @@ func detectTransportContext(
 		return transport{}, err
 	}
 	if isExternalDaemonStarting(dataDir) {
-		fmt.Fprintln(os.Stderr,
+		fmt.Fprintln(daemonProgressWriter(ctx),
 			"server is starting up, waiting...")
 		if waitTimeout <= 0 {
 			waitTimeout = startupWaitTimeout
@@ -146,7 +191,7 @@ func detectTransportContext(
 		return transportFromRuntime(sf), nil
 	}
 	if IsDaemonStarting(dataDir) {
-		fmt.Fprintln(os.Stderr,
+		fmt.Fprintln(daemonProgressWriter(ctx),
 			"server is starting up, waiting...")
 		if waitTimeout <= 0 {
 			waitTimeout = startupWaitTimeout
@@ -184,28 +229,28 @@ func detectTransportContext(
 	return transport{Mode: transportDirect}, nil
 }
 
-func ensureTransport(
-	cfg *config.Config,
-	intent transportIntent,
-	waitTimeout time.Duration,
-) (transport, error) {
-	return ensureTransportContext(
-		context.Background(), cfg, intent, waitTimeout,
-	)
-}
-
 func ensureTransportContext(
 	ctx context.Context,
 	cfg *config.Config,
 	intent transportIntent,
 	waitTimeout time.Duration,
 ) (transport, error) {
+	allowReplacement := intent != transportIntentLongLived
+	if intent == transportIntentLongLived {
+		intent = transportIntentArchiveWrite
+	}
 	if cfg == nil {
 		return transport{}, errors.New("nil config")
 	}
 	if err := ctx.Err(); err != nil {
 		return transport{}, err
 	}
+	if err := cfg.ApplyDeploymentAuth(); err != nil {
+		return transport{}, fmt.Errorf("loading daemon auth: %w", err)
+	}
+	// cfg.NoDaemonAutostart applies the AGENTSVIEW_NO_DAEMON rule to this
+	// invocation only, without touching the process environment.
+	autostartDisabled := daemonAutostartDisabled() || cfg.NoDaemonAutostart || cfg.RequireDaemon
 	if (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
 		waitTimeout <= 0 {
 		waitTimeout = backgroundAutoStartReadyTimeout
@@ -240,13 +285,14 @@ func ensureTransportContext(
 		}
 	}
 	if tr.Mode == transportHTTP {
-		if (intent == transportIntentRead ||
+		if allowReplacement && (intent == transportIntentRead ||
 			intent == transportIntentArchiveWrite) &&
-			shouldUpgradeDaemonRuntime(tr.Runtime, version) {
-			if daemonAutostartDisabled() {
+			shouldReplaceDaemonRuntime(tr.Runtime, version) {
+			if autostartDisabled {
 				if intent == transportIntentRead {
-					return transport{}, appendDaemonRestartUpgradeHint(
-						errors.New("daemon restart required: running daemon is older than this client"),
+					return transport{}, errors.New(
+						"daemon restart required: running daemon version differs from this client; " +
+							"run `agentsview daemon restart` or unset AGENTSVIEW_NO_DAEMON to allow automatic replacement",
 					)
 				}
 				return tr, nil
@@ -256,7 +302,7 @@ func ensureTransportContext(
 			}
 			cfg.NoSync = cfg.NoSync || tr.Runtime.NoSync
 			rt, err := startBackgroundServeForTransport(
-				ctx, cfg, waitTimeout,
+				ctx, cfg, waitTimeout, allowReplacement,
 			)
 			if err != nil {
 				return transport{}, err
@@ -265,18 +311,21 @@ func ensureTransportContext(
 		}
 		return tr, nil
 	}
-	if (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
-		!daemonAutostartDisabled() {
+	if !allowReplacement && tr.DirectIncompatible {
+		return transport{}, longLivedDaemonCompatibilityError(errors.New(tr.DirectReason))
+	}
+	if allowReplacement && (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
+		!autostartDisabled {
 		if rt, err := FindIncompatibleDaemonRuntime(
 			cfg.DataDir, cfg.AuthToken,
 		); err != nil && rt != nil &&
-			shouldUpgradeIncompatibleDaemonRuntime(rt, version) {
+			shouldReplaceIncompatibleDaemonRuntime(rt, version) {
 			if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 				return transport{}, err
 			}
 			cfg.NoSync = cfg.NoSync || rt.NoSync
 			rt, err := startBackgroundServeForTransport(
-				ctx, cfg, waitTimeout,
+				ctx, cfg, waitTimeout, allowReplacement,
 			)
 			if err != nil {
 				return transport{}, err
@@ -285,13 +334,13 @@ func ensureTransportContext(
 		}
 	}
 	if intent == transportIntentRead {
-		if daemonAutostartDisabled() {
-			return transport{}, errors.New(
-				"daemon autostart is disabled; direct SQLite reads are " +
-					"not supported for this command. Start a daemon with " +
-					"`agentsview daemon start` or unset " +
+		if autostartDisabled {
+			return transport{}, cliUnavailableError(errors.New(
+				"daemon autostart is disabled; direct SQLite reads are "+
+					"not supported for this command. Start a daemon with "+
+					"`agentsview daemon start` or unset "+
 					"AGENTSVIEW_NO_DAEMON",
-			)
+			), "run `agentsview daemon start`, then retry; unset AGENTSVIEW_NO_DAEMON only if this command should start a daemon automatically")
 		}
 		if tr.DirectReadOnly {
 			if tr.DirectReason != "" {
@@ -307,13 +356,13 @@ func ensureTransportContext(
 		if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 			return transport{}, err
 		}
-		rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout)
+		rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout, allowReplacement)
 		if err != nil {
 			return transport{}, err
 		}
 		return transportFromRuntime(rt), nil
 	}
-	if daemonAutostartDisabled() {
+	if autostartDisabled {
 		if tr.DirectIncompatible {
 			// AGENTSVIEW_NO_DAEMON never replaces a live daemon, so a
 			// client that cannot talk to the one it found has no path
@@ -341,7 +390,7 @@ func ensureTransportContext(
 	if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 		return transport{}, err
 	}
-	rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout)
+	rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout, allowReplacement)
 	if err != nil {
 		return transport{}, err
 	}
@@ -374,7 +423,7 @@ func waitForBackgroundLaunchBeforeArchiveWrite(
 	}
 	started := time.Now()
 	deadline := started.Add(waitTimeout)
-	progress := daemonLaunchProgressWriter{w: os.Stderr}
+	progress := daemonLaunchProgressWriter{w: daemonProgressWriter(ctx)}
 	var lastUpdate time.Time
 	for isBackgroundLaunchActive(dataDir) {
 		if backgroundServeProbeHook != nil {
@@ -406,29 +455,44 @@ func waitForBackgroundLaunchBeforeArchiveWrite(
 	return true, ctx.Err()
 }
 
-func shouldUpgradeDaemonRuntime(rt *DaemonRuntime, currentVersion string) bool {
-	if rt == nil || rt.ReadOnly {
+func shouldReplaceDaemonRuntime(rt *DaemonRuntime, currentVersion string) bool {
+	if rt == nil || rt.ReadOnly || rt.Record.Version == currentVersion {
 		return false
 	}
-	if update.IsDevBuildVersion(currentVersion) {
-		return false
-	}
-	if rt.Record.Version == "" {
+	// Development versions cannot reliably be ordered across branches.
+	if update.IsDevBuildVersion(currentVersion) || update.IsDevBuildVersion(rt.Record.Version) ||
+		strings.HasSuffix(currentVersion, "-dirty") || strings.HasSuffix(rt.Record.Version, "-dirty") {
 		return true
 	}
 	return update.IsNewer(currentVersion, rt.Record.Version)
 }
 
-func shouldUpgradeIncompatibleDaemonRuntime(
+type longLivedCompatibilityError struct{ cause error }
+
+func (e *longLivedCompatibilityError) Unwrap() error { return e.cause }
+
+func (e *longLivedCompatibilityError) Error() string {
+	return fmt.Sprintf("%v\n\nThis long-running client cannot use the running daemon and will not replace it. "+
+		"Restart this command with the current agentsview binary (`mcp`, `pg push --watch`, "+
+		"`duckdb push --watch`, or the installed push service). If the daemon still needs "+
+		"replacement, run `agentsview daemon restart` from that install", e.cause)
+}
+
+func longLivedDaemonCompatibilityError(err error) error {
+	return &longLivedCompatibilityError{cause: err}
+}
+
+func shouldReplaceIncompatibleDaemonRuntime(
 	rt *DaemonRuntime, currentVersion string,
 ) bool {
 	if rt == nil {
 		return false
 	}
-	if !shouldUpgradeDaemonRuntime(rt, currentVersion) {
+	if !shouldReplaceDaemonRuntime(rt, currentVersion) {
 		return false
 	}
-	if rt.API > daemonAPIVersion || rt.Data > db.CurrentDataVersion() {
+	// Restarting replaces the HTTP API, but cannot downgrade the archive.
+	if rt.Data > db.CurrentDataVersion() {
 		return false
 	}
 	return true
@@ -443,9 +507,13 @@ func daemonRuntimeAhead(rt *DaemonRuntime) bool {
 }
 
 func guardDaemonAutoStartConfig(cfg config.Config) error {
-	host := strings.TrimSpace(cfg.Host)
-	if host == "" || cfg.RequireAuth || isLoopbackHost(host) {
-		return nil
+	effective, err := config.LoadReadOnlyAt(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("loading daemon configuration: %w", err)
+	}
+	host := strings.TrimSpace(effective.Host)
+	if host == "" || effective.RequireAuth || isLoopbackHost(host) {
+		return validateServeConfig(effective)
 	}
 	return fmt.Errorf(
 		"refusing to auto-start an unauthenticated daemon on non-loopback "+
@@ -528,7 +596,7 @@ func newService(ctx context.Context,
 				"opening db: %w", err,
 			)
 		}
-		closeVectorSearcher := installDirectVectorSearcher(cfg, d)
+		closeVectorSearcher := installDirectVectorSearcher(ctx, cfg, d)
 		cleanup := func() {
 			if closeVectorSearcher != nil {
 				if cerr := closeVectorSearcher(); cerr != nil {
@@ -539,7 +607,10 @@ func newService(ctx context.Context,
 		}
 		// engine is nil — CLI reads don't need it, and Sync
 		// is handled via the HTTP daemon when one is running.
-		return service.NewDirectBackend(d, nil), cleanup, nil
+		return service.NewDirectBackend(
+			d, nil, service.WithModelGroups(service.NewModelGroups(cfg.ModelAliases)),
+			service.WithConfiguredDocbank(cfg),
+		), cleanup, nil
 	}
 }
 
@@ -568,13 +639,13 @@ func appendDaemonCompatibilityHint(tr transport, err error) error {
 // configured PostgreSQL sync store. It shares the same store
 // construction path as pg serve, but leaves schema repair/migration
 // to pg push/serve because CLI read commands never mutate PG. Like
-// pg serve, it runs the PG vector gate so `session search --pg
+// pg serve, it runs the replica vector gate so `session search --pg
 // --semantic|--hybrid` and `mcp --pg` get the same semantic search
 // the SQLite direct path wires via installDirectVectorSearcher.
 func newPGReadService(
-	cfg config.Config, pgCfg config.PGConfig,
+	ctx context.Context, cfg config.Config, pgCfg config.PGConfig,
 ) (service.SessionService, func(), error) {
-	store, cleanup, err := openPGReadStore(cfg, pgCfg)
+	store, cleanup, err := openPGReadStore(ctx, cfg, pgCfg)
 	if err != nil {
 		if cleanup != nil {
 			cleanup()
@@ -586,6 +657,9 @@ func newPGReadService(
 			priced.SetCustomPricing(cfg.CustomModelPricing)
 		}
 	}
-	wirePGReadVectorSearchFn(cfg, store)
-	return service.NewReadOnlyBackend(store), cleanup, nil
+	wireReplicaReadVectorSearchFn(ctx, cfg, pgReplica{}, store)
+	return service.NewReadOnlyBackend(
+		store, service.WithModelGroups(service.NewModelGroups(cfg.ModelAliases)),
+		service.WithConfiguredDocbank(cfg),
+	), cleanup, nil
 }

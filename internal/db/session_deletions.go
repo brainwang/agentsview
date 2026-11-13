@@ -11,26 +11,53 @@ import (
 
 const archiveMetadataSessionDeletionRevisionKey = "session_deletion_publication_revision"
 
+// Install after column migrations so older archives gain the referenced columns first.
+const sessionClassificationJournalTriggerSQL = `
+DROP TRIGGER IF EXISTS trg_sessions_classification_journal_update;
+CREATE TRIGGER trg_sessions_classification_journal_update
+AFTER UPDATE OF relationship_type, is_automated ON sessions
+WHEN OLD.relationship_type IS NOT NEW.relationship_type OR OLD.is_automated IS NOT NEW.is_automated
+BEGIN
+ INSERT INTO archive_metadata (key, value)
+  VALUES ('session_deletion_publication_revision', '1')
+ ON CONFLICT(key) DO UPDATE SET
+  value = CAST(value AS INTEGER) + 1,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
+ INSERT INTO session_deletion_changes (session_id, project, revision, deleted)
+  SELECT NEW.id, NEW.project, CAST(value AS INTEGER), 0
+  FROM archive_metadata WHERE key = 'session_deletion_publication_revision'
+ ON CONFLICT(session_id) DO UPDATE SET
+  project = excluded.project, revision = excluded.revision, deleted = 0;
+END;`
+
 // SessionDeletionPublicationRevision is an O(1) change token for hard
-// session deletions, advanced by SQLite triggers.
+// session deletions and repairs, advanced by triggers.
 func (db *DB) SessionDeletionPublicationRevision(ctx context.Context) (int64, error) {
+	return db.archiveJournalRevision(ctx, archiveMetadataSessionDeletionRevisionKey, "session deletion publication")
+}
+
+func (db *DB) archiveJournalRevision(ctx context.Context, key, description string) (int64, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	return archiveJournalRevision(ctx, db.getReader(), key, description)
+}
+
+func archiveJournalRevision(ctx context.Context, q sessionExportQuerier, key, description string) (int64, error) {
 	var raw string
-	err := db.getReader().QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT value FROM archive_metadata WHERE key = ?`,
-		archiveMetadataSessionDeletionRevisionKey,
+		key,
 	).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("reading session deletion publication revision: %w", err)
+		return 0, fmt.Errorf("reading %s revision: %w", description, err)
 	}
 	revision, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil || revision < 0 {
-		return 0, fmt.Errorf("invalid session deletion publication revision %q", raw)
+		return 0, fmt.Errorf("invalid %s revision %q", description, raw)
 	}
 	return revision, nil
 }
@@ -87,6 +114,59 @@ func (db *DB) LoadSessionDeletionDelta(
 		return nil, fmt.Errorf("iterating session deletion tombstones: %w", err)
 	}
 	return tombstones, nil
+}
+
+// LoadSessionDeletionChanges returns the IDs of every session journaled in
+// (afterRevision, throughRevision], whether it was deleted, reinserted, or repaired.
+func (db *DB) LoadSessionDeletionChanges(
+	ctx context.Context, afterRevision, throughRevision int64,
+) ([]string, error) {
+	return db.loadSessionJournalChanges(ctx, "session_deletion_changes", "session deletion", afterRevision, throughRevision)
+}
+
+// table is an internal schema name, never caller-supplied input.
+func (db *DB) loadSessionJournalChanges(
+	ctx context.Context, table, description string, afterRevision, throughRevision int64,
+) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if afterRevision < 0 || throughRevision < afterRevision {
+		return nil, fmt.Errorf(
+			"invalid %s publication window (%d, %d]",
+			description, afterRevision, throughRevision,
+		)
+	}
+	return loadSessionJournalChanges(ctx, db.getReader(), table, description, afterRevision, throughRevision)
+}
+
+func loadSessionJournalChanges(ctx context.Context, q sessionExportQuerier, table, description string, afterRevision, throughRevision int64) ([]string, error) {
+	if afterRevision == throughRevision {
+		return nil, nil
+	}
+	where, args := sessionDeletionPublicationChangeWhere("c", afterRevision, throughRevision, nil, nil)
+	rows, err := q.QueryContext(ctx, `
+		SELECT c.session_id
+		FROM `+table+` c
+		`+where+`
+		ORDER BY c.revision`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing %s changes: %w", description, err)
+	}
+	defer rows.Close()
+
+	var sessionIDs []string
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			return nil, fmt.Errorf("scanning %s change: %w", description, err)
+		}
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating %s changes: %w", description, err)
+	}
+	return sessionIDs, nil
 }
 
 func sessionDeletionPublicationChangeWhere(

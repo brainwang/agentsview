@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,99 @@ import (
 
 	"go.kenn.io/agentsview/internal/parser"
 )
+
+func TestHeadlessClassificationRepairOnOpen(t *testing.T) {
+	d := testDB(t)
+	for _, tc := range []struct {
+		id, prompt, kind, relationship string
+		parent                         *string
+	}{
+		{"plain", "Explain this function.", "non-interactive", "", nil},
+		{"script", "You are a code reviewer. Review this change.", "non-interactive", "", nil},
+		{"child", "Explain this function.", "non-interactive", "", Ptr("plain")},
+		{"fork", "Explain this function.", "non-interactive", "fork", nil},
+		{"review", "Explain this function.", "roborev", "", nil},
+	} {
+		insertSession(t, d, tc.id, "project-a", func(s *Session) {
+			s.Agent = "codex"
+			s.FirstMessage = Ptr(tc.prompt)
+			s.SessionKind = tc.kind
+			s.RelationshipType = tc.relationship
+			s.ParentSessionID = tc.parent
+			s.UserMessageCount = 1
+		})
+	}
+	_, err := d.getWriter().Exec(t.Context(), `DROP TRIGGER trg_sessions_classification_journal_update`)
+	require.NoError(t, err)
+	_, err = d.getWriter().Exec(t.Context(), `UPDATE sessions SET relationship_type = '' WHERE id IN ('plain', 'script')`)
+	require.NoError(t, err)
+	_, err = d.getWriter().Exec(t.Context(), `UPDATE sessions SET is_automated = 1, local_modified_at = '2000-01-01T00:00:00.000Z'`)
+	require.NoError(t, err)
+	_, err = d.getWriter().Exec(t.Context(), `UPDATE stats SET value = 'old-classifier' WHERE key = ?`, ClassifierHashKey)
+	require.NoError(t, err)
+	path := d.Path()
+	require.NoError(t, d.Close())
+	reopened, err := Open(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	for _, tc := range []struct {
+		id, relationship string
+		automated        bool
+	}{
+		{"plain", "subagent", false},
+		{"script", "subagent", true},
+		{"child", "", false},
+		{"fork", "fork", false},
+		{"review", "", true},
+	} {
+		stored, err := reopened.GetSessionFull(t.Context(), tc.id)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, tc.relationship, stored.RelationshipType, tc.id)
+		assert.Equal(t, tc.automated, stored.IsAutomated, tc.id)
+		if tc.relationship == "subagent" {
+			require.NotNil(t, stored.LocalModifiedAt)
+			assert.Greater(t, *stored.LocalModifiedAt, "2000-01-01T00:00:00.000Z")
+		}
+	}
+
+	revision, err := reopened.SessionDeletionPublicationRevision(t.Context())
+	require.NoError(t, err)
+	changes, err := reopened.LoadSessionDeletionChanges(t.Context(), 0, revision)
+	require.NoError(t, err)
+	assert.Contains(t, changes, "plain")
+	assert.Contains(t, changes, "script")
+	_, err = reopened.getWriter().Exec(t.Context(), `UPDATE sessions SET relationship_type = '' WHERE id = 'plain'`)
+	require.NoError(t, err)
+	require.NoError(t, reopened.Close())
+	reopened, err = Open(t.Context(), path)
+	require.NoError(t, err)
+	defer reopened.Close()
+	stored, err := reopened.GetSession(t.Context(), "plain")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "subagent", stored.RelationshipType, "matching-hash audits repair late arrivals")
+}
+
+func TestIncrementalAppendPreservesRoborevTag(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "review", "project-a", func(s *Session) {
+		s.Agent = "codex"
+		s.SessionKind = parser.SessionKindRoborev
+		s.FirstMessage = Ptr("Inspect this change.")
+		s.MessageCount = 1
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d, Message{SessionID: "review", Ordinal: 0, Role: "user", Content: "Inspect this change."})
+	_, err := d.WriteSessionIncremental(t.Context(), "review", []Message{
+		{SessionID: "review", Ordinal: 1, Role: "user", Content: "Explain the finding."},
+	}, IncrementalSessionUpdate{MsgCount: 2, UserMsgCount: 2, NextOrdinal: 2})
+	require.NoError(t, err)
+	stored, err := d.GetSession(t.Context(), "review")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.True(t, stored.IsAutomated)
+}
 
 func TestAutomationVerdictFromPrefix(t *testing.T) {
 	SetUserAutomationPrefixes([]string{"Custom automation:"})
@@ -135,8 +229,12 @@ func TestBackfillIsAutomatedMatchingHashBoundsTextAllocations(t *testing.T) {
 		b.Helper()
 		b.ReportAllocs()
 		for range b.N {
+			b.StopTimer()
+			_, err := d.getWriter().Exec(t.Context(), `UPDATE sessions SET automation_audit = 1`)
+			require.NoError(t, err)
+			b.StartTimer()
 			d.mu.Lock()
-			err := d.backfillIsAutomatedLocked(t.Context(), d.getWriter())
+			err = d.backfillIsAutomatedLocked(t.Context(), d.getWriter())
 			d.mu.Unlock()
 			if err != nil {
 				require.NoError(t, err)
@@ -159,6 +257,138 @@ func TestBackfillIsAutomatedMatchingHashBoundsTextAllocations(t *testing.T) {
 		require.NotNil(t, session, "missing %s", id)
 		assert.Equal(t, want, session.IsAutomated, id)
 	}
+}
+
+func TestBackfillIsAutomatedFreshArchiveQueryPlans(t *testing.T) {
+	d := testDB(t)
+	seedAutomationAuditRows(t, d, 2000, 64)
+	require.NoError(t, d.backfillIsAutomatedLocked(t.Context(), d.getWriter()))
+	var stale int
+	require.NoError(t, d.getWriter().QueryRow(t.Context(),
+		`SELECT count(*) FROM sessions WHERE automation_audit = 1`).Scan(&stale))
+	require.Zero(t, stale)
+	_, err := d.getWriter().Exec(t.Context(), `ANALYZE`)
+	require.NoError(t, err)
+
+	plan := queryPlanOf(t, d, auditAutomatedMatchingHashSQL,
+		automationAuditPrefixBytes, automationAuditPrefixBytes)
+	t.Logf("audit plan:\n%s", plan)
+	assert.Contains(t, plan, "idx_sessions_automation_audit")
+	assert.NotContains(t, plan, "SCAN s")
+	plan = queryPlanOf(t, d, clearAutomationAuditSQL)
+	t.Logf("clear plan:\n%s", plan)
+	assert.Contains(t, plan, "idx_sessions_automation_audit")
+	assert.NotContains(t, plan, "SCAN sessions")
+}
+
+func TestBackfillIsAutomatedRechecksChangedRows(t *testing.T) {
+	const reviewPrompt = "You are a code reviewer. Review the code."
+	for _, tc := range []struct {
+		name   string
+		change func(*testing.T, *DB)
+	}{
+		{"first message", func(t *testing.T, d *DB) {
+			t.Helper()
+			_, err := d.getWriter().Exec(t.Context(),
+				`UPDATE sessions SET first_message = ? WHERE id = 'changed'`, reviewPrompt)
+			require.NoError(t, err)
+		}},
+		{"import", func(t *testing.T, d *DB) {
+			t.Helper()
+			_, err := d.getWriter().Exec(t.Context(), `
+				INSERT INTO sessions(id, project, agent, first_message, user_message_count, is_automated)
+				VALUES ('imported', 'project-a', 'claude', ?, 1, 0)`, reviewPrompt)
+			require.NoError(t, err)
+		}},
+		{"transcript replacement", func(t *testing.T, d *DB) {
+			t.Helper()
+			require.NoError(t, d.ReplaceSessionMessages(t.Context(), "changed",
+				[]Message{userMsg("changed", 0, "Explain another function.")}))
+			var state int
+			require.NoError(t, d.getWriter().QueryRow(t.Context(),
+				`SELECT automation_audit FROM sessions WHERE id = 'changed'`).Scan(&state))
+			assert.Equal(t, 1, state, "transcript replacement invalidates the audit")
+		}},
+		{"automation flag corruption", func(t *testing.T, d *DB) {
+			t.Helper()
+			_, err := d.getWriter().Exec(t.Context(),
+				`UPDATE sessions SET first_message = ? WHERE id = 'changed'`, reviewPrompt)
+			require.NoError(t, err)
+			require.NoError(t, d.backfillIsAutomatedLocked(t.Context(), d.getWriter()))
+			session, err := d.GetSession(t.Context(), "changed")
+			require.NoError(t, err)
+			require.NotNil(t, session)
+			require.True(t, session.IsAutomated)
+			_, err = d.getWriter().Exec(t.Context(), `UPDATE sessions SET is_automated = 0 WHERE id = 'changed'`)
+			require.NoError(t, err)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "changed", "project-a", func(s *Session) {
+				s.FirstMessage = Ptr("Explain this function.")
+				s.UserMessageCount = 1
+			})
+			if tc.name == "transcript replacement" {
+				insertMessages(t, d, userMsg("changed", 0, "Explain this function."))
+			}
+			require.NoError(t, d.backfillIsAutomatedLocked(t.Context(), d.getWriter()))
+			tc.change(t, d)
+			require.NoError(t, d.backfillIsAutomatedLocked(t.Context(), d.getWriter()))
+			id := "changed"
+			if tc.name == "import" {
+				id = "imported"
+			}
+			if tc.name != "transcript replacement" {
+				session, err := d.GetSession(t.Context(), id)
+				require.NoError(t, err)
+				require.NotNil(t, session)
+				assert.True(t, session.IsAutomated)
+			}
+			var state int
+			require.NoError(t, d.getWriter().QueryRow(t.Context(),
+				`SELECT automation_audit FROM sessions WHERE id = ?`, id).Scan(&state))
+			assert.Equal(t, 0, state)
+		})
+	}
+}
+
+func TestMigration_AutomationAudit(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "legacy", "project-a", func(s *Session) {
+		s.FirstMessage = Ptr("You are a code reviewer. Review the code.")
+		s.UserMessageCount = 1
+	})
+	path := d.Path()
+	require.NoError(t, d.Close())
+	conn, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = conn.ExecContext(t.Context(), `
+		DROP TRIGGER trg_sessions_automation_audit;
+		DROP INDEX idx_sessions_automation_audit;
+		ALTER TABLE sessions DROP COLUMN automation_audit;
+		UPDATE sessions SET is_automated = 0 WHERE id = 'legacy'`)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	d, err = Open(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	session, err := d.GetSession(t.Context(), "legacy")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.True(t, session.IsAutomated, "upgrade audits existing rows despite the matching hash")
+	var objects int
+	require.NoError(t, d.getWriter().QueryRow(t.Context(), `
+		SELECT count(*) FROM sqlite_master
+		WHERE (type = 'index' AND name = 'idx_sessions_automation_audit')
+		   OR (type = 'trigger' AND name = 'trg_sessions_automation_audit')`).Scan(&objects))
+	assert.Equal(t, 2, objects)
+	var state int
+	require.NoError(t, d.getWriter().QueryRow(t.Context(),
+		`SELECT automation_audit FROM sessions WHERE id = 'legacy'`).Scan(&state))
+	assert.Equal(t, 0, state, "the upgrade audit leaves corrected rows fresh")
 }
 
 func TestBackfillIsAutomatedBidirectional(t *testing.T) {
@@ -692,7 +922,7 @@ func TestBackfillFixesOrphanCopyClassificationGap(t *testing.T) {
 	defer dstDB.Close()
 
 	// 3. Copy orphan rows (mirrors ResyncAll line ~954).
-	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	count, err := dstDB.CopyOrphanedDataFrom(t.Context(), srcPath)
 	require.NoError(t, err, "CopyOrphanedDataFrom")
 	require.Equal(t, 1, count, "expected 1 orphan")
 

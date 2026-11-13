@@ -28,17 +28,21 @@ func TestManifestSessionMatchesDBSessionWireFormat(t *testing.T) {
 
 	var sess db.Session
 	populateWireFixture(t, reflect.ValueOf(&sess).Elem(), 1)
+	require.Len(t, sess.ParentSessionIDs, 2)
+	require.NotEqual(t, sess.ParentSessionIDs[0], sess.ParentSessionIDs[1])
 
 	// Deliberate parity exemptions: quality_signals is hoisted to the
 	// manifest-level session_quality_signals field because db.Session's
 	// pointer is load-path-transient (see the manifestSession struct
-	// comment). project_assigned records database-only assignment provenance;
-	// the selected project itself is already carried by the project field.
-	// The reference for parity excludes both fields.
+	// comment). project_assigned records database-only assignment provenance,
+	// and ParentSessionIDs and SourceMachines describe hosted read context.
+	// The selected project and scalar ParentSessionID retain their existing wire contracts.
 	reference := sess
 	reference.QualitySignals = nil
 	// Browser links belong to a client connection, not archived content.
 	reference.WebURL = ""
+	reference.ParentSessionIDs = nil
+	reference.SourceMachines = nil
 	type sessionAlias db.Session
 	artifactReference := func(s db.Session) ([]byte, error) {
 		data, err := canonicalJSON(sessionAlias(s))
@@ -50,6 +54,9 @@ func TestManifestSessionMatchesDBSessionWireFormat(t *testing.T) {
 			return nil, err
 		}
 		delete(fields, "project_assigned")
+		// Labels are user-owned archive metadata, like stars; they stay with
+		// the archive that recorded them.
+		delete(fields, "labels")
 		return canonicalJSON(fields)
 	}
 
@@ -60,10 +67,18 @@ func TestManifestSessionMatchesDBSessionWireFormat(t *testing.T) {
 	assert.Equal(t, string(want), string(got),
 		"manifestSession must serialize byte-identically to db.Session minus database-only and transient fields")
 
-	withoutPointer, err := canonicalJSON(manifestSessionFromDB(reference))
+	withoutReadMetadata, err := canonicalJSON(manifestSessionFromDB(reference))
 	require.NoError(t, err)
-	assert.Equal(t, string(got), string(withoutPointer),
-		"manifest bytes must not depend on the transient quality_signals or web_url")
+	assert.Equal(t, string(got), string(withoutReadMetadata),
+		"manifest bytes must not depend on the transient quality_signals, web_url, hosted plural parents, or source machines")
+
+	for _, parents := range [][]string{nil, {}, {"other-parent-a", "other-parent-b"}} {
+		changed := sess
+		changed.ParentSessionIDs = parents
+		wire, err := canonicalJSON(manifestSessionFromDB(changed))
+		require.NoError(t, err)
+		assert.Equal(t, string(got), string(wire), "hosted parent context must not rehash artifacts")
+	}
 
 	roundTrip, err := artifactReference(manifestSessionFromDB(sess).dbSession())
 	require.NoError(t, err)
@@ -122,6 +137,12 @@ func setWireFixtureValue(t *testing.T, field reflect.Value, n int) {
 		elem := reflect.New(field.Type().Elem())
 		setWireFixtureValue(t, elem.Elem(), n)
 		field.Set(elem)
+	case reflect.Slice:
+		values := reflect.MakeSlice(field.Type(), 2, 2)
+		for i := range values.Len() {
+			setWireFixtureValue(t, values.Index(i), n*10+i)
+		}
+		field.Set(values)
 	case reflect.Struct:
 		populateWireFixture(t, field, n*10)
 	default:

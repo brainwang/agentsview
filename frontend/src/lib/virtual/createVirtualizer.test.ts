@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { mount, unmount, tick } from "svelte";
+import { controlFrames } from "../test/frames.js";
+import { realVirtualizer } from "../test/virtualizer.js";
+import { cancelScrollReconcile } from "./createVirtualizer.svelte.js";
 // @ts-ignore
 import VirtualizerTest from "./VirtualizerTest.svelte";
 
@@ -31,6 +34,7 @@ vi.mock("@tanstack/virtual-core", async () => {
         lastOptions.value = opts;
       }
       _willUpdate() {}
+      cancelScroll() {}
     },
     observeElementOffset: vi.fn(),
     observeElementRect: vi.fn(),
@@ -39,6 +43,31 @@ vi.mock("@tanstack/virtual-core", async () => {
     observeWindowRect: vi.fn(),
     windowScroll: vi.fn(),
   };
+});
+
+it("cancels TanStack index reconciliation before a preceding row is measured", async () => {
+  const { Virtualizer } =
+    await vi.importActual<typeof import("@tanstack/virtual-core")>("@tanstack/virtual-core");
+  const { flushFrames } = controlFrames();
+  const { instance, element, cleanup } = realVirtualizer(Virtualizer, { count: 10, height: 200 });
+  try {
+    instance.scrollToIndex(1, { align: "start" });
+    expect(element.scrollTop).toBe(100);
+    cancelScrollReconcile(instance);
+    // At the top, default size anchoring cannot mask a stale index reconcile.
+    element.scrollTop = 0;
+    instance.resizeItem(0, 300);
+    instance.getVirtualItems();
+    flushFrames();
+    flushFrames();
+
+    expect(instance.getOffsetForIndex(1, "start")?.[0]).toBe(300);
+    expect(element.scrollTop).toBe(0);
+    expect(instance.scrollOffset).toBe(0);
+  } finally {
+    cleanup();
+    vi.unstubAllGlobals();
+  }
 });
 
 describe("initialOffset semantics", () => {
@@ -241,6 +270,36 @@ describe("createVirtualizer reactivity", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
+
+  it.each(["element", "window"] as const)(
+    "readers see new options even when TanStack does not notify ($type virtualizer)",
+    async (type) => {
+      // The mocked instance never calls onChange, like TanStack when a new
+      // count leaves the rendered index range unchanged.
+      const onInstanceChange = vi.fn();
+      const scrollDiv = document.createElement("div");
+      const options = (count: number) => ({
+        count,
+        getScrollElement: () => scrollDiv,
+        estimateSize: (): number => 50,
+      });
+      const component = mount(VirtualizerTest, {
+        target: document.createElement("div"),
+        props: { type, options: options(400), onInstanceChange },
+      });
+      await tick();
+      expect(onInstanceChange).toHaveBeenCalledTimes(1);
+
+      component.setOptions(options(90));
+      await tick();
+
+      expect(onInstanceChange).toHaveBeenCalledTimes(2);
+      const reread = onInstanceChange.mock.calls[1]![0] as { options: { count: number } };
+      expect(reread.options.count).toBe(90);
+
+      unmount(component);
+    },
+  );
 
   it.each([
     {

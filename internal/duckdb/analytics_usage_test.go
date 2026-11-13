@@ -5,229 +5,24 @@ package duckdb
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/readbase"
 	"go.kenn.io/agentsview/internal/storage"
+	"go.kenn.io/agentsview/internal/usagefacts"
 )
-
-// TestDuckBuildAnalyticsWhereSubagents verifies that the DuckDB
-// analytics WHERE builder mirrors the SQLite rule: when subagents are
-// counted, the relationship filter stops excluding them and the
-// one-shot exclusion exempts subagent rows (workflow subagents are
-// inherently one-shot). The exemption is hand-written DuckDB SQL, so
-// this guards its column qualification across prefixed/unprefixed
-// callers.
-func TestDuckBuildAnalyticsWhereSubagents(t *testing.T) {
-	t.Run("root-only default", func(t *testing.T) {
-		f := db.AnalyticsFilter{ExcludeOneShot: true}
-		where, _ := duckBuildAnalyticsWhere(f, "started_at", "", false, false)
-		assert.Contains(t, where,
-			"relationship_type NOT IN ('subagent', 'fork')")
-		assert.NotContains(t, where, "OR relationship_type = 'subagent'")
-	})
-
-	t.Run("include subagents, unprefixed", func(t *testing.T) {
-		f := db.AnalyticsFilter{ExcludeOneShot: true, IncludeSubagents: true}
-		where, _ := duckBuildAnalyticsWhere(f, "started_at", "", false, false)
-		assert.Contains(t, where, "relationship_type NOT IN ('fork')")
-		assert.NotContains(t, where, "NOT IN ('subagent'")
-		// One-shot exclusion exempts subagents.
-		assert.Contains(t, where, "OR relationship_type = 'subagent')")
-	})
-
-	t.Run("include subagents, prefixed columns stay qualified", func(t *testing.T) {
-		f := db.AnalyticsFilter{ExcludeOneShot: true, IncludeSubagents: true}
-		where, _ := duckBuildAnalyticsWhere(f, "s.started_at", "s.", false, false)
-		assert.Contains(t, where, "s.relationship_type NOT IN ('fork')")
-		assert.Contains(t, where, "OR s.relationship_type = 'subagent')")
-		// No unqualified relationship_type leaks through.
-		assert.False(t, strings.Contains(where, " relationship_type") ||
-			strings.HasPrefix(where, "relationship_type"),
-			"relationship_type must be table-qualified: %s", where)
-	})
-}
-
-func TestDuckAnalyticsAutomatedScopePredicates(t *testing.T) {
-	tests := []struct {
-		name    string
-		filter  db.AnalyticsFilter
-		want    string
-		notWant string
-	}{
-		{
-			name: "legacy exclude automated normalizes to human",
-			filter: db.AnalyticsFilter{
-				ExcludeAutomated: true,
-			},
-			want: "s.is_automated = FALSE",
-		},
-		{
-			name: "all scope suppresses legacy human filter",
-			filter: db.AnalyticsFilter{
-				AutomatedScope:   "all",
-				ExcludeAutomated: true,
-			},
-			notWant: "s.is_automated = FALSE",
-		},
-		{
-			name: "automated scope selects automated sessions",
-			filter: db.AnalyticsFilter{
-				AutomatedScope: "automated",
-			},
-			want:    "s.is_automated = TRUE",
-			notWant: "s.is_automated = FALSE",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sql, _ := duckBuildAnalyticsWhere(
-				tt.filter,
-				"COALESCE(s.started_at, s.created_at)",
-				"s.",
-				false,
-				false,
-			)
-			if tt.want != "" {
-				assert.Contains(t, sql, tt.want,
-					"DuckDB analytics SQL missing expected predicate")
-			}
-			if tt.notWant != "" {
-				assert.NotContains(t, sql, tt.notWant,
-					"DuckDB analytics SQL has unexpected predicate")
-			}
-		})
-	}
-}
-
-func TestDuckAnalyticsAutomatedScopeOneShotExemption(t *testing.T) {
-	sql, _ := duckBuildAnalyticsWhere(
-		db.AnalyticsFilter{
-			AutomatedScope: "automated",
-			ExcludeOneShot: true,
-		},
-		"COALESCE(s.started_at, s.created_at)",
-		"s.",
-		false,
-		false,
-	)
-	want := "(s.user_message_count > 1 OR s.is_automated = TRUE)"
-	assert.Contains(t, sql, want,
-		"DuckDB analytics SQL missing one-shot exemption")
-}
-
-func TestDuckAnalyticsModelFilterPredicates(t *testing.T) {
-	sql, _ := duckBuildAnalyticsWhere(
-		db.AnalyticsFilter{Model: "gpt-4o"},
-		"COALESCE(s.started_at, s.created_at)",
-		"s.",
-		false,
-		false,
-	)
-	assert.Contains(t, sql,
-		"EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id AND m.model = ?)")
-}
-
-func TestDuckAnalyticsModelAndHourUseSameMessagePredicate(t *testing.T) {
-	hour := 10
-	sql, _ := duckBuildAnalyticsWhere(
-		db.AnalyticsFilter{
-			Model: "gpt-4o",
-			Hour:  &hour,
-		},
-		"COALESCE(s.started_at, s.created_at)",
-		"s.",
-		false,
-		true,
-	)
-	assert.Contains(t, sql, "m.session_id = s.id")
-	assert.Contains(t, sql, "m.model = ?")
-	assert.Contains(t, sql, "CAST(strftime(")
-}
-
-func TestDuckUsageTerminationPredicate(t *testing.T) {
-	where, args := appendDuckUsageSessionFilterClauses(
-		"WHERE true",
-		nil,
-		db.UsageFilter{Termination: "clean,unclean"},
-		"",
-	)
-
-	assert.Contains(t, where, "s.termination_status = 'clean'")
-	assert.Contains(t, where, "s.termination_status IN ('tool_call_pending', 'truncated')")
-	assert.Contains(t, where, "COALESCE(s.ended_at, s.started_at, s.created_at) <= CAST(? AS TIMESTAMP)")
-	require.Len(t, args, 1)
-	_, ok := args[0].(string)
-	assert.True(t, ok, "termination cutoff should be bound as a timestamp string")
-}
-
-func TestDuckUsageProjectLabelsPreserveCommas(t *testing.T) {
-	where, args := appendDuckUsageSessionFilterClauses(
-		"WHERE true",
-		nil,
-		db.UsageFilter{
-			ProjectLabels:        []string{"team,core"},
-			ExcludeProjectLabels: []string{"other,group"},
-		},
-		"",
-	)
-
-	assert.Contains(t, where, "s.project = ?")
-	assert.Contains(t, where, "s.project != ?")
-	assert.Equal(t, []any{"team,core", "other,group"}, args)
-}
-
-func TestDuckUsageAutomatedScopePredicates(t *testing.T) {
-	tests := []struct {
-		name    string
-		filter  db.UsageFilter
-		want    string
-		notWant string
-	}{
-		{
-			name:   "legacy exclude automated normalizes to human",
-			filter: db.UsageFilter{ExcludeAutomated: true},
-			want:   "COALESCE(s.is_automated, FALSE) = FALSE",
-		},
-		{
-			name: "all scope suppresses legacy human filter",
-			filter: db.UsageFilter{
-				AutomatedScope:   "all",
-				ExcludeAutomated: true,
-			},
-			notWant: "COALESCE(s.is_automated, FALSE) = FALSE",
-		},
-		{
-			name:    "automated scope selects automated sessions",
-			filter:  db.UsageFilter{AutomatedScope: "automated"},
-			want:    "COALESCE(s.is_automated, FALSE) = TRUE",
-			notWant: "COALESCE(s.is_automated, FALSE) = FALSE",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			where, _ := appendDuckUsageSessionFilterClauses(
-				"WHERE true", nil, tt.filter, "")
-			if tt.want != "" {
-				assert.Contains(t, where, tt.want,
-					"DuckDB usage SQL missing expected predicate")
-			}
-			if tt.notWant != "" {
-				assert.NotContains(t, where, tt.notWant,
-					"DuckDB usage SQL has unexpected predicate")
-			}
-		})
-	}
-}
 
 func TestDuckUsageAggregateCostRecordsMixedReportedAndComputed(t *testing.T) {
 	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
@@ -567,54 +362,37 @@ func TestDuckUsageAggregateCostPrefersExactCustomKimiAlias(t *testing.T) {
 	assert.Equal(t, "kimi-for-coding", resolutions[0].PricedModel)
 }
 
-func TestDuckUsageAutomatedScopeOneShotExemption(t *testing.T) {
-	where, _ := appendDuckUsageSessionFilterClauses(
-		"WHERE true",
-		nil,
-		db.UsageFilter{AutomatedScope: "automated", ExcludeOneShot: true},
-		"",
-	)
-	assert.Contains(t, where,
-		"(s.user_message_count > 1 OR COALESCE(s.is_automated, FALSE) = TRUE)",
-		"DuckDB usage SQL missing non-human one-shot exemption")
-
-	humanWhere, _ := appendDuckUsageSessionFilterClauses(
-		"WHERE true",
-		nil,
-		db.UsageFilter{AutomatedScope: "human", ExcludeOneShot: true},
-		"",
-	)
-	assert.Contains(t, humanWhere, "AND s.user_message_count > 1",
-		"DuckDB usage human one-shot must be a plain threshold")
-	assert.NotContains(t, humanWhere,
-		"OR COALESCE(s.is_automated, FALSE) = TRUE",
-		"DuckDB usage human one-shot must not exempt automated sessions")
-}
-
 func TestDuckSignalMessagesFormatsTimestampValues(t *testing.T) {
-	ctx := t.Context()
-	store, _ := newSyncedStore(t)
-
-	_, err := store.duck.ExecContext(ctx, `
-		INSERT INTO messages (
-			id, session_id, ordinal, role, content, timestamp,
-			is_system, has_tool_use
-		) VALUES
-			(9101, 'signal-time', 0, 'user', 'with timestamp',
-			 CAST('2026-01-20T12:34:56Z' AS TIMESTAMP), FALSE, FALSE),
-			(9102, 'signal-time', 1, 'assistant', 'without timestamp',
-			 NULL, FALSE, FALSE)`)
-	require.NoError(t, err)
-
-	got, err := store.duckSignalMessages(
-		ctx,
-		[]db.SignalRow{{ID: "signal-time"}},
-		db.AnalyticsFilter{},
-	)
-	require.NoError(t, err)
-	require.Len(t, got["signal-time"], 2)
-	assert.Equal(t, "2026-01-20T12:34:56Z", got["signal-time"][0].Timestamp)
-	assert.Empty(t, got["signal-time"][1].Timestamp)
+	const sessionID = "signal-time"
+	for _, tt := range []struct {
+		name      string
+		timestamp string
+		want      string
+		ordinal   int
+	}{
+		{name: "timestamp", timestamp: "2026-01-20T12:00:00Z", want: "add a guard", ordinal: 2},
+		{name: "null timestamp", want: "initial substantive prompt longer than thirty characters", ordinal: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+				Session: syncSession(sessionID, "alpha", "initial", "2026-01-20T12:00:00Z", 3),
+				Messages: []db.Message{
+					syncMessage(sessionID, 0, "user", "initial substantive prompt longer than thirty characters", "2026-01-20T12:00:00Z"),
+					syncMessage(sessionID, 1, "assistant", "response", tt.timestamp),
+					syncMessage(sessionID, 2, "user", "add a guard", "2026-01-20T12:34:56Z"),
+				},
+				Signals:         db.SessionSignalUpdate{QualitySignals: db.QualitySignals{Version: db.CurrentQualitySignalVersion, ShortPromptCount: 1}},
+				DataVersion:     1,
+				ReplaceMessages: true,
+			}})
+			got, err := store.GetAnalyticsSignalSessions(t.Context(), db.AnalyticsFilter{}, "short_prompt_count", 10)
+			require.NoError(t, err)
+			require.Len(t, got.Sessions, 1)
+			assert.Equal(t, tt.want, got.Sessions[0].Excerpt)
+			require.NotNil(t, got.Sessions[0].MessageOrdinal)
+			assert.Equal(t, tt.ordinal, *got.Sessions[0].MessageOrdinal)
+		})
+	}
 }
 
 func TestDuckAnalyticsSignalSessionsModelFilterUsesMatchingMessages(
@@ -705,35 +483,151 @@ func TestDuckAnalyticsSignalSessionsModelFilterKeepsParserUserEvidence(
 	assert.Equal(t, 0, *resp.Sessions[0].MessageOrdinal)
 }
 
-func TestDuckAnalyticsSummaryModelFilterPopulatesModels(t *testing.T) {
-	ctx := t.Context()
-	start := "2024-06-01T09:00:00Z"
-	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{
-		{
-			Session: syncSession("duck-model-a", "alpha", "gpt", start, 1),
-			Messages: []db.Message{
-				duckModelMessage("duck-model-a", 0, "assistant", "gpt", start, "gpt-4o"),
+func TestDuckAnalyticsSummaryScopedModels(t *testing.T) {
+	t.Run("model_and_hour", func(t *testing.T) {
+		ctx := t.Context()
+
+		mixedSession := syncSession(
+			"duck-summary-output-mixed", "alpha", "mixed",
+			"2024-06-01T10:00:00Z", 2,
+		)
+		mixedSession.TotalOutputTokens = 111
+		mixedSession.HasTotalOutputTokens = true
+		mixedGpt := duckModelMessage(
+			"duck-summary-output-mixed", 0, "assistant", "gpt",
+			"2024-06-01T10:00:00Z", "gpt-4o",
+		)
+		mixedGpt.TokenUsage = []byte(`{"output_tokens":11}`)
+		mixedGpt.OutputTokens = 11
+		mixedGpt.HasOutputTokens = true
+		mixedClaude := duckModelMessage(
+			"duck-summary-output-mixed", 1, "assistant", "claude",
+			"2024-06-01T10:05:00Z", "claude-3-5-sonnet",
+		)
+		mixedClaude.TokenUsage = []byte(`{"output_tokens":100}`)
+		mixedClaude.OutputTokens = 100
+		mixedClaude.HasOutputTokens = true
+
+		uncoveredSession := syncSession(
+			"duck-summary-output-uncovered", "alpha", "mixed",
+			"2024-06-01T10:40:00Z", 2,
+		)
+		uncoveredSession.TotalOutputTokens = 90
+		uncoveredSession.HasTotalOutputTokens = true
+		uncoveredGpt := duckModelMessage(
+			"duck-summary-output-uncovered", 0, "assistant", "gpt",
+			"2024-06-01T10:40:00Z", "gpt-4o",
+		)
+		uncoveredGpt.TokenUsage = nil
+		uncoveredGpt.ContextTokens = 0
+		uncoveredGpt.OutputTokens = 0
+		uncoveredGpt.HasContextTokens = false
+		uncoveredGpt.HasOutputTokens = false
+		uncoveredClaude := duckModelMessage(
+			"duck-summary-output-uncovered", 1, "assistant", "claude",
+			"2024-06-01T10:45:00Z", "claude-3-5-sonnet",
+		)
+		uncoveredClaude.TokenUsage = []byte(`{"output_tokens":90}`)
+		uncoveredClaude.OutputTokens = 90
+		uncoveredClaude.HasOutputTokens = true
+
+		store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{
+			{
+				Session: mixedSession,
+				Messages: []db.Message{
+					mixedGpt,
+					mixedClaude,
+				},
+				DataVersion:     1,
+				ReplaceMessages: true,
 			},
-			DataVersion:     1,
-			ReplaceMessages: true,
-		},
-		{
-			Session: syncSession("duck-model-b", "alpha", "claude", start, 1),
-			Messages: []db.Message{
-				duckModelMessage("duck-model-b", 0, "assistant", "claude", start, "claude-3-5-sonnet"),
+			{
+				Session: uncoveredSession,
+				Messages: []db.Message{
+					uncoveredGpt,
+					uncoveredClaude,
+				},
+				DataVersion:     1,
+				ReplaceMessages: true,
 			},
-			DataVersion:     1,
-			ReplaceMessages: true,
-		},
+		})
+
+		hour := 10
+		resp, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
+			From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+			Model: "gpt-4o", Hour: &hour,
+		})
+		require.NoError(t, err, "GetAnalyticsSummary")
+		assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
+		assert.Equal(t, 11, resp.TotalOutputTokens, "TotalOutputTokens")
+		assert.Equal(t, 1, resp.TokenReportingSessions, "TokenReportingSessions")
+		assert.Equal(t, 2, resp.TotalSessions, "TotalSessions")
+		assert.Equal(t, 2, resp.TotalMessages, "TotalMessages")
 	})
 
-	resp, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
-		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
-		Model: "gpt-4o",
+	t.Run("hour_only", func(t *testing.T) {
+		ctx := t.Context()
+		store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{
+			{
+				Session: syncSession(
+					"duck-summary-hour-mixed", "alpha", "mixed",
+					"2024-06-01T09:00:00Z", 2,
+				),
+				Messages: []db.Message{
+					duckModelMessage(
+						"duck-summary-hour-mixed", 0, "assistant", "gpt",
+						"2024-06-01T09:05:00Z", "gpt-4o",
+					),
+					duckModelMessage(
+						"duck-summary-hour-mixed", 1, "assistant", "claude",
+						"2024-06-01T10:05:00Z", "claude-3-5-sonnet",
+					),
+				},
+				DataVersion:     1,
+				ReplaceMessages: true,
+			},
+		})
+
+		hour := 9
+		resp, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
+			From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+			Hour: &hour,
+		})
+		require.NoError(t, err, "GetAnalyticsSummary")
+		assert.Equal(t, 1, resp.TotalSessions, "TotalSessions")
+		assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
 	})
-	require.NoError(t, err, "GetAnalyticsSummary")
-	assert.Equal(t, 1, resp.TotalSessions, "TotalSessions")
-	assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
+
+	t.Run("model_only", func(t *testing.T) {
+		ctx := t.Context()
+		start := "2024-06-01T09:00:00Z"
+		store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{
+			{
+				Session: syncSession("duck-model-a", "alpha", "gpt", start, 1),
+				Messages: []db.Message{
+					duckModelMessage("duck-model-a", 0, "assistant", "gpt", start, "gpt-4o"),
+				},
+				DataVersion:     1,
+				ReplaceMessages: true,
+			},
+			{
+				Session: syncSession("duck-model-b", "alpha", "claude", start, 1),
+				Messages: []db.Message{
+					duckModelMessage("duck-model-b", 0, "assistant", "claude", start, "claude-3-5-sonnet"),
+				},
+				DataVersion:     1,
+				ReplaceMessages: true,
+			},
+		})
+
+		resp, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
+			From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+			Model: "gpt-4o",
+		})
+		require.NoError(t, err, "GetAnalyticsSummary")
+		assert.Equal(t, 1, resp.TotalSessions, "TotalSessions")
+		assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
+	})
 }
 
 func TestDuckAnalyticsMixedModelFilters(t *testing.T) {
@@ -785,122 +679,6 @@ func assertDuckAnalyticsSummaryModelFilterCountsOnlyMatchingMessages(
 	for _, summary := range resp.Agents {
 		assert.Equal(t, 1, summary.Messages, "AgentMessages")
 	}
-}
-
-func TestDuckAnalyticsSummaryModelsUseMatchingHourRowsOnly(t *testing.T) {
-	ctx := t.Context()
-	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{
-		{
-			Session: syncSession(
-				"duck-summary-hour-mixed", "alpha", "mixed",
-				"2024-06-01T09:00:00Z", 2,
-			),
-			Messages: []db.Message{
-				duckModelMessage(
-					"duck-summary-hour-mixed", 0, "assistant", "gpt",
-					"2024-06-01T09:05:00Z", "gpt-4o",
-				),
-				duckModelMessage(
-					"duck-summary-hour-mixed", 1, "assistant", "claude",
-					"2024-06-01T10:05:00Z", "claude-3-5-sonnet",
-				),
-			},
-			DataVersion:     1,
-			ReplaceMessages: true,
-		},
-	})
-
-	hour := 9
-	resp, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
-		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
-		Hour: &hour,
-	})
-	require.NoError(t, err, "GetAnalyticsSummary")
-	assert.Equal(t, 1, resp.TotalSessions, "TotalSessions")
-	assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
-}
-
-func TestDuckAnalyticsSummaryModelFilterUsesFilteredOutputTokens(
-	t *testing.T,
-) {
-	ctx := t.Context()
-
-	mixedSession := syncSession(
-		"duck-summary-output-mixed", "alpha", "mixed",
-		"2024-06-01T10:00:00Z", 2,
-	)
-	mixedSession.TotalOutputTokens = 111
-	mixedSession.HasTotalOutputTokens = true
-	mixedGpt := duckModelMessage(
-		"duck-summary-output-mixed", 0, "assistant", "gpt",
-		"2024-06-01T10:00:00Z", "gpt-4o",
-	)
-	mixedGpt.TokenUsage = []byte(`{"output_tokens":11}`)
-	mixedGpt.OutputTokens = 11
-	mixedGpt.HasOutputTokens = true
-	mixedClaude := duckModelMessage(
-		"duck-summary-output-mixed", 1, "assistant", "claude",
-		"2024-06-01T10:05:00Z", "claude-3-5-sonnet",
-	)
-	mixedClaude.TokenUsage = []byte(`{"output_tokens":100}`)
-	mixedClaude.OutputTokens = 100
-	mixedClaude.HasOutputTokens = true
-
-	uncoveredSession := syncSession(
-		"duck-summary-output-uncovered", "alpha", "mixed",
-		"2024-06-01T10:40:00Z", 2,
-	)
-	uncoveredSession.TotalOutputTokens = 90
-	uncoveredSession.HasTotalOutputTokens = true
-	uncoveredGpt := duckModelMessage(
-		"duck-summary-output-uncovered", 0, "assistant", "gpt",
-		"2024-06-01T10:40:00Z", "gpt-4o",
-	)
-	uncoveredGpt.TokenUsage = nil
-	uncoveredGpt.ContextTokens = 0
-	uncoveredGpt.OutputTokens = 0
-	uncoveredGpt.HasContextTokens = false
-	uncoveredGpt.HasOutputTokens = false
-	uncoveredClaude := duckModelMessage(
-		"duck-summary-output-uncovered", 1, "assistant", "claude",
-		"2024-06-01T10:45:00Z", "claude-3-5-sonnet",
-	)
-	uncoveredClaude.TokenUsage = []byte(`{"output_tokens":90}`)
-	uncoveredClaude.OutputTokens = 90
-	uncoveredClaude.HasOutputTokens = true
-
-	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{
-		{
-			Session: mixedSession,
-			Messages: []db.Message{
-				mixedGpt,
-				mixedClaude,
-			},
-			DataVersion:     1,
-			ReplaceMessages: true,
-		},
-		{
-			Session: uncoveredSession,
-			Messages: []db.Message{
-				uncoveredGpt,
-				uncoveredClaude,
-			},
-			DataVersion:     1,
-			ReplaceMessages: true,
-		},
-	})
-
-	hour := 10
-	resp, err := store.GetAnalyticsSummary(ctx, db.AnalyticsFilter{
-		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
-		Model: "gpt-4o", Hour: &hour,
-	})
-	require.NoError(t, err, "GetAnalyticsSummary")
-	assert.Equal(t, 2, resp.TotalSessions, "TotalSessions")
-	assert.Equal(t, 2, resp.TotalMessages, "TotalMessages")
-	assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
-	assert.Equal(t, 11, resp.TotalOutputTokens, "TotalOutputTokens")
-	assert.Equal(t, 1, resp.TokenReportingSessions, "TokenReportingSessions")
 }
 
 func assertDuckAnalyticsActivityModelFilterCountsOnlyMatchingMessages(
@@ -1219,6 +997,196 @@ func assertDuckAnalyticsToolsModelFilterCountsOnlyMatchingToolCalls(
 	assert.Equal(t, 1, byTool["Read"], "Read tool")
 	assert.Equal(t, 1, byTool["Skill"], "Skill tool")
 	assert.Zero(t, byTool["Grep"], "Grep tool")
+}
+
+func TestDuckAnalyticsToolEvidenceDatesAndLinks(t *testing.T) {
+	id := "duck-tool-evidence"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session: syncSession(id, "alpha", "evidence", "2025-06-01T23:59:00Z", 4),
+		Messages: []db.Message{
+			duckModelMessage(id, 2, "assistant", "read", "2025-06-01T23:59:00Z", "model-a", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 4, "assistant", "read", "2025-06-02T00:01:00Z", "model-b", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 5, "assistant", "read", "2025-06-02T00:30:00Z", "model-b", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 6, "assistant", "read", "2025-06-02T01:30:00Z", "model-b", db.ToolCall{ToolName: "Read", Category: "Read"}),
+		},
+		Signals: db.SessionSignalUpdate{
+			QualitySignals: db.QualitySignals{Version: db.CurrentQualitySignalVersion},
+			ToolObservations: []db.ToolObservation{
+				{MessageOrdinal: 2, Outcome: "empty"},
+				{MessageOrdinal: 4, Outcome: "empty"},
+				{MessageOrdinal: 5, Outcome: "empty"},
+				{MessageOrdinal: 6, Outcome: "empty"},
+			},
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	filter := db.AnalyticsFilter{Timezone: "UTC", ToolName: "Read", ToolCategory: "Read"}
+	response, err := store.GetAnalyticsSignalSessions(t.Context(), filter, "tool_empty_rate", 10)
+	require.NoError(t, err)
+	assert.Equal(t, new(1), response.Total)
+	require.Len(t, response.Sessions, 1)
+	assert.Equal(t, id, response.Sessions[0].SessionID)
+	assert.Equal(t, 4, response.Sessions[0].SignalTotal)
+	assert.Equal(t, "2025-06-02", response.Sessions[0].Date)
+	assert.Equal(t, new(2), response.Sessions[0].MessageOrdinal)
+	t.Run("localtime", func(t *testing.T) {
+		if _, err := time.LoadLocation("localtime"); err != nil {
+			t.Skip("host timezone database has no localtime entry")
+		}
+		localFilter := filter
+		localFilter.From, localFilter.To = "2025-06-01", "2025-06-02"
+		localFilter.Timezone = "localtime"
+		evidence, err := store.GetAnalyticsSignalSessions(t.Context(), localFilter, "tool_empty_rate", 10)
+		require.NoError(t, err)
+		require.Len(t, evidence.Sessions, 1)
+		assert.Equal(t, 4, evidence.Sessions[0].SignalTotal)
+		assert.Equal(t, new(2), evidence.Sessions[0].MessageOrdinal)
+	})
+	hour := 0
+	filter.Hour = &hour
+	response, err = store.GetAnalyticsSignalSessions(t.Context(), filter, "tool_empty_rate", 10)
+	require.NoError(t, err)
+	require.Len(t, response.Sessions, 1)
+	assert.Equal(t, 2, response.Sessions[0].SignalTotal)
+	assert.Equal(t, new(4), response.Sessions[0].MessageOrdinal)
+}
+
+func TestDuckToolsTimezoneDatabaseDisagreement(t *testing.T) {
+	if os.Getenv("DUCK_TZ_SKEW_TEST") == "1" {
+		id := "duck-tz-skew"
+		store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+			Session: syncSession(id, "alpha", "skew", "2025-03-09T21:59:00Z", 2),
+			Messages: []db.Message{
+				duckModelMessage(id, 0, "assistant", "read", "2025-03-09T21:59:00Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+				duckModelMessage(id, 1, "assistant", "read", "2025-03-09T22:01:00Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			},
+			Signals:     db.SessionSignalUpdate{QualitySignals: db.QualitySignals{Version: db.CurrentQualitySignalVersion}, ToolObservations: []db.ToolObservation{{MessageOrdinal: 0, Outcome: "empty"}, {MessageOrdinal: 1, Outcome: "empty"}}},
+			DataVersion: 1, ReplaceMessages: true,
+		}})
+		filter := db.AnalyticsFilter{From: "2025-03-09", To: "2025-03-10", Timezone: "America/New_York", ToolName: "Read", ToolCategory: "Read"}
+		response, err := store.GetAnalyticsTools(t.Context(), filter)
+		require.NoError(t, err)
+		assert.Equal(t, []db.ToolTrendEntry{{Date: "2025-03-03", ByCat: map[string]int{"Read": 1}}, {Date: "2025-03-10", ByCat: map[string]int{"Read": 1}}}, response.Trend)
+		for i, day := range []string{"2025-03-09", "2025-03-10"} {
+			filter.From, filter.To = day, day
+			response, err := store.GetAnalyticsTools(t.Context(), filter)
+			require.NoError(t, err)
+			assert.Equal(t, 1, response.TotalCalls)
+			evidence, err := store.GetAnalyticsSignalSessions(t.Context(), filter, "tool_empty_rate", 10)
+			require.NoError(t, err)
+			require.Len(t, evidence.Sessions, 1)
+			assert.Equal(t, 1, evidence.Sessions[0].SignalTotal)
+			assert.Equal(t, new(i), evidence.Sessions[0].MessageOrdinal)
+		}
+		return
+	}
+	zone, err := os.ReadFile("/usr/share/zoneinfo/Etc/GMT-2")
+	if os.IsNotExist(err) {
+		t.Skip("timezone fixture unavailable")
+	}
+	require.NoError(t, err)
+	dir := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "America"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "America", "New_York"), zone, 0o600))
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestDuckToolsTimezoneDatabaseDisagreement$")
+	cmd.Env = append(os.Environ(), "DUCK_TZ_SKEW_TEST=1", "ZONEINFO="+dir)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "%s", out)
+}
+
+func TestDuckAnalyticsToolsLocalDayBoundaries(t *testing.T) {
+	id := "duck-tool-boundary"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session: syncSession(id, "alpha", "boundary", "2025-03-09T12:00:00Z", 4),
+		Messages: []db.Message{
+			duckModelMessage(id, 0, "assistant", "read", "2025-03-10T03:59:59Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 1, "assistant", "read", "2025-03-10T04:00:00Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 2, "assistant", "read", "2025-03-10T04:01:00Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 3, "assistant", "read", "", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	resp, err := store.GetAnalyticsTools(t.Context(), db.AnalyticsFilter{From: "2025-03-01", To: "2025-03-12", Timezone: "America/New_York"})
+	require.NoError(t, err)
+	assert.Equal(t, 4, resp.TotalCalls)
+	require.Len(t, resp.ByTool, 1)
+	assert.Equal(t, 1, resp.ByTool[0].SessionCount)
+	assert.Equal(t, []db.ToolTrendEntry{
+		{Date: "2025-03-03", ByCat: map[string]int{"Read": 2}},
+		{Date: "2025-03-10", ByCat: map[string]int{"Read": 2}},
+	}, resp.Trend)
+}
+
+func TestDuckToolsSessionFallbackOutsidePeriods(t *testing.T) {
+	id := "duck-outside-period"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session: syncSession(id, "alpha", "fallback", "2024-01-01T00:00:00Z", 2),
+		Messages: []db.Message{
+			duckModelMessage(id, 0, "assistant", "read", "", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 1, "assistant", "read", "2025-03-10T12:00:00Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+		}, DataVersion: 1, ReplaceMessages: true,
+	}})
+	filter := db.AnalyticsFilter{From: "2025-03-10", To: "2025-03-10", Timezone: "America/New_York"}
+	response, err := store.GetAnalyticsTools(t.Context(), filter)
+	require.NoError(t, err)
+	assert.Equal(t, 1, response.TotalCalls)
+}
+
+func TestDuckAnalyticsToolsLocalWeeks(t *testing.T) {
+	for _, tc := range []struct {
+		name, zone, before, after, firstWeek, secondWeek string
+	}{
+		{"fall DST", "America/New_York", "2025-11-03T04:59:59Z", "2025-11-03T05:00:00Z", "2025-10-27", "2025-11-03"},
+		{"fractional offset", "Asia/Kathmandu", "2025-03-09T18:14:59Z", "2025-03-09T18:15:00Z", "2025-03-03", "2025-03-10"},
+		{"unknown zone", "Invalid/Zone", "2025-03-09T23:59:59Z", "2025-03-10T00:00:00Z", "2025-03-03", "2025-03-10"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "duck-tool-weeks"
+			store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+				Session: syncSession(id, "alpha", "boundary", tc.before, 2),
+				Messages: []db.Message{
+					duckModelMessage(id, 0, "assistant", "read", tc.before, "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+					duckModelMessage(id, 1, "assistant", "read", tc.after, "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+				},
+				DataVersion: 1, ReplaceMessages: true,
+			}})
+			resp, err := store.GetAnalyticsTools(t.Context(), db.AnalyticsFilter{From: "2025-03-01", To: "2025-11-10", Timezone: tc.zone})
+			require.NoError(t, err)
+			require.Len(t, resp.Trend, 2)
+			assert.Equal(t, tc.firstWeek, resp.Trend[0].Date)
+			assert.Equal(t, tc.secondWeek, resp.Trend[1].Date)
+			assert.Equal(t, 1, resp.Trend[0].ByCat["Read"])
+			assert.Equal(t, 1, resp.Trend[1].ByCat["Read"])
+			assert.Equal(t, 2, resp.TotalCalls)
+			assert.Equal(t, 1, resp.ByTool[0].SessionCount)
+		})
+	}
+}
+
+func TestDuckAnalyticsToolsLocalTimezoneWithoutName(t *testing.T) {
+	// Keep the pointer stable for callers that have already cached time.Local.
+	local := time.Local //nolint:forbidigo // Exercise the process-local timezone used by this filter.
+	_ = time.Now().In(local)
+	original := *local
+	t.Cleanup(func() { *local = original })
+	*local = *time.FixedZone("Local", 12*60*60)
+	before, after := "2025-03-09T11:59:59Z", "2025-03-09T12:00:01Z"
+	id := "duck-local-file-zone"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session: syncSession(id, "alpha", "local", before, 2),
+		Messages: []db.Message{
+			duckModelMessage(id, 0, "assistant", "read", before, "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 1, "assistant", "read", after, "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	resp, err := store.GetAnalyticsTools(t.Context(), db.AnalyticsFilter{From: "2025-03-09", To: "2025-03-10", Timezone: "Local"})
+	require.NoError(t, err)
+	assert.Equal(t, 2, resp.TotalCalls)
+	assert.Equal(t, []db.ToolTrendEntry{
+		{Date: "2025-03-03", ByCat: map[string]int{"Read": 1}},
+		{Date: "2025-03-10", ByCat: map[string]int{"Read": 1}},
+	}, resp.Trend)
 }
 
 func TestDuckAnalyticsToolsModelAndHourFilterCountsOnlyMatchingHourToolCalls(
@@ -1831,6 +1799,35 @@ func TestDuckTrendsTermsModelFilterStaysOnMatchingMessages(t *testing.T) {
 	assert.Equal(t, 1, resp.Series[0].Total, "Total")
 }
 
+func TestDuckTrendsTermsPreservesCalendarBucketsAcrossMidnightGap(t *testing.T) {
+	ctx := t.Context()
+	const timestamp = "2023-10-15T12:00:00Z"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session:     syncSession("trend-gap", "alpha", "trend gap", timestamp, 1),
+		Messages:    []db.Message{syncMessage("trend-gap", 0, "user", "seam", timestamp)},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	terms, err := db.ParseTrendTerms([]string{"seam"})
+	require.NoError(t, err)
+	for _, tc := range []struct{ granularity, bucket string }{
+		{"month", "2023-10-01"}, {"", "2023-10-09"},
+	} {
+		t.Run(tc.granularity, func(t *testing.T) {
+			resp, err := store.GetTrendsTerms(ctx, db.AnalyticsFilter{
+				From: "2023-10-01", To: "2023-10-31", Timezone: "America/Asuncion",
+			}, terms, tc.granularity)
+			require.NoError(t, err)
+			assert.Equal(t, 1, resp.MessageCount)
+			require.Len(t, resp.Series, 1)
+			assert.Equal(t, 1, resp.Series[0].Total)
+			assert.Contains(t, resp.Series[0].Points, db.TrendPoint{Date: tc.bucket, Count: 1})
+			if tc.granularity == "" {
+				assert.Equal(t, "week", resp.Granularity)
+			}
+		})
+	}
+}
+
 func newDuckAnalyticsStore(
 	t *testing.T, writes []db.SessionBatchWrite,
 ) *Store {
@@ -1907,17 +1904,54 @@ func duckHOWMessages(cells []db.HourOfWeekCell, dow, hour int) int {
 	return -1
 }
 
+func TestDuckUsageCopilotCostFollowsLatestEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		first, latest string
+	}{
+		{name: "increasing", first: "0.30", latest: "0.50"},
+		{name: "decreasing", first: "5", latest: "3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := syncSession("copilot-order", "project-a", "reported cost", "2026-08-10T08:00:00Z", 2)
+			session.Agent = "copilot"
+			first, latest := money.MustParseDollars(tc.first), money.MustParseDollars(tc.latest)
+			store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+				Session: session,
+				UsageEvents: []db.UsageEvent{
+					{Source: "shutdown", Model: "zzz-model", InputTokens: 10, Cost: &first, CostStatus: "exact", CostSource: db.CopilotReportedCostSource, OccurredAt: "2026-08-10T09:00:00Z", DedupKey: "first"},
+					{Source: "shutdown", Model: "aaa-model", InputTokens: 20, Cost: &latest, CostStatus: "exact", CostSource: db.CopilotReportedCostSource, OccurredAt: "2026-08-10T10:00:00Z", DedupKey: "latest"},
+				},
+				DataVersion: 1, ReplaceMessages: true,
+			}})
+			for _, filter := range []db.UsageFilter{{}, {Model: " , "}, {ExcludeModel: " , "}, {Model: " , ", ExcludeModel: " , "}} {
+				filter.From, filter.To, filter.Timezone = "2026-08-10", "2026-08-10", "UTC"
+				daily, err := store.GetDailyUsage(t.Context(), filter)
+				require.NoError(t, err)
+				assert.Equal(t, latest, daily.Totals.TotalCost)
+				top, err := store.GetTopSessionsByCost(t.Context(), filter, 10)
+				require.NoError(t, err)
+				require.Len(t, top, 1)
+				assert.Equal(t, latest, top[0].Cost)
+			}
+			usage, err := store.GetSessionUsage(t.Context(), session.ID, false)
+			require.NoError(t, err)
+			assert.Equal(t, latest, usage.Cost)
+		})
+	}
+}
+
 // TestDuckDailyUsageEventModelEligibility pins the DuckDB
 // aggregator's usage-event eligibility contract for Codebuff/
 // Freebuff's parser-attributed agent template name. The Codebuff
 // parser (internal/parser/codebuff.go) sets Model = <agentType>
 // (e.g. "base2-deepseek", "base2-free-minimax-m3") rather than the
 // agent name so the per-model breakdown in the usage report stays
-// granular. The aggregate must accept any non-empty Model value and
-// reject empty-model rows: hard-coding an accepted model literal
-// would drop the template-attributed cost (TotalCost falls to zero),
-// and dropping the non-empty-model requirement would leak the
-// empty-model row's cost into TotalCost.
+// granular. The aggregate must accept any non-empty Model value:
+// hard-coding an accepted model literal would drop the
+// template-attributed cost (TotalCost falls to zero). A costed event
+// with no model is written under usagefacts.UnknownModel, so its cost
+// stays in TotalCost as its own model row instead of being dropped.
 func TestDuckDailyUsageEventModelEligibility(t *testing.T) {
 	ctx := t.Context()
 	templateCost := money.MustParseDollars("0.05")
@@ -1951,15 +1985,19 @@ func TestDuckDailyUsageEventModelEligibility(t *testing.T) {
 		From: "2026-07-15", To: "2026-07-15", Timezone: "UTC",
 	})
 	require.NoError(t, err, "GetDailyUsage")
-	assert.Equal(t, templateCost, daily.Totals.TotalCost,
-		"the template-model cost must be included and the "+
-			"empty-model cost excluded")
+	total, err := money.Add(templateCost, emptyModelCost)
+	require.NoError(t, err)
+	assert.Equal(t, total, daily.Totals.TotalCost,
+		"both the template-model and the unknown-model cost count")
 	require.Len(t, daily.Daily, 1)
-	assert.Equal(t, templateCost, daily.Daily[0].TotalCost)
-	require.Len(t, daily.Daily[0].ModelBreakdowns, 1,
-		"only the template-attributed model may surface")
-	assert.Equal(t, "base2-deepseek",
-		daily.Daily[0].ModelBreakdowns[0].ModelName)
+	models := map[string]money.Money{}
+	for _, model := range daily.Daily[0].ModelBreakdowns {
+		models[model.ModelName] = model.Cost
+	}
+	assert.Equal(t, map[string]money.Money{
+		"base2-deepseek":        templateCost,
+		usagefacts.UnknownModel: emptyModelCost,
+	}, models)
 }
 
 func TestDuckAnalyticsToolsWindowsMessagesInSQL(t *testing.T) {
@@ -1986,7 +2024,7 @@ func TestDuckAnalyticsToolsWindowsMessagesInSQL(t *testing.T) {
 	resp, err := store.GetAnalyticsTools(ctx, f)
 	require.NoError(t, err)
 	assert.Equal(t, 3, resp.TotalCalls)
-	from, to := duckAnalyticsWindowBounds(f)
+	from, to := readbase.AnalyticsWindowBounds(f)
 	pred, _ := duckAnalyticsMessageWindowPred("m.timestamp", from, to)
 	require.NotEmpty(t, observedQuery, "production tool query was not observed")
 	assert.Contains(t, observedQuery, pred,
@@ -1995,4 +2033,23 @@ func TestDuckAnalyticsToolsWindowsMessagesInSQL(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, skills.TotalSkillCalls)
 	t.Log("production tool query carried the message window predicate; SQL admitted 3 calls; tools and skills retain UTC+14 boundary and null fallback")
+}
+
+func TestDuckToolsBoundedRangeGroupsByLocalDay(t *testing.T) {
+	id := "duck-long-range"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session: syncSession(id, "alpha", "long", "2005-06-10T12:00:00Z", 2),
+		Messages: []db.Message{
+			duckModelMessage(id, 0, "assistant", "read", "2005-06-10T12:00:00Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+			duckModelMessage(id, 1, "assistant", "read", "2005-06-10T12:05:00Z", "model", db.ToolCall{ToolName: "Read", Category: "Read"}),
+		}, DataVersion: 1, ReplaceMessages: true,
+	}})
+	var visits []readbase.AnalyticsToolVisit
+	filter := db.AnalyticsFilter{From: "1990-01-01", To: "2007-12-31", Timezone: "America/New_York"}
+	err := (analyticsSQL{store}).VisitTools(t.Context(), filter, []string{id}, func(visit readbase.AnalyticsToolVisit) {
+		visits = append(visits, visit)
+	})
+	require.NoError(t, err)
+	require.Len(t, visits, 1)
+	assert.Equal(t, 2, visits[0].Count)
 }

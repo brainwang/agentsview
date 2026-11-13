@@ -8,6 +8,24 @@ import (
 
 const automationAuditPrefixBytes = AutomationEvidencePrefixBytes
 
+// ParentlessWorkerSQL is the stored-row equivalent of parser.PromoteParentlessWorker.
+const ParentlessWorkerSQL = `session_kind = 'non-interactive'
+ AND COALESCE(parent_session_id, '') = '' AND COALESCE(relationship_type, '') = ''`
+
+const parentlessRelationshipSQL = `IIF(sessions.session_kind = 'non-interactive', 'subagent', '')`
+
+// parserRelationshipSQL restores parser provenance, falling back to kind for legacy rows.
+const parserRelationshipSQL = `COALESCE(sessions.parser_relationship_type, ` + parentlessRelationshipSQL + `)`
+
+func repairParentlessWorkers(ctx context.Context, w *writerHandle) error {
+	if _, err := w.Exec(ctx, `UPDATE sessions
+		SET relationship_type = 'subagent', local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE `+ParentlessWorkerSQL); err != nil {
+		return fmt.Errorf("repairing parentless workers: %w", err)
+	}
+	return nil
+}
+
 type boundedAutomationText struct {
 	prefix         sql.RawBytes
 	fullByteLength sql.NullInt64
@@ -28,7 +46,6 @@ func auditAutomatedFull(ctx context.Context,
 	rows, err := w.Query(ctx,
 		`SELECT
 			s.id,
-			s.agent,
 			s.session_kind,
 			s.first_message,
 			s.user_message_count,
@@ -38,7 +55,7 @@ func auditAutomatedFull(ctx context.Context,
 				FROM messages m
 				WHERE m.session_id = s.id
 				  AND m.role = 'user'
-				  AND COALESCE(m.source_subtype, '') <> 'tool_result'
+				  AND m.source_subtype <> 'tool_result'
 				  AND m.is_system = 0
 				  AND TRIM(m.content) <> ''
 				ORDER BY m.ordinal
@@ -60,14 +77,8 @@ func auditAutomatedFull(ctx context.Context,
 	return setIDs, clearIDs, err
 }
 
-func auditAutomatedMatchingHash(ctx context.Context,
-	w *writerHandle,
-	patterns automationPatternSnapshot,
-) (setIDs, clearIDs []string, err error) {
-	rows, err := w.Query(ctx,
-		`SELECT
+const auditAutomatedMatchingHashSQL = `SELECT
 			s.id,
-			s.agent,
 			s.session_kind,
 			s.user_message_count,
 			s.is_automated,
@@ -91,12 +102,20 @@ func auditAutomatedMatchingHash(ctx context.Context,
 				FROM messages m
 				WHERE m.session_id = s.id
 				  AND m.role = 'user'
-				  AND COALESCE(m.source_subtype, '') <> 'tool_result'
+				  AND m.source_subtype <> 'tool_result'
 				  AND m.is_system = 0
 				  AND TRIM(m.content) <> ''
 				ORDER BY m.ordinal
 				LIMIT 1
-			) END`,
+			) END
+		 WHERE s.automation_audit = 1`
+
+func auditAutomatedMatchingHash(ctx context.Context,
+	w *writerHandle,
+	patterns automationPatternSnapshot,
+) (setIDs, clearIDs []string, err error) {
+	rows, err := w.Query(ctx,
+		auditAutomatedMatchingHashSQL,
 		automationAuditPrefixBytes,
 		automationAuditPrefixBytes,
 	)
@@ -111,7 +130,6 @@ func auditAutomatedMatchingHash(ctx context.Context,
 	for rows.Next() {
 		var (
 			id               string
-			agent            string
 			sessionKind      string
 			userMessageCount int
 			rowAutomated     bool
@@ -120,7 +138,6 @@ func auditAutomatedMatchingHash(ctx context.Context,
 		)
 		if err := rows.Scan(
 			&id,
-			&agent,
 			&sessionKind,
 			&userMessageCount,
 			&rowAutomated,
@@ -134,8 +151,8 @@ func auditAutomatedMatchingHash(ctx context.Context,
 				"scanning bounded automated audit candidate: %w", err,
 			)
 		}
-		if IsAutomatedSessionMetadata(agent, sessionKind) {
-			setIDs, clearIDs = appendAutomationFlagChange(
+		if IsAutomatedSessionMetadata(sessionKind) {
+			setIDs, clearIDs = AppendAutomationFlagChange(
 				setIDs, clearIDs, id, rowAutomated, true,
 			)
 			continue
@@ -148,7 +165,7 @@ func auditAutomatedMatchingHash(ctx context.Context,
 			unresolved = append(unresolved, id)
 			continue
 		}
-		setIDs, clearIDs = appendAutomationFlagChange(
+		setIDs, clearIDs = AppendAutomationFlagChange(
 			setIDs, clearIDs, id, rowAutomated, want,
 		)
 	}
@@ -161,11 +178,10 @@ func auditAutomatedMatchingHash(ctx context.Context,
 	}
 
 	err = queryChunked(unresolved, func(ids []string) error {
-		placeholders, args := inPlaceholders(ids)
+		placeholders, args := InPlaceholders(ids)
 		fullRows, err := w.Query(ctx,
 			`SELECT
 				s.id,
-				s.agent,
 				s.session_kind,
 				s.first_message,
 				s.user_message_count,
@@ -175,7 +191,7 @@ func auditAutomatedMatchingHash(ctx context.Context,
 					FROM messages m
 					WHERE m.session_id = s.id
 					  AND m.role = 'user'
-					  AND COALESCE(m.source_subtype, '') <> 'tool_result'
+					  AND m.source_subtype <> 'tool_result'
 					  AND m.is_system = 0
 					  AND TRIM(m.content) <> ''
 					ORDER BY m.ordinal
@@ -217,7 +233,6 @@ func scanFullAutomationCandidates(
 	for rows.Next() {
 		var (
 			id           string
-			agent        string
 			sessionKind  string
 			firstMessage sql.NullString
 			firstUser    sql.NullString
@@ -225,18 +240,18 @@ func scanFullAutomationCandidates(
 			rowAutomated bool
 		)
 		if err := rows.Scan(
-			&id, &agent, &sessionKind,
+			&id, &sessionKind,
 			&firstMessage, &userCount, &rowAutomated, &firstUser,
 		); err != nil {
 			return nil, nil, fmt.Errorf(
 				"scanning automated audit candidate: %w", err,
 			)
 		}
-		want := IsAutomatedSessionMetadata(agent, sessionKind) ||
+		want := IsAutomatedSessionMetadata(sessionKind) ||
 			patterns.matchesTextCandidates(
 				userCount, firstUser, firstMessage,
 			)
-		setIDs, clearIDs = appendAutomationFlagChange(
+		setIDs, clearIDs = AppendAutomationFlagChange(
 			setIDs, clearIDs, id, rowAutomated, want,
 		)
 	}
@@ -246,7 +261,9 @@ func scanFullAutomationCandidates(
 	return setIDs, clearIDs, nil
 }
 
-func appendAutomationFlagChange(
+// AppendAutomationFlagChange adds id to setIDs or clearIDs when the stored
+// automated flag differs from want.
+func AppendAutomationFlagChange(
 	setIDs, clearIDs []string,
 	id string,
 	rowAutomated, want bool,

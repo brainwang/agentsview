@@ -58,16 +58,17 @@ func (s *Store) queryTurnRows(
 		    m.session_id, m.ordinal, m.timestamp, m.has_tool_use,
 		    m.role, m.is_system,
 		    CASE WHEN `+db.PostgresSystemPrefixSQL("m.content", "m.role")+` THEN FALSE ELSE TRUE END AS is_system_prefixed,
-		    COALESCE(m.source_subtype, '') AS source_subtype, m.content_length,
-		    (round(EXTRACT(EPOCH FROM (
+		    m.source_subtype, m.content_length,
+		    (EXTRACT(EPOCH FROM (
 		      COALESCE(
 		        LEAD(m.timestamp) OVER (ORDER BY m.ordinal),
 		        s.ended_at
 		      ) - m.timestamp
-		    )) * 1000))::bigint AS delta_ms
+		    )) * 1000)::bigint AS delta_ms
 		  FROM messages m
 		  LEFT JOIN sessions s ON s.id = m.session_id
 		  WHERE m.session_id = $1
+		    AND `+db.ExcludeClaudeHooksSQL("m.source_subtype")+`
 		) m2
 		ORDER BY m2.ordinal
 	`, sessionID)
@@ -113,6 +114,10 @@ func (s *Store) queryTurnRows(
 func (s *Store) queryCallRows(
 	ctx context.Context, sessionID string,
 ) ([]db.CallRow, error) {
+	return s.queryCallRowsWithJoin(ctx, sessionID, `LEFT JOIN sessions s_sub ON s_sub.id = tc.subagent_session_id`)
+}
+
+func (s *Store) queryCallRowsWithJoin(ctx context.Context, sessionID, subagentJoin string) ([]db.CallRow, error) {
 	rows, err := s.pg.QueryContext(ctx, `
 		SELECT
 		  tc.message_ordinal,
@@ -149,8 +154,7 @@ func (s *Store) queryCallRows(
 		  ,s_sub.started_at
 		  ,s_sub.ended_at
 		FROM tool_calls tc
-		LEFT JOIN sessions s_sub
-		  ON s_sub.id = tc.subagent_session_id
+		`+subagentJoin+`
 		WHERE tc.session_id = $1
 		ORDER BY tc.message_ordinal, tc.id
 	`, sessionID)

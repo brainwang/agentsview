@@ -33,14 +33,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_hash   TEXT,
     local_modified_at TEXT,
     transcript_revision TEXT NOT NULL DEFAULT '0',
+    usage_generation TEXT,
     parent_session_id TEXT,
     parser_parent_session_id TEXT,
+    parser_relationship_type TEXT,
     relationship_type TEXT NOT NULL DEFAULT '',
     total_output_tokens INTEGER NOT NULL DEFAULT 0,
     peak_context_tokens INTEGER NOT NULL DEFAULT 0,
     has_total_output_tokens INTEGER NOT NULL DEFAULT 0,
     has_peak_context_tokens INTEGER NOT NULL DEFAULT 0,
     is_automated INTEGER NOT NULL DEFAULT 0,
+    automation_audit INTEGER NOT NULL DEFAULT 1,
     tool_failure_signal_count INTEGER NOT NULL DEFAULT 0,
     tool_retry_count INTEGER NOT NULL DEFAULT 0,
     edit_churn_count INTEGER NOT NULL DEFAULT 0,
@@ -68,8 +71,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     data_version INTEGER NOT NULL DEFAULT 0,
     cwd TEXT NOT NULL DEFAULT '',
     git_branch TEXT NOT NULL DEFAULT '',
+    -- JSON array of parser-derived pull request links; '' when none.
+    pr_links TEXT NOT NULL DEFAULT '',
     source_session_id TEXT NOT NULL DEFAULT '',
     source_version TEXT NOT NULL DEFAULT '',
+    group_key TEXT NOT NULL DEFAULT '',
     transcript_fidelity TEXT NOT NULL DEFAULT '',
     parser_malformed_lines INTEGER NOT NULL DEFAULT 0,
     is_truncated INTEGER NOT NULL DEFAULT 0,
@@ -80,6 +86,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- mirrored to PG/DuckDB.
     last_write_incremental INTEGER NOT NULL DEFAULT 0,
     deleted_at  TEXT,
+    -- Before revert pages had separate IDs, trash covered the whole thread.
+    -- A restore ends that inherited scope; later trash actions are per-file.
+    trash_includes_codex_pages INTEGER NOT NULL DEFAULT 0,
     -- Retained for compatibility with older archives and mirrors. New source
     -- availability state is stored independently in source_missing_at.
     deletion_cause TEXT,
@@ -91,6 +100,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     termination_status TEXT,
     secret_leak_count INTEGER NOT NULL DEFAULT 0,
     secrets_rules_version TEXT NOT NULL DEFAULT '',
+    friction_count INTEGER NOT NULL DEFAULT 0,
+    friction_rules_version TEXT NOT NULL DEFAULT '',
+    friction_hash TEXT NOT NULL DEFAULT '',
     sync_marker TEXT
 );
 
@@ -120,6 +132,8 @@ CREATE TABLE IF NOT EXISTS messages (
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
     thinking_text  TEXT NOT NULL DEFAULT '',
+    dialogue_text  TEXT,
+    dialogue_is_content INTEGER NOT NULL DEFAULT 0,
     timestamp      TEXT,
     has_thinking   INTEGER NOT NULL DEFAULT 0,
     has_tool_use   INTEGER NOT NULL DEFAULT 0,
@@ -249,6 +263,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_file_path
 -- Analytics indexes
 CREATE INDEX IF NOT EXISTS idx_sessions_started
     ON sessions(started_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_effective_start
+    ON sessions(COALESCE(NULLIF(started_at, ''), created_at));
 CREATE INDEX IF NOT EXISTS idx_sessions_message_count
     ON sessions(message_count);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_message_count
@@ -286,8 +302,45 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_session
 CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
     ON usage_events(occurred_at);
 
+-- Per-session plan usage and live-capture coverage. Codex cloud reports
+-- usage as shares of plan limits and credits, not tokens, so these never
+-- become usage_events. A row holds the latest plan usage report and the
+-- newest outcome after it, the live-capture coverage, or both.
+CREATE TABLE IF NOT EXISTS session_plan_usage (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    has_plan_usage INTEGER NOT NULL DEFAULT 0,
+    data_as_of TEXT,
+    data_status TEXT NOT NULL DEFAULT '',
+    usage_source TEXT NOT NULL DEFAULT '',
+    weekly_percent REAL,
+    five_hour_percent REAL,
+    credits TEXT,
+    groups_json TEXT NOT NULL DEFAULT '[]',
+    is_final INTEGER NOT NULL DEFAULT 0,
+    outcome_kind TEXT NOT NULL DEFAULT '',
+    outcome_at TEXT,
+    counted_under TEXT NOT NULL DEFAULT '',
+    has_coverage INTEGER NOT NULL DEFAULT 0,
+    last_capture_at TEXT,
+    uncaptured_turns INTEGER NOT NULL DEFAULT 0
+);
+
+-- A usage total the agent recorded for a whole session, such as Claude
+-- Code's cost-state. It overlaps the session's usage rows, and with
+-- subagent_scope 'included' its subagents' rows, so usage queries never read
+-- it; session usage shows it next to AgentsView's totals.
+CREATE TABLE IF NOT EXISTS session_usage_totals (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    subagent_scope TEXT NOT NULL DEFAULT '',
+    cost_microdollars INTEGER,
+    incomplete INTEGER NOT NULL DEFAULT 0,
+    models_json TEXT NOT NULL DEFAULT '[]'
+);
+
 CREATE TABLE IF NOT EXISTS cursor_usage_events (
     id INTEGER PRIMARY KEY,
+    agent TEXT NOT NULL DEFAULT 'cursor',
     occurred_at TEXT NOT NULL,
     model TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT '',
@@ -327,7 +380,10 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     result_content        TEXT,
     subagent_session_id TEXT,
     file_path  TEXT,
-    call_index INTEGER
+    call_index INTEGER,
+    observed_outcome TEXT,
+    observed_repeat TEXT,
+    sequence_ending TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session
@@ -732,11 +788,39 @@ CREATE TABLE IF NOT EXISTS starred_sessions (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Session labels: user- or tool-supplied tags. Like project assignments,
+-- rows are keyed by session id without a foreign key so a launcher can
+-- label a session before sync imports it, and parser writes never touch
+-- them.
+CREATE TABLE IF NOT EXISTS session_labels (
+    session_id TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (session_id, label)
+);
+
+-- Launcher-supplied parent links. Linking passes recompute them from current
+-- evidence: a link is the session's parent only while the transcript gives
+-- none, no tool-call spawn edge claims the session, and the link's chain
+-- does not lead back to the session.
+CREATE TABLE IF NOT EXISTS session_external_parents (
+    session_id        TEXT PRIMARY KEY,
+    parent_session_id TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_session_external_parents_parent
+    ON session_external_parents(parent_session_id);
+
 -- Excluded sessions: tracks session IDs that were permanently
 -- deleted by the user so the sync engine does not re-import them.
 CREATE TABLE IF NOT EXISTS excluded_sessions (
     id         TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    -- Source file of the deleted session, so another file sharing its id
+    -- does not take it over.
+    file_path  TEXT,
+    include_codex_pages INTEGER NOT NULL DEFAULT 0
 );
 -- Skipped files cache: persists skip decisions for files that
 -- produced no session (non-interactive, parse errors) so they
@@ -769,8 +853,16 @@ CREATE TABLE IF NOT EXISTS local_session_source_baselines (
 CREATE INDEX IF NOT EXISTS idx_local_source_baselines_ownership
     ON local_session_source_baselines(machine, agent, file_path, session_id);
 
+-- Local provenance for archived Claude subagent messages. A missing
+-- contributor must not turn a full refresh into a partial replacement.
+CREATE TABLE IF NOT EXISTS claude_subagent_sources (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    file_path  TEXT NOT NULL,
+    PRIMARY KEY (session_id, file_path)
+);
+
 -- Remote skip cache: tracks file mtimes per remote host
--- for SSH sync incremental optimization.
+-- for remote sync incremental optimization.
 CREATE TABLE IF NOT EXISTS remote_skipped_files (
     host       TEXT NOT NULL,
     path       TEXT NOT NULL,
@@ -870,6 +962,14 @@ CREATE TABLE IF NOT EXISTS project_identity_observations (
 CREATE INDEX IF NOT EXISTS idx_project_identity_observations_project
     ON project_identity_observations(project);
 
+-- Stable automatic names for source-recorded repositories. Parser snapshots
+-- retain their original labels; explicit folder/session assignments win.
+CREATE TABLE IF NOT EXISTS repository_project_names (
+    normalized_remote TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_project_identity_snapshots (
     session_id         TEXT PRIMARY KEY,
     project            TEXT NOT NULL,
@@ -877,6 +977,7 @@ CREATE TABLE IF NOT EXISTS session_project_identity_snapshots (
     root_path          TEXT NOT NULL DEFAULT '',
     git_remote         TEXT NOT NULL DEFAULT '',
     git_remote_name    TEXT NOT NULL DEFAULT '',
+    recorded_git_remote TEXT NOT NULL DEFAULT '',
     repository_path    TEXT NOT NULL DEFAULT '',
     worktree_name      TEXT NOT NULL DEFAULT '',
     worktree_root_path TEXT NOT NULL DEFAULT '',
@@ -896,6 +997,9 @@ CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_evidence
     ON session_project_identity_snapshots(
         machine, root_path, git_remote, observed_at DESC, session_id
     );
+
+CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshots_remote
+    ON session_project_identity_snapshots(normalized_remote);
 
 CREATE TABLE IF NOT EXISTS background_migrations (
     name            TEXT PRIMARY KEY,
@@ -945,7 +1049,7 @@ DROP TRIGGER IF EXISTS trg_session_project_identity_snapshots_revision_delete;
 CREATE TRIGGER IF NOT EXISTS trg_project_identity_observations_revision_insert
 AFTER INSERT ON project_identity_observations BEGIN
     INSERT INTO archive_metadata (key, value) VALUES ('project_identity_publication_revision', '1')
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO project_identity_observation_changes (
         project, machine, root_path, git_remote, revision, deleted
@@ -960,7 +1064,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_project_identity_observations_revision_update
 AFTER UPDATE ON project_identity_observations BEGIN
     INSERT INTO archive_metadata (key, value) VALUES ('project_identity_publication_revision', '1')
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO project_identity_observation_changes (
         project, machine, root_path, git_remote, revision, deleted
@@ -983,7 +1087,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_project_identity_observations_revision_delete
 AFTER DELETE ON project_identity_observations BEGIN
     INSERT INTO archive_metadata (key, value) VALUES ('project_identity_publication_revision', '1')
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO project_identity_observation_changes (
         project, machine, root_path, git_remote, revision, deleted
@@ -998,7 +1102,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_session_project_identity_snapshots_revision_insert
 AFTER INSERT ON session_project_identity_snapshots BEGIN
     INSERT INTO archive_metadata (key, value) VALUES ('project_identity_publication_revision', '1')
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO session_project_identity_snapshot_changes (
         session_id, project, revision, deleted
@@ -1013,7 +1117,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_session_project_identity_snapshots_revision_update
 AFTER UPDATE ON session_project_identity_snapshots BEGIN
     INSERT INTO archive_metadata (key, value) VALUES ('project_identity_publication_revision', '1')
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO session_project_identity_snapshot_changes (
         session_id, project, revision, deleted
@@ -1036,7 +1140,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_session_project_identity_snapshots_revision_delete
 AFTER DELETE ON session_project_identity_snapshots BEGIN
     INSERT INTO archive_metadata (key, value) VALUES ('project_identity_publication_revision', '1')
-    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+    ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO session_project_identity_snapshot_changes (
         session_id, project, revision, deleted
@@ -1067,6 +1171,14 @@ END;
 -- trigger body referencing sync_marker here would fail to create against a
 -- pre-migration sessions table that doesn't have the column yet.
 
+-- Latest usage-affecting change per session, including hard deletions.
+CREATE TABLE IF NOT EXISTS usage_session_changes (
+    session_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_session_changes_revision
+    ON usage_session_changes(revision);
+
 -- Session-deletion journal: a compact publication journal recording hard
 -- session deletions so mirror pushes can apply bounded tombstone deltas
 -- instead of enumerating the whole archive. Unlike sync_marker, this only
@@ -1089,7 +1201,7 @@ BEGIN
     INSERT INTO archive_metadata (key, value)
         VALUES ('session_deletion_publication_revision', '1')
     ON CONFLICT(key) DO UPDATE SET
-        value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+        value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO session_deletion_changes (session_id, project, revision, deleted)
         SELECT OLD.id, OLD.project,
@@ -1107,7 +1219,7 @@ BEGIN
     INSERT INTO archive_metadata (key, value)
         VALUES ('session_deletion_publication_revision', '1')
     ON CONFLICT(key) DO UPDATE SET
-        value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+        value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO session_deletion_changes (session_id, project, revision, deleted)
         SELECT NEW.id, NEW.project,
@@ -1142,7 +1254,7 @@ BEGIN
     INSERT INTO archive_metadata (key, value)
     VALUES ('worktree_mapping_publication_revision', '1')
     ON CONFLICT(key) DO UPDATE SET
-        value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+        value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO worktree_project_mapping_changes
         (machine, path_prefix, revision, deleted)
@@ -1159,7 +1271,7 @@ BEGIN
     INSERT INTO archive_metadata (key, value)
     VALUES ('worktree_mapping_publication_revision', '1')
     ON CONFLICT(key) DO UPDATE SET
-        value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+        value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO worktree_project_mapping_changes
         (machine, path_prefix, revision, deleted)
@@ -1183,7 +1295,7 @@ BEGIN
     INSERT INTO archive_metadata (key, value)
     VALUES ('worktree_mapping_publication_revision', '1')
     ON CONFLICT(key) DO UPDATE SET
-        value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+        value = CAST(value AS INTEGER) + 1,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');
     INSERT INTO worktree_project_mapping_changes
         (machine, path_prefix, revision, deleted)
@@ -1289,6 +1401,110 @@ CREATE INDEX IF NOT EXISTS idx_secret_findings_session
 CREATE INDEX IF NOT EXISTS idx_secret_findings_rule
     ON secret_findings(rule_name);
 
+-- Friction findings: per-occurrence detections from internal/friction.
+-- Derived from stored messages at sync time and replaced per session.
+-- Natural coordinates let findings survive the full-resync orphan copy.
+CREATE TABLE IF NOT EXISTS friction_findings (
+    id              INTEGER PRIMARY KEY,
+    session_id      TEXT NOT NULL
+        REFERENCES sessions(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    detector        TEXT NOT NULL,
+    message_ordinal INTEGER,
+    call_index      INTEGER,
+    tool_name       TEXT NOT NULL DEFAULT '',
+    label           TEXT NOT NULL DEFAULT '',
+    text            TEXT NOT NULL DEFAULT '',
+    evidence        TEXT NOT NULL DEFAULT '',
+    title           TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    occurred_at     TEXT,
+    seq             INTEGER NOT NULL,
+    rules_version   TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_findings_session
+    ON friction_findings(session_id);
+
+CREATE TABLE IF NOT EXISTS diagnostic_events (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    message TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    accepted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_events_occurred ON diagnostic_events (occurred_at);
+
+-- Friction Log review state is built independently by each store.
+-- One digest is kept for each completed local date.
+CREATE TABLE IF NOT EXISTS friction_digests (
+    date             TEXT PRIMARY KEY,
+    timezone         TEXT NOT NULL,
+    rules_version    TEXT NOT NULL,
+    built_at         TEXT NOT NULL,
+    revision         INTEGER NOT NULL DEFAULT 1,
+    sessions_scanned INTEGER NOT NULL,
+    snapshot_json    TEXT NOT NULL,
+    summary_json     TEXT NOT NULL,
+    markdown         TEXT NOT NULL,
+    markdown_sha256  TEXT NOT NULL,
+    run_id           TEXT NOT NULL
+);
+
+-- A subject enters one digest only, even if the session resumes later.
+CREATE TABLE IF NOT EXISTS friction_digest_sessions (
+    subject_id   TEXT PRIMARY KEY,
+    date         TEXT NOT NULL,
+    subject_kind TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_digest_sessions_date
+    ON friction_digest_sessions(date);
+
+-- Local recurrence per fingerprint across digests.
+CREATE TABLE IF NOT EXISTS friction_patterns (
+    fingerprint      TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    first_seen_date  TEXT NOT NULL,
+    last_seen_date   TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL,
+    session_count    INTEGER NOT NULL,
+    last_subject_id  TEXT NOT NULL,
+    last_ordinal     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_patterns_last_seen
+    ON friction_patterns(last_seen_date);
+
+-- The Kata issue filed or linked for a Friction Log pattern. Kata owns the
+-- issue's state; this keeps only enough to find and show it, and survives a
+-- full resync with the other friction tables.
+CREATE TABLE IF NOT EXISTS friction_issue_links (
+    fingerprint       TEXT PRIMARY KEY,
+    kata_instance_uid TEXT NOT NULL,
+    kata_project_uid  TEXT NOT NULL,
+    issue_uid         TEXT NOT NULL,
+    qualified_id      TEXT NOT NULL,
+    web_url           TEXT NOT NULL DEFAULT '',
+    source            TEXT NOT NULL,
+    linked_at         TEXT NOT NULL
+);
+
+-- Why automatic filing has not linked a pattern: a failure to retry, a case
+-- a person must settle, or a link a person removed. Linking clears the row.
+CREATE TABLE IF NOT EXISTS friction_filing_state (
+    fingerprint     TEXT PRIMARY KEY,
+    state           TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    first_failed_at TEXT,
+    next_attempt_at TEXT,
+    last_error      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL
+);
+
 -- Durable normalized-artifact import claims. Artifact kinds evolve
 -- independently, so each claim retains a separate version gate.
 CREATE TABLE IF NOT EXISTS artifact_import_queue (
@@ -1339,6 +1555,7 @@ CREATE TABLE IF NOT EXISTS artifact_checkpoint_landings (
     checkpoint_size   INTEGER NOT NULL
 );
 
+-- Unused; kept because builds up to v0.44 require it for read-only opens.
 CREATE TABLE IF NOT EXISTS artifact_checkpoint_landing_sessions (
     origin        TEXT NOT NULL,
     gid           TEXT NOT NULL,
@@ -1404,6 +1621,7 @@ CREATE TABLE IF NOT EXISTS tool_call_occurrence_agent_state (
     agent_id           TEXT NOT NULL,
     first_event_index  INTEGER NOT NULL,
     latest_event_index INTEGER NOT NULL,
+    latest_evidence_event_index INTEGER DEFAULT -1,
     PRIMARY KEY (session_id, message_ordinal, call_index, agent_id)
 );
 
@@ -1450,18 +1668,24 @@ CREATE TABLE IF NOT EXISTS session_signal_state (
 );
 
 -- SQLite-only parser-proven conversation projection and compact latest changes.
--- Bodies are stored once here; removed rows retain metadata, not old text.
+-- Text lives in messages and is read back by ordinal; body is retired and
+-- stays NULL. Removed rows retain metadata, not old text.
 CREATE TABLE IF NOT EXISTS conversation_messages (
     session_id TEXT NOT NULL, message_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL, role TEXT NOT NULL, timestamp TEXT NOT NULL DEFAULT '',
     source_id TEXT NOT NULL DEFAULT '', body TEXT, digest TEXT NOT NULL DEFAULT '',
-    text_bytes INTEGER NOT NULL DEFAULT 0, gap TEXT NOT NULL DEFAULT '',
+    text_bytes INTEGER NOT NULL DEFAULT 0,
+    visible_digest TEXT NOT NULL DEFAULT '',
+    visible_text_bytes INTEGER NOT NULL DEFAULT 0,
+    visible_gap TEXT NOT NULL DEFAULT 'visible_text_unavailable', gap TEXT NOT NULL DEFAULT '',
     deleted INTEGER NOT NULL DEFAULT 0, removed INTEGER NOT NULL DEFAULT 0,
     revision INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(session_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_messages_revision ON conversation_messages(revision);
 CREATE INDEX IF NOT EXISTS idx_conversation_messages_source ON conversation_messages(session_id, source_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_ordinal
+    ON conversation_messages(session_id, ordinal) WHERE removed = 0;
 CREATE TABLE IF NOT EXISTS conversation_session_changes (
     session_id TEXT PRIMARY KEY,
     revision INTEGER NOT NULL,
@@ -1469,3 +1693,150 @@ CREATE TABLE IF NOT EXISTS conversation_session_changes (
     gap TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_session_changes_revision ON conversation_session_changes(revision);
+
+-- Durable local raw archive identity, inventory and accepted generations.
+CREATE TABLE IF NOT EXISTS raw_archive_roots (
+    id TEXT PRIMARY KEY, device_id TEXT NOT NULL, machine TEXT NOT NULL,
+    provider TEXT NOT NULL, original_path TEXT NOT NULL, configured_root_id TEXT NOT NULL,
+    UNIQUE(device_id,provider,configured_root_id)
+);
+CREATE TABLE IF NOT EXISTS raw_archive_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id TEXT NOT NULL REFERENCES raw_archive_roots(id), path TEXT NOT NULL,
+    sha256 TEXT NOT NULL, size INTEGER NOT NULL, mod_time_ns INTEGER NOT NULL,
+    covered INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(root_id,path,sha256)
+);
+CREATE TABLE IF NOT EXISTS raw_archive_sources (
+    manifest_id TEXT PRIMARY KEY, root_id TEXT NOT NULL REFERENCES raw_archive_roots(id),
+    source_key TEXT NOT NULL, original_path TEXT NOT NULL, canonical_json BLOB NOT NULL,
+    parse_error TEXT NOT NULL DEFAULT '', processing_version TEXT NOT NULL DEFAULT '',
+    UNIQUE(root_id,source_key)
+);
+
+-- Source deletion policy is frozen with the first imported capture. These
+-- records and mappings survive a projection rebuild independently of sessions.
+CREATE TABLE IF NOT EXISTS raw_archive_devices (
+    device_id TEXT PRIMARY KEY, suppressions BLOB NOT NULL
+);
+-- Other spellings of a root's original path, verified at capture time, that
+-- seeded sessions may store for the same transcripts.
+CREATE TABLE IF NOT EXISTS raw_archive_root_aliases (
+    root_id TEXT NOT NULL REFERENCES raw_archive_roots(id), alias TEXT NOT NULL,
+    PRIMARY KEY(root_id,alias)
+);
+CREATE TABLE IF NOT EXISTS raw_archive_sessions (
+    device_id TEXT NOT NULL, provider TEXT NOT NULL, parser_id TEXT NOT NULL,
+    session_id TEXT NOT NULL UNIQUE,
+    root_id TEXT NOT NULL REFERENCES raw_archive_roots(id), source_key TEXT NOT NULL,
+    PRIMARY KEY(device_id,provider,parser_id)
+);
+
+-- Attached history remains in an external archive. These rows own the local
+-- projection independently of disposable source indexes and mount paths.
+CREATE TABLE IF NOT EXISTS archive_attachments (
+    repository_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, archive_id TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT '', pending_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(repository_id,snapshot_id)
+);
+CREATE TABLE IF NOT EXISTS archive_source_bindings (
+    archive_id TEXT NOT NULL, device_id TEXT NOT NULL, root_id TEXT NOT NULL,
+    source_key TEXT NOT NULL, manifest_id TEXT NOT NULL,
+    PRIMARY KEY(archive_id,device_id,root_id,source_key)
+);
+CREATE TABLE IF NOT EXISTS archive_attachment_sources (
+    repository_id TEXT NOT NULL, snapshot_id TEXT NOT NULL,
+    archive_id TEXT NOT NULL, device_id TEXT NOT NULL, root_id TEXT NOT NULL, source_key TEXT NOT NULL,
+    target TEXT NOT NULL, completed_target TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(repository_id,snapshot_id,archive_id,device_id,root_id,source_key),
+    FOREIGN KEY(repository_id,snapshot_id) REFERENCES archive_attachments(repository_id,snapshot_id),
+    FOREIGN KEY(archive_id,device_id,root_id,source_key) REFERENCES archive_source_bindings(archive_id,device_id,root_id,source_key)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_attachment_pending
+    ON archive_attachment_sources(repository_id,snapshot_id,root_id,source_key)
+    WHERE completed_target != target;
+
+CREATE TABLE IF NOT EXISTS archive_session_provenance (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    archive_id TEXT NOT NULL, device_id TEXT NOT NULL, root_id TEXT NOT NULL, source_key TEXT NOT NULL,
+    manifest_id TEXT NOT NULL, native_session_id TEXT NOT NULL,
+    FOREIGN KEY(archive_id,device_id,root_id,source_key) REFERENCES archive_source_bindings(archive_id,device_id,root_id,source_key)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_session_source
+    ON archive_session_provenance(archive_id,device_id,root_id,source_key);
+
+-- Transcript evidence survives permanent session deletion.
+CREATE TABLE IF NOT EXISTS commit_links (
+    session_id TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    message_ordinal INTEGER NOT NULL,
+    call_index INTEGER NOT NULL,
+    tool_use_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    project TEXT NOT NULL,
+    PRIMARY KEY (session_id, sha)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_links_sha ON commit_links(sha);
+
+-- Capture moves since the last transcript write before losing the session row.
+CREATE TRIGGER IF NOT EXISTS trg_commit_links_deletion_project
+BEFORE DELETE ON sessions
+BEGIN
+    UPDATE commit_links SET project=OLD.project WHERE session_id=OLD.id;
+END;
+
+-- Git trailer evidence survives transcript rewrites and checkout removal.
+CREATE TABLE IF NOT EXISTS commit_trailers (
+    session_id TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    project TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (session_id, sha)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_trailers_sha ON commit_trailers(sha);
+
+-- Local replay evidence commits with fork messages and survives archive rebuilds.
+CREATE TABLE IF NOT EXISTS codex_fork_state (
+ session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+ state_json TEXT NOT NULL
+);
+
+-- OCR text is shared by all occurrences of the same image and processor.
+CREATE TABLE IF NOT EXISTS image_text_cache (
+    id INTEGER PRIMARY KEY,
+    image_hash TEXT NOT NULL,
+    processor TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    succeeded INTEGER NOT NULL DEFAULT 0,
+    failures INTEGER NOT NULL DEFAULT 0,
+    retry_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    UNIQUE (image_hash, processor)
+);
+
+CREATE TABLE IF NOT EXISTS image_text_occurrences (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    -- Source rows can be replaced before the session refreshes this projection.
+    call_id INTEGER,
+    event_id INTEGER,
+    image_index INTEGER NOT NULL,
+    image_hash TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_image_text_occurrences_call ON image_text_occurrences(call_id, image_index) WHERE call_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_image_text_occurrences_event ON image_text_occurrences(event_id, image_index) WHERE event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_image_text_occurrences_session ON image_text_occurrences(session_id);
+CREATE INDEX IF NOT EXISTS idx_image_text_occurrences_hash ON image_text_occurrences(image_hash);
+
+CREATE TRIGGER IF NOT EXISTS image_text_session_delete BEFORE DELETE ON sessions BEGIN
+    DELETE FROM image_text_cache WHERE image_hash IN (SELECT image_hash FROM image_text_occurrences WHERE session_id=old.id)
+    AND NOT EXISTS (SELECT 1 FROM image_text_occurrences o WHERE o.image_hash=image_text_cache.image_hash AND o.session_id<>old.id);
+END;

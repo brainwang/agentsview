@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { formatCount } from "../../utils/format.js";
+  import { Table } from "@kenn-io/kit-ui";
   import { Chart, Circle, Layer, Line, Spline } from "layerchart";
   import { scalePoint } from "d3-scale";
   import { analytics } from "../../stores/analytics.svelte.js";
   import { settings } from "../../stores/settings.svelte.js";
   import GranularityPicker from "../shared/GranularityPicker.svelte";
-  import { formatDateTime, getLocale, m } from "../../i18n/index.js";
+  import PanelStatus from "./PanelStatus.svelte";
+  import { formatDateTime, m } from "../../i18n/index.js";
   import { parseLocalDate } from "../../utils/dates.js";
   import { chartSeriesColorMap } from "../../utils/chartPalette.js";
   import LargeChartFrame from "../shared/LargeChartFrame.svelte";
@@ -12,6 +15,10 @@
   // Soft cap from the series-count ladder: past six skills the tail folds
   // into "Other" instead of generating more hues.
   const MAX_SERIES = 6;
+  const CHART_SERIES_COLORS = Array.from(
+    { length: MAX_SERIES },
+    (_, index) => `var(--chart-series-${index + 1})`,
+  );
   const OTHER_KEY = "__other__";
   const PLOT_HEIGHT = 120;
   const PLOT_TOP = 8;
@@ -21,7 +28,14 @@
   const PLOT_RIGHT = 10;
   const MAX_X_LABELS = 14;
 
-  const trendEntries = $derived(analytics.skills?.trend ?? []);
+  // The trend belongs to the grouping it was fetched with; hide it while
+  // the selected grouping is loading or has failed.
+  const skills = $derived(
+    analytics.requestedSkillsGranularity === analytics.skillsGranularity
+      ? analytics.skills
+      : null,
+  );
+  const trendEntries = $derived(skills?.trend ?? []);
 
   const skillTotals = $derived.by(() => {
     const totals = new Map<string, number>();
@@ -104,7 +118,7 @@
   const colorMap = $derived(chartSeriesColorMap(
     allSeries.map((series) => series.key),
     settings.chartPalette,
-    (_key, index) => `var(--chart-series-${index + 1})`,
+    CHART_SERIES_COLORS,
     "var(--chart-series-other)",
   ));
 
@@ -260,25 +274,20 @@
   <div class="trend-header">
     <h3 class="chart-title">{m.analytics_skill_trend_title()}</h3>
     <GranularityPicker
-      value={analytics.skillsGranularity}
+      value={analytics.requestedSkillsGranularity}
       onChange={(g) => analytics.setSkillsGranularity(g)}
       disabled={analytics.querying.skills}
     />
   </div>
 
-  {#if analytics.errors.skills}
-    <div class="error">
-      {analytics.errors.skills}
-      <button
-        class="retry-btn"
-        onclick={() => analytics.fetchSkills()}
-      >
-        {m.shared_retry()}
-      </button>
-    </div>
-  {:else if analytics.loading.skills && trendEntries.length === 0}
-    <div class="empty">{m.analytics_skill_trend_loading()}</div>
-  {:else if trendEntries.length > 0 && allSeries.length > 0}
+  <PanelStatus
+    hasData={skills !== null}
+    pending={analytics.querying.skills}
+    error={analytics.errors.skills}
+    onRetry={() => analytics.fetchSkills()}
+    loadingLabel={m.analytics_skill_trend_loading()}
+  />
+  {#if trendEntries.length > 0 && allSeries.length > 0}
     <div
       class="legend"
       role="group"
@@ -297,7 +306,7 @@
           ></span>
           <span class="legend-name">{series.label}</span>
           <span class="legend-count">
-            {series.total.toLocaleString(getLocale())}
+            {formatCount(series.total)}
           </span>
         </button>
       {/each}
@@ -340,7 +349,7 @@
             {xTicks}
             yTicks={4}
             formatX={(value) => bucketLabel(String(value))}
-            formatY={(value) => Number(value).toLocaleString(getLocale())}
+            formatY={(value) => formatCount(Number(value))}
           >
             {#each chartSeries as series (series.key)}
               {#if trendEntries.length > 1}
@@ -386,27 +395,29 @@
           </LargeChartFrame>
         </Layer>
       </Chart>
-      <table id="skill-trend-data" class="kit-sr-only">
-        <caption>{m.analytics_skill_trend_title()}</caption>
-        <thead>
-          <tr>
-            <th scope="col">{m.analytics_skill_trend_date()}</th>
-            {#each allSeries as series (series.key)}
-              <th scope="col">{series.label}</th>
-            {/each}
-          </tr>
-        </thead>
-        <tbody>
-          {#each trendEntries as entry, index (entry.date)}
+      <div id="skill-trend-data" class="kit-sr-only">
+        <Table bare unsorted>
+          <caption>{m.analytics_skill_trend_title()}</caption>
+          <thead>
             <tr>
-              <th scope="row">{bucketDateLabel(entry.date)}</th>
+              <th scope="col">{m.analytics_skill_trend_date()}</th>
               {#each allSeries as series (series.key)}
-                <td>{(series.values[index] ?? 0).toLocaleString(getLocale())}</td>
+                <th scope="col">{series.label}</th>
               {/each}
             </tr>
-          {/each}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {#each trendEntries as entry, index (entry.date)}
+              <tr>
+                <th scope="row">{bucketDateLabel(entry.date)}</th>
+                {#each allSeries as series (series.key)}
+                  <td>{formatCount(series.values[index] ?? 0)}</td>
+                {/each}
+              </tr>
+            {/each}
+          </tbody>
+        </Table>
+      </div>
     </div>
 
     {#if hoverIndex !== null && tooltipPos}
@@ -426,14 +437,14 @@
               style="background: {seriesColor(row.key)}"
             ></span>
             <span class="tip-value">
-              {row.value.toLocaleString(getLocale())}
+              {formatCount(row.value)}
             </span>
             <span class="tip-name">{row.label}</span>
           </div>
         {/each}
       </div>
     {/if}
-  {:else}
+  {:else if skills}
     <div class="empty">{m.analytics_skill_trend_empty()}</div>
   {/if}
 </div>
@@ -478,7 +489,7 @@
     border-radius: var(--radius-sm);
     background: var(--bg-inset);
     color: var(--text-secondary);
-    font-size: 10px;
+    font-size: 11px;
     cursor: pointer;
     transition: opacity 0.1s, background 0.1s;
   }
@@ -551,7 +562,7 @@
     padding: 5px 8px;
     background: var(--text-primary);
     color: var(--bg-primary);
-    font-size: 10px;
+    font-size: 11px;
     border-radius: var(--radius-sm);
     white-space: nowrap;
     pointer-events: none;
@@ -592,23 +603,5 @@
     font-size: 12px;
     padding: 24px;
     text-align: center;
-  }
-
-  .error {
-    color: var(--accent-red);
-    font-size: 12px;
-    padding: 12px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .retry-btn {
-    padding: 2px 8px;
-    border: 1px solid currentColor;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    color: inherit;
-    cursor: pointer;
   }
 </style>

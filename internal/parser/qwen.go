@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"cmp"
+	"context"
 	"encoding/json/v2"
 	"fmt"
 	"os"
@@ -25,7 +27,7 @@ import (
 // tool-call-only entries with no text follow-up is emitted as a single
 // coalesced assistant message so the data isn't lost.
 func parseQwenSession(
-	path, project, machine string,
+	ctx context.Context, path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -38,13 +40,15 @@ func parseQwenSession(
 	}
 	defer f.Close()
 
-	lr := newLineReader(f, maxLineSize)
+	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
 
 	var (
 		sessionID    string
 		cwd          string
 		firstMessage string
+		userTitle    string
+		autoTitle    string
 		startedAt    time.Time
 		endedAt      time.Time
 		ordinal      int
@@ -88,6 +92,23 @@ func parseQwenSession(
 		}
 
 		switch root.Get("type").Str {
+		case "system":
+			// /rename and the title generator append custom_title
+			// records. The latest user title wins over the latest
+			// generated one; records written before titleSource
+			// existed are user renames.
+			if root.Get("subtype").Str != "custom_title" {
+				continue
+			}
+			title := strings.TrimSpace(
+				root.Get("systemPayload.customTitle").Str,
+			)
+			if root.Get("systemPayload.titleSource").Str == "auto" {
+				autoTitle = title
+			} else {
+				userTitle = title
+			}
+
 		case "user":
 			if root.Get("message.role").Str != "user" {
 				continue
@@ -169,16 +190,23 @@ func parseQwenSession(
 		sessionID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	}
 	if project == "" && cwd != "" {
-		project = ExtractProjectFromCwd(cwd)
+		project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
+	}
+
+	sessionName := cmp.Or(userTitle, autoTitle)
+	if firstMessage == "" {
+		firstMessage = truncate(sessionName, 300)
 	}
 
 	sess := &ParsedSession{
+		MalformedLines:   lr.SkippedLines(),
 		ID:               "qwen:" + sessionID,
 		Project:          project,
 		Machine:          machine,
 		Agent:            AgentQwen,
 		Cwd:              cwd,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
 		MessageCount:     len(messages),

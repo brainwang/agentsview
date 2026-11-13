@@ -18,9 +18,10 @@ const diffDeleteChunkSize = 500
 // declaration order. insertMessagesTx and the diff UPDATE share it
 // so the persisted tuple has exactly one definition.
 func messageInsertArgs(m Message) []any {
+	dialogue, dialogueIsContent := StoredDialogue(m.Content, m.ThinkingText, m.DialogueText)
 	return []any{
 		m.SessionID, m.Ordinal, m.Role, m.Content,
-		m.ThinkingText,
+		m.ThinkingText, dialogue, dialogueIsContent,
 		m.Timestamp, m.HasThinking, m.HasToolUse,
 		m.ContentLength, m.IsSystem,
 		m.Model, m.ReasoningEffort, string(m.TokenUsage),
@@ -48,6 +49,10 @@ var messageUpdateSetClause = func() string {
 // Both sides go through the same resolve helpers the insert path
 // uses, so equality is defined on exactly the persisted tuples.
 func messageRowEqual(a, b Message) bool {
+	if a.DialogueText != b.DialogueText &&
+		(a.DialogueText == nil || b.DialogueText == nil || *a.DialogueText != *b.DialogueText) {
+		return false
+	}
 	if a.SessionID != b.SessionID || a.Ordinal != b.Ordinal ||
 		a.Role != b.Role || a.Content != b.Content ||
 		a.ThinkingText != b.ThinkingText || a.Timestamp != b.Timestamp ||
@@ -135,11 +140,9 @@ type messageDiffPlan struct {
 // must use the full replace path; a load failure also degrades to
 // full replace rather than failing the write.
 func (db *DB) planStoredMessageDiff(
-	sessionID string, msgs []Message,
+	ctx context.Context, sessionID string, msgs []Message,
 ) (messageDiffPlan, []Message, bool, bool) {
-	stored, err := db.GetAllMessages(
-		context.Background(), sessionID,
-	)
+	stored, err := db.GetAllMessages(ctx, sessionID)
 	if err != nil {
 		return messageDiffPlan{}, nil, false, false
 	}
@@ -172,9 +175,49 @@ func transcriptMessagesEqual(stored, incoming []Message) bool {
 	return true
 }
 
+// transcriptMessagesGainSourceIDs reports whether incoming repeats stored
+// except that rows stored without a source ID now carry one, and each such ID
+// occurs once in incoming. These are the same messages after a parser starts
+// keeping native IDs, so a caller can update them in place and keep their
+// row IDs, pins, and notes.
+func transcriptMessagesGainSourceIDs(stored, incoming []Message) bool {
+	if len(stored) != len(incoming) {
+		return false
+	}
+	byOrdinal := make(map[int]Message, len(stored))
+	for _, msg := range stored {
+		if _, exists := byOrdinal[msg.Ordinal]; exists {
+			return false
+		}
+		byOrdinal[msg.Ordinal] = msg
+	}
+	counts := messageSourceUUIDCounts(incoming)
+	seen := make(map[int]bool, len(incoming))
+	gained := false
+	for _, msg := range incoming {
+		old, exists := byOrdinal[msg.Ordinal]
+		if !exists || seen[msg.Ordinal] {
+			return false
+		}
+		seen[msg.Ordinal] = true
+		if old.SourceUUID == "" && msg.SourceUUID != "" {
+			if counts[msg.SourceUUID] != 1 {
+				return false
+			}
+			old.SourceUUID = msg.SourceUUID
+			gained = true
+		}
+		if !transcriptMessageEqual(old, msg) {
+			return false
+		}
+	}
+	return gained
+}
+
 func transcriptMessageEqual(a, b Message) bool {
 	comparableTranscriptMessage := func(msg Message) Message {
 		msg.ID = 0
+		msg.DialogueText = nil
 		msg.ContentLength = 0
 		msg.SourceType = ""
 		msg.SourceParentUUID = ""
@@ -206,10 +249,13 @@ func transcriptMessageEqual(a, b Message) bool {
 //   - duplicate ordinals on either side;
 //   - a changed row's source_uuid differs from the stored row's
 //     (the ordinal now holds a different message, so pins must be
-//     re-matched by source_uuid — full replace's job);
+//     re-matched by source_uuid — full replace's job), unless the
+//     stored row had none and gains one used once in incoming while
+//     staying unchanged or completing its text;
 //   - more than half the stored rows changed (an ordinal-shifting
 //     rewrite, where full replace's source_uuid pin re-matching and
-//     bulk FTS handling are the right tool).
+//     bulk FTS handling are the right tool). Rows that only gain a
+//     source_uuid do not count: they cannot shift.
 func planSessionMessageDiff(
 	stored, incoming []Message,
 ) (messageDiffPlan, bool) {
@@ -227,6 +273,7 @@ func planSessionMessageDiff(
 	incomingUUIDCounts := messageSourceUUIDCounts(incoming)
 
 	var plan messageDiffPlan
+	shifting := 0
 	seen := make(map[int]bool, len(incoming))
 	for _, m := range incoming {
 		if seen[m.Ordinal] {
@@ -238,8 +285,22 @@ func planSessionMessageDiff(
 		case !exists:
 			plan.inserts = append(plan.inserts, m)
 		case !messageRowEqual(old, m):
-			if old.SourceUUID != m.SourceUUID {
+			gainsSourceUUID := old.SourceUUID == "" && m.SourceUUID != "" &&
+				incomingUUIDCounts[m.SourceUUID] == 1
+			if old.SourceUUID != m.SourceUUID && !gainsSourceUUID {
 				return messageDiffPlan{}, false
+			}
+			withSourceUUID := old
+			withSourceUUID.SourceUUID = m.SourceUUID
+			onlyGainsSourceUUID := gainsSourceUUID && messageRowEqual(withSourceUUID, m)
+			// A gained ID proves nothing about which message moved where,
+			// so the row must be unchanged or the same reply completed.
+			if gainsSourceUUID && !onlyGainsSourceUUID &&
+				(old.Role != m.Role || !IsTextExtension(old.Content, m.Content)) {
+				return messageDiffPlan{}, false
+			}
+			if !onlyGainsSourceUUID {
+				shifting++
 			}
 			plan.updates = append(plan.updates, messageDiffUpdate{
 				id:  old.ID,
@@ -259,7 +320,7 @@ func planSessionMessageDiff(
 			return messageDiffPlan{}, false
 		}
 	}
-	if 2*len(plan.updates) > len(stored) {
+	if 2*shifting > len(stored) {
 		return messageDiffPlan{}, false
 	}
 	return plan, true
@@ -273,6 +334,14 @@ func messageSourceUUIDCounts(msgs []Message) map[string]int {
 		}
 	}
 	return counts
+}
+
+// IsTextExtension reports whether incoming completes stored: stored is a
+// non-empty strict prefix of incoming. An empty stored text never qualifies,
+// so a placeholder or policy-blanked row cannot claim arbitrary text.
+func IsTextExtension(stored, incoming string) bool {
+	return stored != "" && len(incoming) > len(stored) &&
+		strings.HasPrefix(incoming, stored)
 }
 
 func messagePinIdentityStable(
@@ -294,11 +363,8 @@ func messagePinIdentityStable(
 	// A content extension is the same message completed by a later
 	// parse (e.g. a streamed partial response): the row keeps its
 	// ordinal, role, and source uuid (the caller refuses uuid
-	// changes), so the in-place update may retain the pin. The old
-	// content must be a non-empty prefix so an empty placeholder
-	// cannot claim an arbitrary replacement as its completion.
-	return old.Content != "" &&
-		strings.HasPrefix(incoming.Content, old.Content)
+	// changes), so the in-place update may retain the pin.
+	return IsTextExtension(old.Content, incoming.Content)
 }
 
 // messageDiffNeedsPinRemapTx reports whether an in-place update would

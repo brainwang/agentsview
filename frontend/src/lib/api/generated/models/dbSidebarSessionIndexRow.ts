@@ -16,10 +16,13 @@ export interface DbSidebarSessionIndexRow {
   machine: string;
   message_count: number;
   parent_session_id?: string;
+  parent_session_ids?: string[];
   project: string;
   project_assigned?: boolean;
   relationship_type?: string;
   session_kind?: string;
+  /** Contributing hosted device machine IDs; omitted for sessions without hosted provenance. */
+  source_machines?: string[];
   /** @nullable */
   started_at: string | null;
   termination_status?: string;

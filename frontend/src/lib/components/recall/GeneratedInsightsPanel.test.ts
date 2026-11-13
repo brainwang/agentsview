@@ -1,3 +1,6 @@
+import { reportErrorShown } from "../../utils/telemetry.js";
+import type { InsightTask } from "../../stores/insights.svelte.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
@@ -50,9 +53,9 @@ const state = vi.hoisted(() => {
       tasks: [],
       loading: false,
       selectedId: 42,
-      selectedTaskId: null,
+      selectedTaskId: null as string | null,
       selectedItem,
-      selectedTask: undefined,
+      selectedTask: undefined as InsightTask | undefined,
       cancelInFlightReads: mocks.cancelInFlightReads,
       deleteItem: mocks.deleteItem,
       dismissTask: vi.fn(),
@@ -73,9 +76,19 @@ const state = vi.hoisted(() => {
   };
 });
 
-vi.mock("../../stores/insights.svelte.js", () => ({
-  insights: state.store,
-}));
+vi.mock("../../stores/insights.svelte.js", async () => {
+  const { SvelteMap } = await import("svelte/reactivity");
+  const selected = new SvelteMap<string, unknown>();
+  for (const key of ["selectedTask", "selectedTaskId"]) {
+    Object.defineProperty(state.store, key, {
+      get: () => selected.get(key),
+      set: (value: unknown) => {
+        selected.set(key, value);
+      },
+    });
+  }
+  return { insights: state.store };
+});
 
 vi.mock("../../stores/sessions.svelte.js", () => ({
   sessions: state.sessions,
@@ -106,8 +119,10 @@ describe("GeneratedInsightsPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.serverVersion.insight_generation_available = true;
+    state.serverVersion.read_only = false;
     router.route = "recall";
     router.params = { tab: "generated" };
+    state.store.selectedTask = undefined;
     state.store.selectedId = 42;
     state.store.selectedItem = state.store.items[0]!;
     state.sessions.agents = [];
@@ -119,6 +134,35 @@ describe("GeneratedInsightsPanel", () => {
     component = undefined;
     document.body.innerHTML = "";
     router.params = {};
+  });
+
+  it("counts a retry failure with the same task ID", async () => {
+    const failed = { clientId: "task-a", status: "error", error: "Failed" } as InsightTask;
+    state.store.selectedTask = failed;
+    state.store.selectedTaskId = "task-a";
+    state.store.retryTask.mockImplementation(() => {
+      state.store.selectedTask = { ...failed, status: "generating", error: null };
+    });
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("insight");
+    document.querySelector<HTMLButtonElement>(".generated-actions button")!.click();
+    await tick();
+    state.store.selectedTask = { ...failed };
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(2);
+    state.store.selectedTask = { ...failed };
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(2);
+    state.store.selectedTaskId = "task-b";
+    state.store.selectedTask = { ...failed, clientId: "task-b" };
+    await tick();
+    mocks.select.mockImplementation(() => (state.store.selectedTask = undefined));
+    document.querySelector<HTMLButtonElement>(".generated-list button")!.click();
+    await tick();
+    state.store.selectedTask = failed;
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(4);
   });
 
   it("shows every input that scopes a generated report", async () => {
@@ -162,6 +206,35 @@ describe("GeneratedInsightsPanel", () => {
     expect(generate!.disabled).toBe(true);
     generate!.click();
     expect(mocks.generate).not.toHaveBeenCalled();
+    // The reason sits beside the button and describes it.
+    const reason = document.getElementById(generate!.getAttribute("aria-describedby")!);
+    expect(reason?.textContent?.trim()).toBe("Insight generation is unavailable for this archive");
+  });
+
+  it("explains a read-only archive beside the disabled Generate button", async () => {
+    state.serverVersion.insight_generation_available = false;
+    state.serverVersion.read_only = true;
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    const generate = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Generate",
+    );
+    expect(generate!.disabled).toBe(true);
+    const reason = document.getElementById(generate!.getAttribute("aria-describedby")!);
+    expect(reason?.textContent?.trim()).toBe(
+      "This archive is read-only, so new reports can't be generated here.",
+    );
+  });
+
+  it("shows no unavailable reason while generation is available", async () => {
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    const generate = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Generate",
+    );
+    expect(generate!.disabled).toBe(false);
+    expect(generate!.hasAttribute("aria-describedby")).toBe(false);
+    expect(document.querySelector(".generate-reason")).toBeNull();
   });
 
   it("generates from the scope retained in the insights store", async () => {
@@ -208,6 +281,62 @@ describe("GeneratedInsightsPanel", () => {
     expect(setPublishTarget).toHaveBeenCalledWith({ kind: "insight", id: 42 });
     expect(mocks.deleteItem).toHaveBeenCalledWith(42);
     expect(router.params).toEqual({ tab: "generated" });
+  });
+
+  it("renders canned reports as Markdown and routes tool-effectiveness reports to their view", async () => {
+    state.store.selectedItem = {
+      ...state.store.items[0]!,
+      schema_version: "llm_insight.v1",
+      structured_json: JSON.stringify({
+        schema_version: "llm_insight.v1",
+        summary: "s",
+        recommendations: [],
+      }),
+    } as typeof state.store.selectedItem;
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(document.querySelector("[data-testid=tool-effectiveness-unavailable]")).toBeNull();
+    expect(document.querySelector(".generated-detail .markdown-body")?.textContent).toContain(
+      "# Generated report",
+    );
+    expect(document.querySelector(".tool-effectiveness-report")).toBeNull();
+    await unmount(component);
+
+    state.store.selectedItem = {
+      ...state.store.items[0]!,
+      type: "tool_effectiveness",
+      kind: "",
+      content: "saved tool report",
+    };
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(document.querySelector("[data-testid=tool-effectiveness-unavailable]")).not.toBeNull();
+    expect(document.body.textContent).toContain("saved tool report");
+    expect(document.querySelector(".generated-badge")?.textContent?.trim()).toBe(
+      "Tool Effectiveness",
+    );
+    expect(document.body.textContent).not.toContain("calls judged");
+    await unmount(component);
+
+    state.store.selectedItem = {
+      ...state.store.items[0]!,
+      type: "tool_effectiveness",
+      kind: "",
+      schema_version: "tool_effectiveness.v1",
+      structured_json: JSON.stringify({
+        session_id: "s1",
+        call_count: 1234,
+        conclusions: [{ assessment: "helped", text: "Read found it", ordinals: [1], calls: [] }],
+        omissions: [],
+      }),
+    } as typeof state.store.selectedItem;
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(document.querySelector(".tool-effectiveness-report")).not.toBeNull();
+    const chips = [...document.querySelectorAll(".generated-meta-chip")].map((c) =>
+      c.textContent?.trim(),
+    );
+    expect(chips).toContain("1.2K calls judged");
   });
 
   it("cancels archive reads without canceling generation tasks", async () => {

@@ -10,22 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestProviderCapabilitiesWatchRootsDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).WatchRoots)
-}
-
-func TestProviderCapabilitiesStreamingDiscoveryDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StreamingDiscovery)
-}
-
-func TestProviderCapabilitiesPersistentArchiveDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).PersistentArchive)
-}
-
-func TestProviderCapabilitiesS3DiscoveryDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery)
-}
-
 func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery,
 		"new providers must opt in explicitly")
@@ -52,6 +36,15 @@ func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
 	}
 }
 
+func TestProviderCapabilitiesAppOwnedStorePaths(t *testing.T) {
+	for _, agent := range []AgentType{AgentHermes, AgentAugureDesktop, AgentPi, AgentClaude, AgentType("unknown")} {
+		for _, path := range []string{"state.db", "state.db#one", "profile#one/state.db#two", "sessions/one.jsonl", "session_one.json", ""} {
+			want := (agent == AgentHermes || agent == AgentAugureDesktop) && (path == "state.db" || path == "state.db#one" || path == "profile#one/state.db#two")
+			assert.Equalf(t, want, OwnsAppStore(agent, path), "%s: %s", agent, path)
+		}
+	}
+}
+
 func TestProviderCapabilitiesActivityHintsMatchConsumers(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).ActivityHints,
 		"new providers must opt in explicitly")
@@ -59,11 +52,11 @@ func TestProviderCapabilitiesActivityHintsMatchConsumers(t *testing.T) {
 	for _, factory := range ProviderFactories() {
 		agent := factory.Definition().Type
 		got := factory.Capabilities().Source.ActivityHints
-		// TraeX and Augure Code inherit the Codex hint reader through the
-		// shared provider. A fork that writes no history.jsonl (none has been
+		// Codex forks inherit the Codex hint reader through the shared
+		// provider. A fork that writes no history.jsonl (none has been
 		// observed for Augure) simply yields no hints; the capability claim
 		// itself must stay consistent with the shared factory.
-		if agent == AgentCodex || agent == AgentTraeX || agent == AgentAugureCode {
+		if IsCodexFormatAgent(agent) {
 			assert.Equal(t, CapabilitySupported, got)
 			provider := factory.NewProvider(ProviderConfig{
 				Roots: []string{t.TempDir()},
@@ -84,7 +77,11 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		agent := factory.Definition().Type
 		got := factory.Capabilities().Source.ChangedPathRelevance
 		if agent == AgentOpenCode || agent == AgentKilo ||
-			agent == AgentMiMoCode || agent == AgentIcodemate {
+			agent == AgentMiMoCode || agent == AgentIcodemate || agent == AgentJunie ||
+			agent == AgentCodebuff || agent == AgentVibe ||
+			agent == AgentAntigravityCLI || agent == AgentAntigravity ||
+			agent == AgentGemini || agent == AgentPi ||
+			agent == AgentOMO || agent == AgentStepCode {
 			assert.Equal(t, CapabilitySupported, got)
 			provider := factory.NewProvider(ProviderConfig{
 				Roots: []string{t.TempDir()},
@@ -94,6 +91,33 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		}
 		assert.Equalf(t, CapabilityUnsupported, got,
 			"%s must not classify watch path relevance", agent)
+	}
+}
+
+func TestProviderCapabilitiesStoredMemberFreshnessListingMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StoredMemberFreshnessListing,
+		"new providers must opt in explicitly")
+
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.StoredMemberFreshnessListing
+		root := t.TempDir()
+		provider := factory.NewProvider(ProviderConfig{Roots: []string{root}})
+		// Every SourceSetProvider forwards the resolver method, so the capability is the gate.
+		if agent == AgentCursorIDE {
+			assert.Equal(t, CapabilitySupported, got)
+			dbPath := filepath.Join(root, CursorIDEDBRelPath)
+			container, ok := ResolveStoredMemberFreshnessContainer(provider, dbPath)
+			assert.True(t, ok)
+			assert.Equal(t, dbPath, container)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not declare a stored member freshness listing", agent)
+		_, ok := ResolveStoredMemberFreshnessContainer(
+			provider, filepath.Join(root, "x.db"),
+		)
+		assert.Falsef(t, ok, "%s must not resolve a stored freshness container", agent)
 	}
 }
 

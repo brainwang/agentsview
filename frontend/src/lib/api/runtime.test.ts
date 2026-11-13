@@ -1,12 +1,38 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { getApiV1Version } from "./generated/metadata/metadata.js";
-import { ApiError, orvalFetch, responseTimingOf, setAuthToken } from "./runtime.js";
+import {
+  ApiError,
+  TransportError,
+  isTransient,
+  orvalFetch,
+  getServerUrl,
+  responseTimingOf,
+  SERVER_URL_CHANGE_EVENT,
+  setAuthToken,
+  setServerUrl,
+} from "./runtime.js";
+import { requestUrl } from "../test-support/request-url.js";
 
 describe("orvalFetch", () => {
   afterEach(() => {
     localStorage.clear();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it("notifies this tab only when the selected server changes", () => {
+    const servers: string[] = [];
+    const listener = () => servers.push(getServerUrl());
+    window.addEventListener(SERVER_URL_CHANGE_EVENT, listener);
+    try {
+      setServerUrl("https://example.com/remote");
+      setServerUrl("https://example.com/remote");
+      setServerUrl("");
+      setServerUrl("");
+      expect(servers).toEqual(["https://example.com/remote", ""]);
+    } finally {
+      window.removeEventListener(SERVER_URL_CHANGE_EVENT, listener);
+    }
   });
 
   it("records when a JSON response was sent, answered, and read", async () => {
@@ -51,7 +77,7 @@ describe("orvalFetch", () => {
     await orvalFetch("/api/v1/usage/summary", {});
 
     const [input, init] = fetchMock.mock.calls[0]!;
-    expect(String(input)).toBe("https://example.test/api/v1/usage/summary");
+    expect(requestUrl(input)).toBe("https://example.test/api/v1/usage/summary");
     expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer secret");
   });
   it("tests a candidate server with only the supplied credentials", async () => {
@@ -105,5 +131,21 @@ describe("API errors", () => {
       code: "unknown_project_key",
       message: "unknown project key",
     } satisfies Partial<ApiError>);
+  });
+
+  it("marks a fetch failure as transient", async () => {
+    const cause = new TypeError("Failed to fetch");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(cause));
+    const error = await orvalFetch("/api/v1/search", {}).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(TransportError);
+    expect(error).toMatchObject({ message: cause.message, cause });
+    expect(isTransient(error)).toBe(true);
+  });
+
+  it("classifies an invalid server address rejected by fetch as transient", async () => {
+    setServerUrl("http://[");
+    const error = await orvalFetch("/api/v1/search", {}).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(TransportError);
+    expect(isTransient(error)).toBe(true);
   });
 });

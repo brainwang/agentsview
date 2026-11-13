@@ -18,6 +18,8 @@ import {
 
 type Theme = "light" | "dark";
 export type MessageLayout = "default" | "compact" | "stream" | "skim";
+/** How wide the transcript reading column is; see --reading-column in app.css. */
+export type ReadingWidth = "default" | "wider" | "full";
 export type TranscriptMode = "normal" | "focused";
 export type PublishTarget =
   | { kind: "session"; id: string }
@@ -32,10 +34,49 @@ type ModalType =
   | "resync"
   | "update"
   | "confirmDelete"
+  | "toolImage"
   | null;
 
+/** A tool call a jump expects at its target message; a rewrite can renumber messages, so the jump checks it. */
+export interface ScrollCall {
+  /** The call's position in its message; undefined when the jump targets the message itself. */
+  index?: number;
+  toolUseId: string;
+  /** Without a tool ID, the transcript revision the link was made from, since position alone can't tell calls apart. */
+  revision?: string;
+  /** The call's tool name and input fingerprint, since some agents derive tool IDs from the call's position. */
+  fingerprint?: string;
+}
+
+/** URL parameters that carry a ScrollCall in a message link. */
+export function scrollCallParams(call: ScrollCall): Record<string, string> {
+  const params: Record<string, string> = {};
+  if (call.index !== undefined) params["call"] = String(call.index);
+  if (call.toolUseId) params["tool_use_id"] = call.toolUseId;
+  else if (call.revision) params["rev"] = call.revision;
+  if (call.index !== undefined && call.fingerprint) params["fp"] = call.fingerprint;
+  return params;
+}
+
+/** Read a ScrollCall back from message-link parameters; undefined when the link names no call or revision. */
+export function parseScrollCall(
+  index?: string,
+  toolUseId?: string,
+  revision?: string,
+  fingerprint?: string,
+): ScrollCall | undefined {
+  const position = index !== undefined && /^\d+$/.test(index) ? Number(index) : undefined;
+  if (position === undefined) return revision ? { toolUseId: "", revision } : undefined;
+  let call: ScrollCall;
+  if (toolUseId) call = { index: position, toolUseId };
+  else if (revision) call = { index: position, toolUseId: "", revision };
+  else call = { index: position, toolUseId: "" };
+  if (fingerprint) call.fingerprint = fingerprint;
+  return call;
+}
+
 /** Block types that can be toggled visible/hidden. */
-export type BlockType = "user" | "assistant" | "thinking" | "tool" | "code" | "system";
+export type BlockType = "user" | "assistant" | "thinking" | "tool" | "code" | "system" | "hook";
 
 export const ALL_BLOCK_TYPES: BlockType[] = [
   "user",
@@ -44,6 +85,7 @@ export const ALL_BLOCK_TYPES: BlockType[] = [
   "tool",
   "code",
   "system",
+  "hook",
 ];
 
 const BLOCK_FILTER_KEY = "agentsview-block-filters";
@@ -93,6 +135,7 @@ function readBlockFilters(): Set<BlockType> {
 }
 
 const LAYOUT_KEY = "agentsview-message-layout";
+const READING_WIDTH_KEY = "agentsview-reading-width";
 const ZOOM_KEY = "agentsview-zoom-level";
 const VALID_TRANSCRIPT_MODES: TranscriptMode[] = ["normal", "focused"];
 
@@ -160,6 +203,7 @@ function readStoredZoom(): ZoomLevel | undefined {
 }
 
 const VALID_LAYOUTS: MessageLayout[] = ["default", "compact", "stream", "skim"];
+export const READING_WIDTHS: ReadingWidth[] = ["default", "wider", "full"];
 // Theme state lives in kit-ui's theme store (mode/high-contrast persistence,
 // root class management, and OS-preference tracking in "system" mode). Reuse
 // the app's historical "theme" storage key — its stored "light"/"dark" values
@@ -191,6 +235,18 @@ function readStoredLayout(): MessageLayout {
     const raw = localStorage?.getItem(LAYOUT_KEY);
     if (raw && VALID_LAYOUTS.includes(raw as MessageLayout)) {
       return raw as MessageLayout;
+    }
+  } catch {
+    // ignore
+  }
+  return "default";
+}
+
+function readStoredReadingWidth(): ReadingWidth {
+  try {
+    const raw = localStorage?.getItem(READING_WIDTH_KEY);
+    if (raw && READING_WIDTHS.includes(raw as ReadingWidth)) {
+      return raw as ReadingWidth;
     }
   } catch {
     // ignore
@@ -257,6 +313,7 @@ class UIStore {
 
   sortNewestFirst: boolean = $state(false);
   messageLayout: MessageLayout = $state(readStoredLayout());
+  readingWidth: ReadingWidth = $state(readStoredReadingWidth());
   transcriptMode: TranscriptMode = $state(readStoredTranscriptMode());
   sidebarWidth: number = $state(readStoredSidebarWidth());
   vitalsWidth: number = $state(readStoredVitalsWidth());
@@ -267,6 +324,8 @@ class UIStore {
   selectedOrdinal: number | null = $state(null);
   pendingScrollOrdinal: number | null = $state(null);
   pendingScrollSession: string | null = $state(null);
+  /** The tool call a pending jump expects at its message; null when any message at the ordinal will do. */
+  pendingScrollCall: ScrollCall | null = $state(null);
 
   private localZoomLevel = readStoredZoom();
   zoomLevel: ZoomLevel = $state(this.localZoomLevel ?? ZOOM_DEFAULT);
@@ -293,6 +352,22 @@ class UIStore {
       $effect(() => {
         try {
           localStorage?.setItem(LAYOUT_KEY, this.messageLayout);
+        } catch {
+          // ignore
+        }
+      });
+
+      // The root attribute selects the --reading-column width in app.css, so
+      // the transcript, session header, find bar, and panels follow it.
+      $effect(() => {
+        const width = this.readingWidth;
+        if (width === "default") {
+          delete document.documentElement.dataset.readingWidth;
+        } else {
+          document.documentElement.dataset.readingWidth = width;
+        }
+        try {
+          localStorage?.setItem(READING_WIDTH_KEY, width);
         } catch {
           // ignore
         }
@@ -507,6 +582,10 @@ class UIStore {
     this.messageLayout = layout;
   }
 
+  setReadingWidth(width: ReadingWidth) {
+    this.readingWidth = width;
+  }
+
   setTranscriptMode(mode: TranscriptMode) {
     this.transcriptMode = mode;
   }
@@ -543,13 +622,15 @@ class UIStore {
     this.selectedOrdinal = null;
     this.pendingScrollOrdinal = null;
     this.pendingScrollSession = null;
+    this.pendingScrollCall = null;
   }
 
-  scrollToOrdinal(ordinal: number, sessionId?: string) {
+  scrollToOrdinal(ordinal: number, sessionId?: string, call?: ScrollCall) {
     this.followLatest = false;
     this.selectedOrdinal = ordinal;
     this.pendingScrollOrdinal = ordinal;
     this.pendingScrollSession = sessionId ?? null;
+    this.pendingScrollCall = call ?? null;
   }
 
   setFollowLatest(enabled: boolean) {
@@ -559,6 +640,7 @@ class UIStore {
       this.selectedOrdinal = null;
       this.pendingScrollOrdinal = null;
       this.pendingScrollSession = null;
+      this.pendingScrollCall = null;
     }
   }
 

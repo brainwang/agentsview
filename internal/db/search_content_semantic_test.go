@@ -26,9 +26,16 @@ type fakeVectorSearcher struct {
 	calls      int
 }
 
-func (f *fakeVectorSearcher) SemanticSearch(
-	_ context.Context, _ string, limit int,
-) ([]VectorHit, error) {
+func (f *fakeVectorSearcher) PrepareSemanticSearch(
+	context.Context, string,
+) (VectorSearchPage, int, error) {
+	return func(_ context.Context, limit int) ([]VectorHit, bool, error) {
+		hits, err := f.page(limit)
+		return hits, len(f.hits) < limit, err
+	}, 0, nil
+}
+
+func (f *fakeVectorSearcher) page(limit int) ([]VectorHit, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
@@ -85,17 +92,6 @@ func TestSearchContentSemanticNoSearcherUnavailable(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrSemanticUnavailable,
 		"expected ErrSemanticUnavailable, got %v", err)
-}
-
-func TestHasSemanticFlipsWithSetVectorSearcher(t *testing.T) {
-	d := testDB(t)
-	require.False(t, d.HasSemantic(), "HasSemantic before SetVectorSearcher")
-
-	d.SetVectorSearcher(&fakeVectorSearcher{})
-	assert.True(t, d.HasSemantic(), "HasSemantic after SetVectorSearcher")
-
-	d.SetVectorSearcher(nil)
-	assert.False(t, d.HasSemantic(), "HasSemantic after clearing the searcher")
 }
 
 func TestSearchContentSemanticRoutesAndPreservesRank(t *testing.T) {
@@ -443,6 +439,7 @@ func TestSearchContentSemanticMatchCarriesUnitRangeAndLineage(t *testing.T) {
 	assert.Equal(t, "subagent", sub.Relationship)
 	assert.Equal(t, "parent", sub.ParentSessionID)
 	assert.True(t, sub.Sidechain, "anchor message is_sidechain")
+	assert.NotEmpty(t, sub.TranscriptRevision)
 
 	data, err := json.Marshal(sub)
 	require.NoError(t, err)
@@ -450,6 +447,7 @@ func TestSearchContentSemanticMatchCarriesUnitRangeAndLineage(t *testing.T) {
 		`"ordinal":1`, `"ordinal_range":[1,2]`,
 		`"subordinate":true`, `"relationship":"subagent"`,
 		`"parent_session_id":"parent"`, `"is_sidechain":true`,
+		`"transcript_revision":`,
 	} {
 		assert.Contains(t, string(data), want)
 	}
@@ -461,6 +459,7 @@ func TestSearchContentSemanticMatchCarriesUnitRangeAndLineage(t *testing.T) {
 	assert.Empty(t, top.Relationship)
 	assert.Empty(t, top.ParentSessionID)
 	assert.False(t, top.Sidechain)
+	assert.NotEmpty(t, top.TranscriptRevision)
 }
 
 // TestContentMatchJSONUnitFieldsOmittedForLexicalMatches guards the lexical

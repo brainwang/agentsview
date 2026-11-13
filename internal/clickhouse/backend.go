@@ -76,7 +76,16 @@ func ReplicaTarget(ch config.ClickHouseConfig) storage.ReplicaTarget {
 		Schema:        ch.Database,
 		MachineName:   ch.MachineName,
 		AllowInsecure: ch.AllowInsecure,
+		PushVectors:   ch.PushVectorsEnabled(),
+		PushBatchSize: pushBatchSize(ch),
 	}
+}
+
+func pushBatchSize(ch config.ClickHouseConfig) int {
+	if ch.PushBatchSize == nil {
+		return 0
+	}
+	return *ch.PushBatchSize
 }
 
 func target(t storage.ReplicaTarget) Target {
@@ -98,20 +107,26 @@ func (Backend) NewPusher(
 	if err := CheckTransportSecurity(t.URL, t.AllowInsecure); err != nil {
 		return nil, err
 	}
+	if t.PushBatchSize < 0 {
+		return nil, fmt.Errorf(
+			"clickhouse push_batch_size must be at least 1, got %d", t.PushBatchSize,
+		)
+	}
 	s, err := New(ctx, target(t), local, t.MachineName, opts)
 	if err != nil {
 		return nil, err
 	}
+	s.sessionBatchSize = t.PushBatchSize
 	return s, nil
 }
 
 func (Backend) OpenStore(
-	t storage.ReplicaTarget,
+	ctx context.Context, t storage.ReplicaTarget,
 ) (storage.ReplicaStore, error) {
 	if err := CheckTransportSecurity(t.URL, t.AllowInsecure); err != nil {
 		return nil, err
 	}
-	store, err := NewStore(context.Background(), target(t))
+	store, err := NewStore(ctx, target(t))
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +149,11 @@ func (Backend) OpenServeStore(
 	store, err := NewStore(ctx, target(t))
 	if err != nil {
 		return nil, err
+	}
+	// The kept reports only save work; without them every report is built
+	// on request, so serve starts anyway.
+	if err := store.openActivityReportDisk(target(t)); err != nil {
+		log.Printf("clickhouse: keeping activity reports in memory only: %v", err)
 	}
 	return store, nil
 }
@@ -166,7 +186,7 @@ func (Backend) Status(
 	}
 	rows := []storage.StatusRow{
 		{Label: "Machine:", Value: status.Machine},
-		{Label: "Last push:", Value: valueOrNever(status.LastPushAt)},
+		{Label: "Last push:", Value: db.ValueOrNever(status.LastPushAt)},
 		{Label: "Last push machine:", Value: status.LastPushMachine},
 	}
 	if status.Scope != "" {
@@ -204,9 +224,46 @@ func (Backend) LastPushAt(
 	return status.LastPushAt, nil
 }
 
-func valueOrNever(v string) string {
-	if v == "" {
-		return "never"
+// VectorGenerations lists the embedding generations pushed to store, oldest
+// first.
+func (Backend) VectorGenerations(
+	ctx context.Context, store storage.ReplicaStore,
+) ([]storage.VectorGenerationInfo, error) {
+	chStore, err := asStore(store)
+	if err != nil {
+		return nil, err
 	}
-	return v
+	return ListVectorGenerationInfo(ctx, chStore.DB())
+}
+
+// OpenVectorSearcher serves the pushed generation matching gen.Fingerprint.
+// Every generation shares one chunk table, so a registered generation is
+// always ready to search.
+func (Backend) OpenVectorSearcher(
+	ctx context.Context, store storage.ReplicaStore, gen storage.VectorGenerationInfo,
+	maxInputChars int, encode storage.VectorQueryEncoder,
+) (db.VectorSearcher, string, error) {
+	chStore, err := asStore(store)
+	if err != nil {
+		return nil, "", err
+	}
+	dim, found, err := LookupVectorGeneration(ctx, chStore.DB(), gen.Fingerprint)
+	if err != nil {
+		return nil, "", err
+	}
+	if !found {
+		return nil, "ClickHouse has no embedding generation matching fingerprint " + gen.Fingerprint, nil
+	}
+	return NewVectorSearcher(chStore.DB(), gen.Fingerprint, dim, maxInputChars, encode), "", nil
+}
+
+// asStore unwraps the concrete ClickHouse store a replica-neutral caller
+// holds; only this backend opens them, so any other type is a programming
+// error.
+func asStore(store storage.ReplicaStore) (*Store, error) {
+	chStore, ok := store.(*Store)
+	if !ok {
+		return nil, fmt.Errorf("clickhouse store is %T, not *clickhouse.Store", store)
+	}
+	return chStore, nil
 }

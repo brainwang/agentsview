@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import ArchiveContentSettings from "./ArchiveContentSettings.svelte";
 import { SettingsService } from "../../api/generated/index";
@@ -101,6 +101,19 @@ describe("ArchiveContentSettings", () => {
     // The rejected write leaves the stored policy alone, so the control stays
     // on the value the daemon still holds.
     expect(getByRole("radio", { name: "Keep" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("sets the migrate command in the hint as code without losing any of the sentence", () => {
+    const { getByText } = render(ArchiveContentSettings);
+
+    const command = getByText("agentsview db migrate --images");
+    expect(command.tagName).toBe("CODE");
+    const hint = command.closest("p");
+    expect(hint?.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "Saved results keep the image setting they had when saved. Switching back to " +
+        "Keep won't restore images already removed. Run agentsview db migrate " +
+        "--images to move stored images to separate files.",
+    );
   });
 
   it("disables all radios when settings are read-only", () => {

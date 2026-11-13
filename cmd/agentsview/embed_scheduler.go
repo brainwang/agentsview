@@ -10,6 +10,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/cenkalti/backoff/v7"
+
+	"go.kenn.io/kit/embedmodel"
 	kitvec "go.kenn.io/kit/vector"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -39,23 +42,30 @@ func acquireVectorsWriteLockWithRetry(
 	ctx context.Context, dataDir string,
 ) (*writeOwnerLock, bool, error) {
 	deadline := time.Now().Add(vectorsWriteLockRetryTimeout)
-	for {
+	lock, err := backoff.Retry(ctx, func() (*writeOwnerLock, error) {
 		lock, err := tryAcquireNamedLock(dataDir, vectorsWriteLockFile)
 		if err == nil {
-			return lock, true, nil
+			return lock, nil
 		}
 		if _, ok := errors.AsType[writeOwnerLockHeldError](err); !ok {
-			return nil, false, err
+			return nil, backoff.Permanent(err)
 		}
 		if !time.Now().Before(deadline) {
-			return nil, false, nil
+			return nil, backoff.Permanent(err)
 		}
-		select {
-		case <-ctx.Done():
-			return nil, false, nil
-		case <-time.After(vectorsWriteLockRetryInterval):
+		return nil, err
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(vectorsWriteLockRetryInterval)),
+		backoff.WithMaxTries(0), backoff.WithMaxElapsedTime(0))
+	if err == nil {
+		return lock, true, nil
+	}
+	retryErr := backoff.AsRetryError(err)
+	if errors.Is(retryErr.Cause, backoff.ErrPermanent) {
+		if _, ok := errors.AsType[writeOwnerLockHeldError](retryErr.LastErr); !ok {
+			return nil, false, retryErr.LastErr
 		}
 	}
+	return nil, false, nil
 }
 
 // embedDebounceInterval is the fixed quiet period the after-sync scheduler
@@ -91,7 +101,9 @@ type embedScheduler struct {
 	// carried into every scheduler-driven BuildRequest so scheduled builds
 	// stay config-authoritative rather than drifting from a CLI-only
 	// override (see EmbeddingsBuildOptions.IncludeAutomatedSet).
-	includeAutomated bool
+	includeAutomated    bool
+	onBattery           func() bool
+	batteryDeferredPath string
 
 	dirty chan func()
 	stop  chan struct{}
@@ -169,7 +181,13 @@ func (s *embedScheduler) run(
 	// be silently deferred until the next backstop tick (24h by default)
 	// instead of retrying on the debounce interval. It is read and written only
 	// from this single goroutine, so it needs no synchronization of its own.
-	var pendingBackstop bool
+	// A battery marker left by an earlier daemon does not record whether the
+	// deferred work was a backstop, so its replay is a full reconciliation.
+	_, markerErr := os.Stat(s.batteryDeferredPath)
+	pendingBackstop := s.batteryDeferredPath != "" && markerErr == nil
+	if pendingBackstop {
+		s.Notify()
+	}
 	var pendingRelease func()
 	var buildErrorRetries int
 	defer func() {
@@ -207,6 +225,22 @@ func (s *embedScheduler) run(
 			}
 			resetTimer(debounceTimer, s.debounce)
 		case <-debounceTimer.C:
+			if s.onBattery != nil && s.onBattery() {
+				if pendingRelease != nil {
+					s.setBatteryDeferred(true)
+					pendingRelease()
+					pendingRelease = nil
+				}
+				resetTimer(debounceTimer, batteryRecheckInterval)
+				continue
+			}
+			if pendingRelease == nil {
+				var ok bool
+				pendingRelease, ok = s.idle.BeginWork()
+				if !ok {
+					continue
+				}
+			}
 			req := vector.BuildRequest{Backstop: pendingBackstop, IncludeAutomated: s.includeAutomated}
 			started, err := s.mgr.TryBuild(ctx, req)
 			if err != nil {
@@ -234,6 +268,7 @@ func (s *embedScheduler) run(
 				resetTimer(debounceTimer, s.debounce)
 				continue
 			}
+			s.setBatteryDeferred(false)
 			if pendingRelease != nil {
 				pendingRelease()
 				pendingRelease = nil
@@ -249,6 +284,16 @@ func (s *embedScheduler) run(
 				// forever. Healthy pending work may still be satisfied by a
 				// backstop before its ordinary debounce expires.
 				pendingBackstop = true
+				continue
+			}
+			if s.onBattery != nil && s.onBattery() {
+				s.setBatteryDeferred(true)
+				if pendingRelease != nil {
+					pendingRelease()
+					pendingRelease = nil
+				}
+				pendingBackstop = true
+				resetTimer(debounceTimer, batteryRecheckInterval)
 				continue
 			}
 			// With no error retry pending, a periodic reconciliation gets a
@@ -277,6 +322,7 @@ func (s *embedScheduler) run(
 				continue
 			}
 
+			s.setBatteryDeferred(false)
 			release()
 			pendingBackstop = false
 			if pendingRelease != nil {
@@ -286,9 +332,25 @@ func (s *embedScheduler) run(
 				// will re-arm the timer when the loop receives it.
 				pendingRelease()
 				pendingRelease = nil
-				stopTimer(debounceTimer)
 			}
+			stopTimer(debounceTimer)
 		}
+	}
+}
+
+// setBatteryDeferred carries paused message work across a daemon exit.
+func (s *embedScheduler) setBatteryDeferred(deferred bool) {
+	if s.batteryDeferredPath == "" {
+		return
+	}
+	var err error
+	if deferred {
+		err = os.WriteFile(s.batteryDeferredPath, nil, 0o600)
+	} else {
+		err = os.Remove(s.batteryDeferredPath)
+	}
+	if err != nil && (deferred || !errors.Is(err, os.ErrNotExist)) {
+		log.Printf("embed scheduler: recording battery-deferred work: %v", err)
 	}
 }
 
@@ -309,16 +371,6 @@ func resetTimer(t *time.Timer, d time.Duration) {
 	t.Reset(d)
 }
 
-// teeEmitter fans a sync completion out to the production SSE emitter and,
-// when after-sync embedding is enabled, the embed scheduler. The scheduler
-// side never blocks (embedScheduler.Notify is non-blocking), so wrapping
-// the emitter this way cannot slow down the sync pipeline.
-type teeEmitter struct {
-	primary      sync.Emitter
-	scheduler    *embedScheduler
-	runAfterSync bool
-}
-
 // notifyTeeEmitter fans a successful sync event out to another bounded
 // background consumer after preserving the primary emitter's delivery.
 type notifyTeeEmitter struct {
@@ -334,37 +386,17 @@ func (t notifyTeeEmitter) Emit(scope string) {
 // wrapEmbeddingSyncEmitter connects successful sync and resync events to both
 // embedding stores. Recall refreshes cannot depend on extraction being enabled:
 // a resync can journal removed Recall entries while copying the durable corpus.
-func wrapEmbeddingSyncEmitter(
-	primary sync.Emitter, serving vectorServing, runAfterSync bool,
-) sync.Emitter {
-	if serving.Scheduler != nil {
-		primary = teeEmitter{
-			primary: primary, scheduler: serving.Scheduler,
-			runAfterSync: runAfterSync,
-		}
-	}
-	if serving.RecallMutationNotify != nil {
-		primary = notifyTeeEmitter{
-			primary: primary, notify: serving.RecallMutationNotify,
-		}
-	}
-	return primary
-}
-
-func (t teeEmitter) Emit(scope string) {
-	t.primary.Emit(scope)
-	if t.runAfterSync {
-		t.scheduler.Notify()
-	}
+func wrapEmbeddingSyncEmitter(primary sync.Emitter, notify func(bool)) sync.Emitter {
+	return notifyTeeEmitter{primary: primary, notify: func() { notify(false); notify(true) }}
 }
 
 // searcherAdapter implements db.VectorSearcher over a vector.Index,
 // translating its error taxonomy into db.ErrSemanticUnavailable-wrapped
 // errors and enforcing the config-drift staleness gate before every query.
 type searcherAdapter struct {
-	ix          *vector.Index
-	enc         kitvec.EncodeFunc
-	fingerprint string
+	ix    *vector.Index
+	enc   kitvec.EncodeFunc
+	space embedmodel.Descriptor
 }
 
 type recallSearcherAdapter struct {
@@ -374,41 +406,40 @@ type recallSearcherAdapter struct {
 	cfg      config.Config
 }
 
+// corpusIdentity returns the recall corpus snapshot the configured index must
+// serve and the descriptor that recognizes its generation.
 func (a recallSearcherAdapter) corpusIdentity(
 	ctx context.Context,
-) (db.RecallVectorSnapshot, error) {
+) (db.RecallVectorSnapshot, embedmodel.Descriptor, error) {
 	extractionFingerprint, err := recallCorpusFingerprint(ctx, a.database)
 	if err != nil {
-		return db.RecallVectorSnapshot{}, err
+		return db.RecallVectorSnapshot{}, embedmodel.Descriptor{}, err
 	}
 	revision, err := a.database.RecallCorpusRevision(ctx)
 	if err != nil {
-		return db.RecallVectorSnapshot{}, err
+		return db.RecallVectorSnapshot{}, embedmodel.Descriptor{}, err
 	}
+	gen := recallVectorGeneration(a.cfg.Vector.Embeddings, extractionFingerprint)
 	return db.RecallVectorSnapshot{
-		GenerationFingerprint: recallVectorGeneration(
-			a.cfg.Vector.Embeddings, extractionFingerprint,
-		).Fingerprint(),
-		CorpusRevision: revision,
-	}, nil
+		GenerationFingerprint: gen.Fingerprint(),
+		CorpusRevision:        revision,
+	}, vectorSpace(a.cfg.Vector.Embeddings, gen), nil
 }
 
 func (a recallSearcherAdapter) SearchRecall(
 	ctx context.Context, query string, limit int,
 ) ([]db.RecallVectorHit, bool, db.RecallVectorSnapshot, error) {
-	identity, err := a.corpusIdentity(ctx)
+	identity, space, err := a.corpusIdentity(ctx)
 	if err != nil {
 		return nil, false, db.RecallVectorSnapshot{}, fmt.Errorf("%w: %w", db.ErrSemanticUnavailable, err)
 	}
-	stale, err := a.ix.StaleActive(
-		ctx, identity.GenerationFingerprint, identity.CorpusRevision,
-	)
+	stale, err := a.ix.StaleActiveWithin(ctx, space, identity.CorpusRevision, a.revisionFresh)
 	if err != nil {
 		return nil, false, db.RecallVectorSnapshot{}, translateRecallSearchError(err)
 	}
 	if stale {
 		return nil, false, db.RecallVectorSnapshot{}, fmt.Errorf(
-			"%w: recall index is stale: run 'agentsview embeddings build --store recall'",
+			"%w: recall index is stale: run 'agentsview index embeddings build --store recall'",
 			db.ErrSemanticUnavailable,
 		)
 	}
@@ -429,11 +460,22 @@ func (a recallSearcherAdapter) SearchRecall(
 func (a recallSearcherAdapter) ValidateRecallSnapshot(
 	ctx context.Context, identity db.RecallVectorSnapshot,
 ) error {
-	stale, err := a.ix.StaleActive(
-		ctx, identity.GenerationFingerprint, identity.CorpusRevision,
-	)
+	currentIdentity, space, err := a.corpusIdentity(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %w", db.ErrSemanticUnavailable, err)
+	}
+	// The corpus may move during a search; the index only has to be within
+	// the lag bound of the corpus as it is now.
+	stale, err := a.ix.StaleActiveWithin(ctx, space, currentIdentity.CorpusRevision, a.revisionFresh)
 	if err != nil {
 		return translateRecallSearchError(err)
+	}
+	if currentIdentity.GenerationFingerprint != identity.GenerationFingerprint ||
+		(stale && currentIdentity != identity) {
+		return fmt.Errorf(
+			"%w: recall corpus changed during search; retry after the recall index refreshes",
+			db.ErrSemanticUnavailable,
+		)
 	}
 	if stale {
 		return fmt.Errorf(
@@ -441,78 +483,128 @@ func (a recallSearcherAdapter) ValidateRecallSnapshot(
 			db.ErrSemanticUnavailable,
 		)
 	}
-	currentIdentity, err := a.corpusIdentity(ctx)
-	if err != nil {
-		return fmt.Errorf("%w: %w", db.ErrSemanticUnavailable, err)
-	}
-	if currentIdentity != identity {
-		return fmt.Errorf(
-			"%w: recall corpus changed during search; retry after the recall index refreshes",
-			db.ErrSemanticUnavailable,
-		)
-	}
 	return nil
+}
+
+// revisionFresh reports whether a Recall index completed at corpus revision
+// completed may answer for a corpus at want: always when they match, and,
+// with [vector] recall_max_revision_lag above 0, when the index trails by at
+// most that many revisions. Revisions that are not counters, such as legacy
+// timestamp watermarks, must still match exactly.
+func (a recallSearcherAdapter) revisionFresh(completed, want string) bool {
+	if completed == want {
+		return true
+	}
+	maxLag := a.cfg.Vector.RecallMaxRevisionLag
+	if maxLag <= 0 {
+		return false
+	}
+	lag, ok := db.RecallCorpusRevisionLag(completed, want)
+	return ok && lag >= 0 && lag <= int64(maxLag)
 }
 
 func (a recallSearcherAdapter) MaxRecallSearchCandidates() int {
 	return a.ix.MaxSearchCandidates()
 }
 
-// newSearcherAdapter builds a searcherAdapter for gen's configured
-// embedding identity.
-func newSearcherAdapter(ix *vector.Index, enc kitvec.EncodeFunc, gen kitvec.Generation) searcherAdapter {
-	return searcherAdapter{ix: ix, enc: enc, fingerprint: gen.Fingerprint()}
+// newSearcherAdapter builds a searcherAdapter for the configured embedding
+// space.
+func newSearcherAdapter(ix *vector.Index, enc kitvec.EncodeFunc, space embedmodel.Descriptor) searcherAdapter {
+	return searcherAdapter{ix: ix, enc: enc, space: space}
 }
 
-// SemanticSearch implements db.VectorSearcher. A stale active generation
-// (the configured model/dimension no longer matches what was last built)
-// is a hard error checked before querying at all, rather than silently
-// searching the mismatched old generation.
-func (a searcherAdapter) SemanticSearch(
-	ctx context.Context, query string, limit int,
-) ([]db.VectorHit, error) {
-	stale, err := a.ix.StaleActive(ctx, a.fingerprint, "")
+// SemanticReadiness inspects generation metadata without encoding a query.
+func (a searcherAdapter) SemanticReadiness(
+	ctx context.Context,
+) (db.SemanticReadiness, error) {
+	generations, err := a.ix.Generations(ctx)
+	if err != nil {
+		return db.SemanticReadiness{}, err
+	}
+	for _, generation := range generations {
+		if generation.State != "active" {
+			continue
+		}
+		out := db.SemanticReadiness{
+			State:      "ready",
+			Generation: generation.Fingerprint,
+			Embedded:   generation.Embedded,
+			Missing:    generation.Missing,
+		}
+		matches, err := a.space.Matches(generation.Fingerprint)
+		if err != nil {
+			return db.SemanticReadiness{}, err
+		}
+		if !matches {
+			out.State = "unavailable"
+			out.Reason = "configuration_mismatch"
+			return out, nil
+		}
+		if generation.Missing > 0 {
+			out.State = "partial"
+			out.Reason = "index_incomplete"
+		}
+		return out, nil
+	}
+	return db.SemanticReadiness{
+		State: "unavailable", Reason: "no_active_generation",
+	}, nil
+}
+
+// PrepareSemanticSearch implements db.VectorSearcher and embeds query once
+// per request. A stale active generation (the configured model/dimension no
+// longer matches what was last built) is a hard error checked before
+// querying at all, rather than silently searching the mismatched old
+// generation.
+func (a searcherAdapter) PrepareSemanticSearch(
+	ctx context.Context, query string,
+) (db.VectorSearchPage, int, error) {
+	stale, err := a.ix.StaleActive(ctx, a.space, "")
 	if err != nil {
 		// StaleActive shares Search's error taxonomy (notably
 		// vector.ErrMirrorVersionMismatch from a version-mismatched
 		// read-only vectors.db), so it is translated the same way;
 		// errors outside the taxonomy pass through with this context.
-		return nil, translateSearchError(
+		return nil, 0, translateSearchError(
 			fmt.Errorf("checking embedding index staleness: %w", err))
 	}
 	if stale {
-		return nil, fmt.Errorf(
-			"%w: index is stale (embedding config changed): run "+
-				"'agentsview embeddings build --full-rebuild'",
-			db.ErrSemanticUnavailable)
+		return nil, 0, db.NewSemanticUnavailableError(
+			"index is stale (embedding config changed): run " +
+				"'agentsview index embeddings build --full-rebuild'")
 	}
 
-	hits, err := a.ix.Search(ctx, a.enc, query, limit)
+	search, err := a.ix.PrepareSearch(ctx, a.enc, query)
 	if err != nil {
-		return nil, translateSearchError(err)
+		return nil, 0, translateSearchError(err)
 	}
-
-	out := make([]db.VectorHit, len(hits))
-	for i, h := range hits {
-		out[i] = db.VectorHit{
-			SessionID:    h.SessionID,
-			Ordinal:      h.Ordinal,
-			OrdinalStart: h.OrdinalStart,
-			OrdinalEnd:   h.OrdinalEnd,
-			Subordinate:  h.Subordinate,
-			Score:        h.Score,
-			Snippet:      h.Snippet,
+	return func(ctx context.Context, limit int) ([]db.VectorHit, bool, error) {
+		hits, exhausted, err := search(ctx, limit)
+		if err != nil {
+			return nil, false, translateSearchError(err)
 		}
-	}
-	return out, nil
+		out := make([]db.VectorHit, len(hits))
+		for i, h := range hits {
+			out[i] = db.VectorHit{
+				SessionID:    h.SessionID,
+				Ordinal:      h.Ordinal,
+				OrdinalStart: h.OrdinalStart,
+				OrdinalEnd:   h.OrdinalEnd,
+				Subordinate:  h.Subordinate,
+				Score:        h.Score,
+				Snippet:      h.Snippet,
+			}
+		}
+		return out, exhausted, nil
+	}, a.ix.MaxSearchCandidates(), nil
 }
 
 // ResolveMessageUnits implements db.VectorSearcher by delegating to the
 // index's resolver, translating its error taxonomy (notably
 // vector.ErrMirrorVersionMismatch from a version-mismatched read-only
-// vectors.db) the same way SemanticSearch does. It needs no staleness gate
-// of its own: the hybrid path always calls SemanticSearch — which enforces
-// the gate — before resolving FTS hits.
+// vectors.db) the same way PrepareSemanticSearch does. It needs no staleness
+// gate of its own: the hybrid path always calls PrepareSemanticSearch, which
+// enforces the gate, before resolving FTS hits.
 func (a searcherAdapter) ResolveMessageUnits(
 	ctx context.Context, refs []db.MessageRef,
 ) ([]db.UnitRef, error) {
@@ -541,10 +633,9 @@ func translateSearchError(err error) error {
 	queryEncErr, hasQueryEncErr := errors.AsType[*vector.QueryEncodeError](err)
 	switch {
 	case hasBuildingErr:
-		return fmt.Errorf("%w: index is building: %d%% complete",
-			db.ErrSemanticUnavailable, buildingErr.Percent)
+		return db.NewSemanticUnavailableError(fmt.Sprintf("index is building: %d%% complete", buildingErr.Percent))
 	case errors.Is(err, vector.ErrMirrorVersionMismatch):
-		return fmt.Errorf("%w: %w", db.ErrSemanticUnavailable, err)
+		return db.NewSemanticUnavailableError(err.Error())
 	case errors.Is(err, vector.ErrNoActiveGeneration):
 		return db.ErrSemanticUnavailable
 	case hasQueryEncErr:
@@ -568,12 +659,12 @@ func translateRecallSearchError(err error) error {
 		))
 	case errors.Is(err, vector.ErrMirrorVersionMismatch):
 		return db.NewSemanticUnavailableError(fmt.Sprintf(
-			"%v; rebuild the recall index with 'agentsview embeddings build --store recall'",
+			"%v; rebuild the recall index with 'agentsview index embeddings build --store recall'",
 			err,
 		))
 	case errors.Is(err, vector.ErrNoActiveGeneration):
 		return db.NewSemanticUnavailableError(
-			"recall index has not been built; run 'agentsview embeddings build --store recall'",
+			"recall index has not been built; run 'agentsview index embeddings build --store recall'",
 		)
 	default:
 		return translateSearchError(err)
@@ -584,11 +675,12 @@ func translateRecallSearchError(err error) error {
 // into the daemon. All fields are zero when [vector] is disabled, so
 // callers can treat it uniformly without a separate enabled check.
 type vectorServing struct {
-	ServerOpts           []server.Option
-	Scheduler            *embedScheduler
-	RecallScheduler      *embedScheduler
-	RecallMutationNotify func()
-	Close                func() error
+	manager, recallManager *vector.Manager
+	ServerOpts             []server.Option
+	Scheduler              *embedScheduler
+	RecallScheduler        *embedScheduler
+	RecallMutationNotify   func()
+	Close                  func() error
 }
 
 // setupVectorServing acquires vectors.write.lock, opens vectors.db
@@ -630,7 +722,7 @@ func setupVectorServing(
 		return vectorServing{ServerOpts: []server.Option{
 			server.WithEmbeddingsUnavailableReason(
 				"vector serving is disabled for this daemon run: another " +
-					"process (typically a direct 'agentsview embeddings build') " +
+					"process (typically a direct 'agentsview index embeddings build') " +
 					"held vectors.write.lock at startup; wait for it to finish, " +
 					"then restart the daemon"),
 		}}, nil
@@ -683,11 +775,13 @@ func setupVectorServing(
 	}
 
 	gen := vectorGeneration(cfg.Vector.Embeddings)
-	mgr := vector.NewManager(ix, database, encoders, gen)
+	mgr := embeddingManager(ix, database, encoders, cfg, vector.MessageIndexSpec().Name)
 	recallMgr := embeddingManager(
 		recallIX, database, encoders, cfg, vector.RecallIndexSpec().Name,
 	)
-	database.SetVectorSearcher(newSearcherAdapter(ix, queryEnc, gen))
+	database.SetVectorSearcher(newSearcherAdapter(
+		ix, queryEnc, vectorSpace(cfg.Vector.Embeddings, gen),
+	))
 	database.SetRecallVectorSearcher(recallSearcherAdapter{
 		ix: recallIX, enc: queryEnc, database: database, cfg: cfg,
 	})
@@ -697,12 +791,9 @@ func setupVectorServing(
 	recallScheduler := newEmbedScheduler(
 		recallMgr, embedDebounceInterval, recallBackstop(cfg, backstop), false, idle,
 	)
-	serverOpts := []server.Option{
-		server.WithEmbeddingsManager(mgr),
-		server.WithEmbeddingsStoreManager(
-			vector.RecallIndexSpec().Name, recallMgr,
-		),
-		server.WithEmbeddingsIncludeAutomatedDefault(cfg.Vector.IncludeAutomated),
+	if cfg.Vector.Embed.RunAfterSyncEnabled() || backstop > 0 {
+		// Only automatic builds replay a battery marker; manual builds leave it on disk.
+		scheduler.batteryDeferredPath = path + ".battery-deferred"
 	}
 	var recallMutationNotify func()
 	if cfg.Vector.Embed.Recall {
@@ -712,14 +803,10 @@ func setupVectorServing(
 		// signal stays bounded and coalesces with any startup mutation burst.
 		recallScheduler.Notify()
 		recallMutationNotify = recallScheduler.Notify
-		serverOpts = append(serverOpts,
-			server.WithRecallCorpusMutationNotifier(recallMutationNotify),
-			server.WithSessionMutationNotifier(recallMutationNotify),
-		)
 	}
 
 	return vectorServing{
-		ServerOpts:           serverOpts,
+		manager: mgr, recallManager: recallMgr,
 		Scheduler:            scheduler,
 		RecallScheduler:      recallScheduler,
 		RecallMutationNotify: recallMutationNotify,
@@ -776,7 +863,7 @@ func recallBackstop(cfg config.Config, configured time.Duration) time.Duration {
 // no-op cases above, and the degraded-on-error case); otherwise the
 // caller must call it when done with d to release the read-only index
 // handle.
-func installDirectVectorSearcher(cfg config.Config, d *db.DB) func() error {
+func installDirectVectorSearcher(ctx context.Context, cfg config.Config, d *db.DB) func() error {
 	if cfg.ArchiveContent.UsageOnly() || d.ArchiveContent().UsageOnly() || !cfg.Vector.Enabled {
 		return nil
 	}
@@ -786,11 +873,11 @@ func installDirectVectorSearcher(cfg config.Config, d *db.DB) func() error {
 	}
 
 	ix, messageErr := vector.OpenSpec(
-		context.Background(), path, vector.MessageIndexSpec(), true,
+		ctx, path, vector.MessageIndexSpec(), true,
 		cfg.Vector.Embeddings.MaxInputChars,
 	)
 	recallIX, recallErr := vector.OpenSpec(
-		context.Background(), path, vector.RecallIndexSpec(), true,
+		ctx, path, vector.RecallIndexSpec(), true,
 		cfg.Vector.Embeddings.MaxInputChars,
 	)
 	if messageErr != nil && recallErr != nil {
@@ -816,7 +903,8 @@ func installDirectVectorSearcher(cfg config.Config, d *db.DB) func() error {
 		return nil
 	}
 	if ix != nil {
-		d.SetVectorSearcher(newSearcherAdapter(ix, enc, vectorGeneration(cfg.Vector.Embeddings)))
+		gen := vectorGeneration(cfg.Vector.Embeddings)
+		d.SetVectorSearcher(newSearcherAdapter(ix, enc, vectorSpace(cfg.Vector.Embeddings, gen)))
 	}
 	if recallIX != nil {
 		d.SetRecallVectorSearcher(recallSearcherAdapter{

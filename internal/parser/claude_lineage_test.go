@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -92,7 +93,7 @@ func TestClaudeBackgroundForkTrimsReplayAndLinksParent(t *testing.T) {
 		"fork-2222.jsonl", lineageForkContent(),
 	)
 
-	results, excluded, err := claudeParseFile(
+	results, excluded, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -134,7 +135,7 @@ func TestClaudeBackgroundForkPrefersInteractiveOriginalOverTiedBackgroundSibling
 	sibling = strings.ReplaceAll(sibling, `"a2"`, `"a3"`)
 	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(origPath), "sibling-3333.jsonl"), []byte(sibling), 0o600))
 
-	results, _, err := claudeParseFile(forkPath, "demo", "local", claudeParseOptions{siblingLineage: true})
+	results, _, err := claudeParseFile(t.Context(), forkPath, "demo", "local", claudeParseOptions{siblingLineage: true})
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "orig-1111", results[0].Session.ParentSessionID)
@@ -149,7 +150,7 @@ func TestClaudeOriginalUnaffectedBySiblingFork(t *testing.T) {
 		"fork-2222.jsonl", lineageForkContent(),
 	)
 
-	results, excluded, err := claudeParseFile(
+	results, excluded, err := claudeParseFile(t.Context(),
 		origPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -179,7 +180,7 @@ func TestClaudeBackgroundForkPureReplayExcluded(t *testing.T) {
 		"fork-2222.jsonl", forkContent,
 	)
 
-	results, excluded, err := claudeParseFile(
+	results, excluded, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -217,7 +218,7 @@ func TestClaudeBackgroundForkChainTrimsAgainstNearestBgAncestor(t *testing.T) {
 	cPath := filepath.Join(dir, "cccc-3333.jsonl")
 	require.NoError(t, os.WriteFile(cPath, []byte(cContent), 0o644))
 
-	cResults, _, err := claudeParseFile(
+	cResults, _, err := claudeParseFile(t.Context(),
 		cPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -227,7 +228,7 @@ func TestClaudeBackgroundForkChainTrimsAgainstNearestBgAncestor(t *testing.T) {
 	assert.Equal(t, "third question", cResults[0].Messages[0].Content)
 	assert.Equal(t, "bbbb-2222", cResults[0].Session.ParentSessionID)
 
-	bResults, _, err := claudeParseFile(
+	bResults, _, err := claudeParseFile(t.Context(),
 		bPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -267,7 +268,7 @@ func TestClaudeBackgroundForkQueuedOnlyChainTrimsAgainstEqualBgSibling(t *testin
 	cPath := filepath.Join(dir, "cccc-3333.jsonl")
 	require.NoError(t, os.WriteFile(cPath, []byte(cContent), 0o644))
 
-	results, excluded, err := claudeParseFile(
+	results, excluded, err := claudeParseFile(t.Context(),
 		cPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -308,7 +309,7 @@ func TestClaudeBackgroundForkEqualBgTwinsElectKeeperByStem(t *testing.T) {
 	largePath := filepath.Join(dir, "dddd-4444.jsonl")
 	require.NoError(t, os.WriteFile(largePath, []byte(largeContent), 0o644))
 
-	largeResults, largeExcluded, err := claudeParseFile(
+	largeResults, largeExcluded, err := claudeParseFile(t.Context(),
 		largePath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -316,7 +317,7 @@ func TestClaudeBackgroundForkEqualBgTwinsElectKeeperByStem(t *testing.T) {
 	assert.Empty(t, largeResults)
 	assert.Equal(t, []string{"dddd-4444"}, largeExcluded)
 
-	smallResults, smallExcluded, err := claudeParseFile(
+	smallResults, smallExcluded, err := claudeParseFile(t.Context(),
 		smallPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -345,7 +346,7 @@ func TestClaudeBackgroundForkEqualBgCopiesElectKeeperByStem(t *testing.T) {
 		t.Run(stem, func(t *testing.T) {
 			t.Parallel()
 
-			results, excluded, err := claudeParseFile(
+			results, excluded, err := claudeParseFile(t.Context(),
 				filepath.Join(dir, stem+".jsonl"), "demo", "local",
 				claudeParseOptions{siblingLineage: true},
 			)
@@ -386,7 +387,7 @@ func TestClaudeBackgroundForkBoundaryRetryFailsOpen(t *testing.T) {
 		"fork-2222.jsonl", forkContent,
 	)
 
-	results, excluded, err := claudeParseFile(
+	results, excluded, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -419,7 +420,7 @@ func TestClaudeBackgroundForkKeepsQueuedCommandWithoutNewChainEntry(t *testing.T
 		"fork-2222.jsonl", forkContent,
 	)
 
-	results, excluded, err := claudeParseFile(
+	results, excluded, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -488,7 +489,7 @@ func TestClaudeBackgroundForkFailOpen(t *testing.T) {
 				tt.origName, tt.origContent,
 				"fork-2222.jsonl", tt.forkContent,
 			)
-			results, excluded, err := claudeParseFile(
+			results, excluded, err := claudeParseFile(t.Context(),
 				forkPath, "my_app", "local",
 				claudeParseOptions{siblingLineage: true},
 			)
@@ -511,7 +512,7 @@ func TestClaudeBackgroundForkNoSiblingFailsOpen(t *testing.T) {
 	forkPath := filepath.Join(dir, "fork-2222.jsonl")
 	require.NoError(t, os.WriteFile(forkPath, []byte(lineageForkContent()), 0o644))
 
-	results, excluded, err := claudeParseFile(
+	results, excluded, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -554,7 +555,7 @@ func TestClaudeBackgroundForkKeepsPostBoundaryCoincidentalMatch(t *testing.T) {
 		"fork-2222.jsonl", forkContent,
 	)
 
-	results, _, err := claudeParseFile(
+	results, _, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -596,7 +597,7 @@ func TestClaudeBackgroundForkPicksLongestReplayCandidate(t *testing.T) {
 	forkPath := filepath.Join(dir, "fork-2222.jsonl")
 	require.NoError(t, os.WriteFile(forkPath, []byte(forkContent), 0o644))
 
-	results, _, err := claudeParseFile(
+	results, _, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -646,7 +647,7 @@ func TestClaudeBackgroundForkEqualReplayCandidatesFailOpen(t *testing.T) {
 			forkPath := filepath.Join(dir, "fork-3333.jsonl")
 			require.NoError(t, os.WriteFile(forkPath, []byte(forkContent), 0o600))
 
-			results, excluded, err := claudeParseFile(
+			results, excluded, err := claudeParseFile(t.Context(),
 				forkPath, "my_app", "local",
 				claudeParseOptions{siblingLineage: true},
 			)
@@ -688,7 +689,7 @@ func TestClaudeBackgroundForkKeepsOwnUUIDLessRecords(t *testing.T) {
 		"fork-2222.jsonl", forkContent,
 	)
 
-	results, _, err := claudeParseFile(
+	results, _, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -709,7 +710,7 @@ func TestClaudeBackgroundForkKeepsOwnUUIDLessRecords(t *testing.T) {
 		"StartedAt = %v", results[0].Session.StartedAt)
 
 	// The original still splices its own queued command.
-	origResults, _, err := claudeParseFile(
+	origResults, _, err := claudeParseFile(t.Context(),
 		filepath.Join(filepath.Dir(forkPath), "orig-1111.jsonl"),
 		"my_app", "local",
 		claudeParseOptions{siblingLineage: true},
@@ -778,7 +779,7 @@ func TestClaudeBackgroundForkIncrementalAppendContinuesFromTrim(t *testing.T) {
 		"fork-2222.jsonl", lineageForkContent(),
 	)
 
-	results, _, err := claudeParseFile(
+	results, _, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)
@@ -800,7 +801,7 @@ func TestClaudeBackgroundForkIncrementalAppendContinuesFromTrim(t *testing.T) {
 	// Stored identity mirrors what the engine persists from the full
 	// parse; without it the identity-fill fallback escalates every
 	// bg-marked append to a full parse.
-	msgs, _, _, _, err := claudeParseSessionFrom(forkPath, offset, claudeIncrementalScan{
+	msgs, _, _, _, err := claudeParseSessionFrom(t.Context(), forkPath, offset, claudeIncrementalScan{
 		startOrdinal:  2,
 		lastEntryUUID: "a2",
 		stored:        claudeStoredIdentity{sessionKind: "bg"},
@@ -871,7 +872,7 @@ func TestClaudeLineageSniffCacheInvalidatedBySameSizeRewrite(t *testing.T) {
 
 			// Warm the memo and prove the warm-phase lineage state,
 			// so a stale hit has a wrong decision to serve.
-			warm, _, err := claudeParseFile(
+			warm, _, err := claudeParseFile(t.Context(),
 				forkPath, "my_app", "local",
 				claudeParseOptions{siblingLineage: true},
 			)
@@ -908,7 +909,7 @@ func TestClaudeLineageSniffCacheInvalidatedBySameSizeRewrite(t *testing.T) {
 
 			// The fork's lineage resolution is the observable: it is
 			// what consumes the rewritten head's sniff.
-			results, _, err := claudeParseFile(
+			results, _, err := claudeParseFile(t.Context(),
 				forkPath, "my_app", "local",
 				claudeParseOptions{siblingLineage: true},
 			)
@@ -919,6 +920,35 @@ func TestClaudeLineageSniffCacheInvalidatedBySameSizeRewrite(t *testing.T) {
 			assert.Equal(t, tt.wantFirst, firstMessageContent(results[0].Messages))
 		})
 	}
+}
+
+// Model a prior observation whose filesystem metadata collides with a newer
+// same-size head. The full parser must validate bytes before using that memo.
+func TestClaudeLineageSniffCacheRejectsStaleHeadWithMatchingMetadata(t *testing.T) {
+	t.Parallel()
+	original := lineageOriginalContent()
+	origPath, forkPath := writeLineageFixture(t, "orig-1111.jsonl", original, "fork-2222.jsonl", lineageForkContent())
+	warm, _, err := claudeParseFile(t.Context(), forkPath, "my_app", "local", claudeParseOptions{siblingLineage: true})
+	require.NoError(t, err)
+	require.Len(t, warm, 1)
+	require.Equal(t, "orig-1111", warm[0].Session.ParentSessionID)
+	// This is the memo a previous z9 head can leave when stat metadata has
+	// coarse resolution. Retain all actual observed cache metadata.
+	prior := strings.ReplaceAll(original, `"u1"`, `"z9"`)
+	require.Len(t, prior, len(original))
+	claudeSniffMu.Lock()
+	cached, ok := claudeSniffCache[origPath]
+	cached.headSHA = sha256.Sum256([]byte(prior))
+	cached.sniff.rootUUID = "z9"
+	claudeSniffCache[origPath] = cached
+	claudeSniffMu.Unlock()
+	require.True(t, ok, "full parse must warm the original's head")
+	results, _, err := claudeParseFile(t.Context(), forkPath, "my_app", "local", claudeParseOptions{siblingLineage: true})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "orig-1111", results[0].Session.ParentSessionID)
+	require.Len(t, results[0].Messages, 2)
+	assert.Equal(t, "continued question", firstMessageContent(results[0].Messages))
 }
 
 func BenchmarkClaudeLineageSniffCacheHit(b *testing.B) {
@@ -959,7 +989,7 @@ func TestClaudeLineageSniffGivesUpAfterBoundedPreamble(t *testing.T) {
 		"fork-2222.jsonl", forkContent,
 	)
 
-	results, _, err := claudeParseFile(
+	results, _, err := claudeParseFile(t.Context(),
 		forkPath, "my_app", "local",
 		claudeParseOptions{siblingLineage: true},
 	)

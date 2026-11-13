@@ -205,3 +205,103 @@ func TestGenAIPricesRegexMatchingPreservesUpstreamCaseSensitivity(t *testing.T) 
 	_, ok = prices.Resolve("", "model-abc", time.Time{})
 	assert.False(t, ok)
 }
+
+func TestGenAIPricesMixedScalarAndRegexCaseRules(t *testing.T) {
+	prices, err := ParseGenAIPrices([]byte(`[
+		{"id":"example", "model_match":{"starts_with":"öPEN-"}, "models":[
+			{"id":"model", "match":{"and":[
+				{"contains":"MoDeL"}, {"ends_with":"eNd"},
+				{"or":[{"regex":"^ÖPEN-"},{"equals":"öpen-special-model-end"}]}
+			]}, "prices":{"input_mtok":1}}
+		]}
+	]`))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		model   string
+		matches bool
+	}{
+		{"ÖPEN-MODEL-END", true},
+		{"ÖPEN-model-end", true},
+		{"öpen-special-MODEL-END", true},
+		{"öpen-model-end", false},
+		{"ÖPEN-other-end", false},
+		{"ÖPEN-model-other", false},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			_, matched := prices.Resolve("", tc.model, time.Time{})
+			assert.Equal(t, tc.matches, matched)
+		})
+	}
+}
+
+func TestGenAIPricesCaseInsensitiveRulesKeepDeclarationOrder(t *testing.T) {
+	prices, err := ParseGenAIPrices([]byte(`[
+		{"id":"direct", "model_match":{"starts_with":"Direct-"},
+		 "provider_match":{"contains":"GateWay"}, "models":[
+			{"id":"specific", "match":{"contains":"-Pro-"}, "prices":{"input_mtok":3}},
+			{"id":"broad", "match":{"starts_with":"DIRECT-"}, "prices":{"input_mtok":1}}
+		]}
+	]`))
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name     string
+		provider string
+		model    string
+		want     string
+		pattern  string
+	}{
+		{"first overlapping rule wins", "", "direct-PRO-v1", "3", "direct/specific"},
+		{"later rule when first misses", "", "DIRECT-lite", "1", "direct/broad"},
+		{"provider match ignores case", " My-GATEWAY ", "direct-pro-v1", "3", "direct/specific"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := prices.Resolve(tc.provider, tc.model, time.Time{})
+			require.True(t, ok)
+			assert.Equal(t, money.MustParseDollars(tc.want), got.InputPerMTok)
+			assert.Equal(t, tc.pattern, got.ModelPattern)
+		})
+	}
+}
+
+func TestGenAIPricesPriceChangesListsEveryRateBoundary(t *testing.T) {
+	prices, err := ParseGenAIPrices([]byte(`[
+		{
+			"id": "offpeak",
+			"name": "Off Peak",
+			"api_pattern": "https://example.invalid",
+			"model_match": {"contains": "night-model"},
+			"models": [{
+				"id": "night-model",
+				"match": {"equals": "night-model"},
+				"prices": [
+					{"prices": {"input_mtok": 10}},
+					{"constraint": {"start_date": "2026-08-02"}, "prices": {"input_mtok": 8}},
+					{"constraint": {"start_time": "22:00:00+00:00", "end_time": "02:00:00+00:00"},
+					 "prices": {"input_mtok": 2}}
+				]
+			}]
+		}
+	]`))
+	require.NoError(t, err)
+	from := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 8, 2, 23, 30, 0, 0, time.UTC)
+	changes := prices.PriceChanges(from, to)
+	assert.Equal(t, []time.Time{
+		time.Date(2026, 8, 1, 22, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 2, 2, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 2, 22, 0, 0, 0, time.UTC),
+	}, changes)
+	// Between two adjacent boundaries every instant resolves alike.
+	bounds := append(append([]time.Time{from}, changes...), to)
+	for i := range len(bounds) - 1 {
+		first, ok := prices.Resolve("", "night-model", bounds[i])
+		require.True(t, ok)
+		for at := bounds[i]; at.Before(bounds[i+1]); at = at.Add(7 * time.Minute) {
+			got, ok := prices.Resolve("", "night-model", at)
+			require.True(t, ok)
+			assert.Equal(t, first.InputPerMTok, got.InputPerMTok, "at %s", at)
+		}
+	}
+	assert.Empty(t, prices.PriceChanges(to, from))
+}

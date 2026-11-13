@@ -1,10 +1,12 @@
 <script lang="ts">
   import {
     Button,
-    Checkbox,
     Modal,
+    SegmentedControl,
     TableHeaderCell,
+    TableSort,
     TextInput,
+    Toggle,
     Typeahead,
   } from "@kenn-io/kit-ui";
   import { onDestroy } from "svelte";
@@ -18,6 +20,8 @@
   import { formatDateTime, m } from "../../i18n/index.js";
   import { LatestRead } from "../../utils/latest-read.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { LockIcon } from "../../icons.js";
+  import StateNotice from "../shared/StateNotice.svelte";
 
   interface Props {
     readOnly?: boolean;
@@ -67,6 +71,9 @@
   let applying = $state(false);
   let error = $state("");
   let applyMessage = $state("");
+  // Apply failures show beside the Apply action above the list; save and
+  // delete failures keep showing under the form.
+  let applyError = $state("");
   let editingId: number | null = $state(null);
   let editingWasEnabled = $state(false);
   let pathPrefix = $state("");
@@ -74,6 +81,16 @@
   let project = $state("");
   let enabled = $state(true);
   let confirmation: Confirmation | null = $state(null);
+  const sort = new TableSort<DbProjectRule>({
+    prefix: row => row.path_prefix,
+    project: row => row.project || derivedLayoutLabel(row),
+    original: row => row.original_project || null,
+    enabled: row => row.enabled ? m.worktree_on() : m.worktree_off(),
+    updated: { value: row => new Date(row.updated_at), firstDirection: "desc" },
+    governed: { value: row => row.governed_sessions, firstDirection: "desc" },
+  });
+  const uid = $props.id();
+  const formTitleId = `${uid}-form-title`;
   const mappingsRead = new LatestRead();
   let machineGeneration = 0;
   let disposed = false;
@@ -88,6 +105,13 @@
       meta: sessions.machineLabel(name) !== name ? name : undefined,
     })),
   );
+  const layoutOptions = $derived([
+    { value: explicitLayout, label: m.worktree_layout_explicit({}) },
+    {
+      value: repoDotWorktreesLayout,
+      label: m.worktree_layout_repo_dot_worktrees({ repo: "repo", branch: "branch" }),
+    },
+  ]);
   const isRepoDotWorktrees = $derived(layout === repoDotWorktreesLayout);
   const canSave = $derived(
     pathPrefix.trim() !== "" &&
@@ -162,6 +186,7 @@
     saving = false;
     applying = false;
     applyMessage = "";
+    applyError = "";
     error = "";
     resetForm();
     void loadMappings(value);
@@ -179,6 +204,7 @@
     project = mapping.project;
     enabled = mapping.enabled;
     applyMessage = "";
+    applyError = "";
     error = "";
   }
 
@@ -211,6 +237,7 @@
     saving = true;
     error = "";
     applyMessage = "";
+    applyError = "";
     try {
       if (id == null) {
         await SettingsService.postApiV1SettingsWorktreeMappings(input);
@@ -241,6 +268,7 @@
     saving = true;
     error = "";
     applyMessage = "";
+    applyError = "";
     try {
       await SettingsService.deleteApiV1SettingsWorktreeMappingsById({
           id: String(mapping.id),
@@ -274,6 +302,7 @@
     applying = true;
     error = "";
     applyMessage = "";
+    applyError = "";
     try {
       const res = await SettingsService.postApiV1SettingsWorktreeMappingsApply({ machine: initiatingMachine });
       onMutated?.();
@@ -284,7 +313,7 @@
       });
     } catch (err) {
       if (!isCurrentMachine(initiatingMachine, generation)) return;
-      error = err instanceof Error ? err.message : m.worktree_failed_apply();
+      applyError = err instanceof Error ? err.message : m.worktree_failed_apply();
     } finally {
       if (isCurrentMachine(initiatingMachine, generation)) applying = false;
     }
@@ -334,18 +363,35 @@
   {:else if error && machine === ""}
     <div class="error-text">{error}</div>
   {:else}
-    <div class="machine-row">
-      <span class="label">{m.worktree_machine()}</span>
-      <Typeahead
-        options={machineOptions}
-        value={machine}
-        fallbackLabel={sessions.machineLabel(machine || localMachine)}
-        placeholder={m.worktree_select_machine()}
-        title={m.worktree_select_machine()}
-        emptyLabel={m.worktree_no_machines()}
-        onselect={selectMachine}
-      />
+    <!-- Applying acts on every rule listed for the machine, so it sits with
+         the machine picker above the list rather than with the form. -->
+    <div class="list-toolbar">
+      <div class="machine-field">
+        <span class="label">{m.worktree_machine()}</span>
+        <Typeahead
+          options={machineOptions}
+          value={machine}
+          fallbackLabel={sessions.machineLabel(machine || localMachine)}
+          placeholder={m.worktree_select_machine()}
+          title={m.worktree_select_machine()}
+          emptyLabel={m.worktree_no_machines()}
+          onselect={selectMachine}
+        />
+      </div>
+      {#if !readOnly}
+        <Button
+          label={applying ? m.worktree_applying() : m.worktree_apply_mappings()}
+          disabled={applying || loading || mappings.length === 0}
+          onclick={applyMappings}
+        />
+      {/if}
     </div>
+    {#if applyError}
+      <div class="error-text">{applyError}</div>
+    {/if}
+    {#if applyMessage}
+      <div class="success-text">{applyMessage}</div>
+    {/if}
 
     <div class="rules-list" aria-busy={loading}>
       {#if loading}
@@ -357,14 +403,14 @@
           <table class="table">
             <thead>
               <tr>
-                <TableHeaderCell label={m.data_rules_col_prefix()} />
-                <TableHeaderCell label={m.data_rules_col_project()} />
-                <TableHeaderCell label={m.data_rules_col_original()} />
-                <TableHeaderCell label={m.data_rules_col_enabled()} />
-                <TableHeaderCell label={m.data_rules_col_updated()} />
-                <TableHeaderCell label={m.data_rules_col_governed()} numeric />
+                <TableHeaderCell label={m.data_rules_col_prefix()} {sort} column="prefix" />
+                <TableHeaderCell label={m.data_rules_col_project()} {sort} column="project" />
+                <TableHeaderCell label={m.data_rules_col_original()} {sort} column="original" />
+                <TableHeaderCell label={m.data_rules_col_enabled()} {sort} column="enabled" />
+                <TableHeaderCell label={m.data_rules_col_updated()} {sort} column="updated" />
+                <TableHeaderCell label={m.data_rules_col_governed()} {sort} column="governed" numeric />
                 {#if !readOnly}
-                  <TableHeaderCell label={m.data_rules_col_actions()} />
+                  <TableHeaderCell><span class="kit-sr-only">{m.data_rules_col_actions()}</span></TableHeaderCell>
                 {/if}
               </tr>
             </thead>
@@ -377,7 +423,7 @@
                    path_prefix) instead of id. That pair is unique on SQLite
                    too, since a single archive enforces UNIQUE(machine,
                    path_prefix). -->
-              {#each mappings as mapping (`${mapping.source_archive_id}:${mapping.path_prefix}`)}
+              {#each sort.sort(mappings) as mapping (`${mapping.source_archive_id}:${mapping.path_prefix}`)}
                 <tr class="rule-row" class:disabled={!mapping.enabled}>
                   <td class="col-prefix" title={mapping.path_prefix}>{mapping.path_prefix}</td>
                   <td>
@@ -423,84 +469,74 @@
     </div>
 
     {#if readOnly}
-      <p class="warning" role="note">{m.data_rules_read_only()}</p>
+      <StateNotice role="note" description={m.data_rules_read_only()}>
+        {#snippet icon()}
+          <LockIcon size="16" strokeWidth="2" />
+        {/snippet}
+      </StateNotice>
     {:else}
-      <div class="form-grid">
+      <section class="mapping-form" aria-labelledby={formTitleId}>
+        <h4 id={formTitleId}>
+          {editingId == null ? m.worktree_form_new_title() : m.worktree_form_edit_title()}
+        </h4>
         <div class="field">
           <span>{m.worktree_layout()}</span>
-          <div class="layout-options" role="group" aria-label={m.worktree_layout()}>
-            <Button
-              label={m.worktree_layout_explicit({})}
-              tone={layout === explicitLayout ? "info" : "neutral"}
-              surface={layout === explicitLayout ? "soft" : "outline"}
-              onclick={() => (layout = explicitLayout)}
-            />
-            <Button
-              label={m.worktree_layout_repo_dot_worktrees({ repo: "repo", branch: "branch" })}
-              tone={layout === repoDotWorktreesLayout ? "info" : "neutral"}
-              surface={layout === repoDotWorktreesLayout ? "soft" : "outline"}
-              onclick={() => (layout = repoDotWorktreesLayout)}
-            />
-          </div>
+          <SegmentedControl
+            options={layoutOptions}
+            value={layout}
+            ariaLabel={m.worktree_layout()}
+            onchange={(value) => (layout = value)}
+          />
         </div>
-        <label class="field">
-          <span>{isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}</span>
-          <TextInput
-            bind:value={pathPrefix}
-            block
-            ariaLabel={isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}
-            placeholder={isRepoDotWorktrees ? "/Users/me" : "/Users/me/project.worktrees"}
+        <div class="field-row">
+          <label class="field">
+            <span>{isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}</span>
+            <TextInput
+              bind:value={pathPrefix}
+              block
+              ariaLabel={isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}
+              placeholder={isRepoDotWorktrees ? "/Users/me" : "/Users/me/project.worktrees"}
+            />
+            {#if isRepoDotWorktrees}
+              <div class="hint">{m.worktree_parent_directory_hint()}</div>
+            {/if}
+          </label>
+          <label class="field">
+            <span>{m.worktree_project()}</span>
+            <TextInput
+              bind:value={project}
+              block
+              ariaLabel={m.worktree_project()}
+              placeholder="project-name"
+              disabled={isRepoDotWorktrees}
+            />
+            <div class="hint">
+              {isRepoDotWorktrees ? m.worktree_project_derived() : m.worktree_project_required()}
+            </div>
+          </label>
+        </div>
+        <Toggle bind:checked={enabled} label={m.worktree_enabled()} />
+        <div class="form-actions">
+          <Button
+            label={saving
+              ? m.worktree_saving()
+              : editingId == null
+                ? m.worktree_add_mapping()
+                : m.worktree_save_mapping()}
+            tone="info"
+            surface="solid"
+            disabled={!canSave || saving}
+            onclick={requestSave}
           />
-          {#if isRepoDotWorktrees}
-            <div class="hint">{m.worktree_parent_directory_hint()}</div>
+          {#if editingId != null}
+            <Button label={m.worktree_cancel()} disabled={saving} onclick={resetForm} />
           {/if}
-        </label>
-        <label class="field">
-          <span>{m.worktree_project()}</span>
-          <TextInput
-            bind:value={project}
-            block
-            ariaLabel={m.worktree_project()}
-            placeholder="project-name"
-            disabled={isRepoDotWorktrees}
-          />
-          <div class="hint">
-            {isRepoDotWorktrees ? m.worktree_project_derived() : m.worktree_project_required()}
-          </div>
-        </label>
-        <Checkbox bind:checked={enabled} label={m.worktree_enabled()} />
-      </div>
+        </div>
+      </section>
     {/if}
 
     {#if error}
       <div class="error-text">{error}</div>
-    {/if}
-    {#if applyMessage}
-      <div class="success-text">{applyMessage}</div>
-    {/if}
-
-    {#if !readOnly}
-      <div class="button-row">
-        <Button
-          label={saving
-            ? m.worktree_saving()
-            : editingId == null
-              ? m.worktree_add_mapping()
-              : m.worktree_save_mapping()}
-          tone="info"
-          surface="solid"
-          disabled={!canSave || saving}
-          onclick={requestSave}
-        />
-        {#if editingId != null}
-          <Button label={m.worktree_cancel()} disabled={saving} onclick={resetForm} />
-        {/if}
-        <Button
-          label={applying ? m.worktree_applying() : m.worktree_apply_mappings()}
-          disabled={applying || loading || mappings.length === 0}
-          onclick={applyMappings}
-        />
-      </div>
     {/if}
   {/if}
 </section>
@@ -534,28 +570,56 @@
     gap: 4px;
   }
 
+  /* Section heading under the page title. */
   h3 {
     margin: 0;
-    font-size: 13px;
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 600;
   }
 
   .description {
     margin: 0;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 13px;
   }
 
-  .machine-row,
-  .button-row,
+  .form-actions,
   .row-actions {
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
-  .machine-row {
+  /* Machine picker on the left, the list-wide Apply action on the right,
+     both on the picker's control line. */
+  .list-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
     justify-content: space-between;
-    font-size: 12px;
+    gap: var(--space-4);
+  }
+
+  /* Label above the control, as in the Recall scope fields. The machine is
+     an opaque ID, so it reads in monospace and truncates. */
+  .machine-field {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    flex: 0 1 320px;
+    min-width: 0;
+    gap: var(--space-3);
+    --typeahead-min-width: 240px;
+    --typeahead-max-width: 320px;
+  }
+
+  .machine-field :global(.kit-typeahead) {
+    width: 100%;
+  }
+
+  .machine-field :global(.kit-typeahead__value-text) {
+    font-family: var(--font-mono);
   }
 
   .label,
@@ -615,10 +679,14 @@
 
   .derived-label,
   .hint,
-  .muted,
-  .empty {
+  .muted {
     color: var(--text-muted);
     font-size: 11px;
+  }
+
+  .empty {
+    color: var(--text-secondary);
+    font-size: 13px;
   }
 
   .link-btn {
@@ -631,10 +699,31 @@
     cursor: pointer;
   }
 
-  .form-grid {
+  /* One framed form under the list: layout, then the two path fields side
+     by side, the switch, and the actions, all on one left edge. */
+  .mapping-form {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-6);
+    padding: var(--space-6);
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+  }
+
+  .mapping-form h4 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .field-row {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: var(--space-5);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-6);
+    align-self: stretch;
   }
 
   .field {
@@ -644,19 +733,21 @@
     min-width: 0;
   }
 
-  /* Stacked: the long repo_dot_worktrees label does not fit two-up inside a
-     one-third-width form column. */
-  .layout-options {
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 4px;
+  .mapping-form :global(.kit-toggle__label) {
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
   }
 
-  .warning {
-    margin: 0;
-    color: var(--accent-orange);
-    font-size: 12px;
+  /* Disabled secondary actions (Apply with no rules, Cancel while saving)
+     use app.css's disabled ink and edge, as in Settings, instead of fading
+     the whole button with opacity. */
+  .rules-view :global(.kit-button:disabled:not(.kit-button--solid.kit-button--info)) {
+    opacity: 1; /* kit-ui-check-ignore: deliberate local rule; disabled controls here use the disabled ink and edge instead of fading with opacity */
+    background: transparent;
+    border-color: var(--disabled-edge);
+    box-shadow: none;
+    color: var(--disabled-ink);
   }
 
   .error-text,
@@ -680,7 +771,7 @@
   }
 
   @media (max-width: 760px) {
-    .form-grid {
+    .field-row {
       grid-template-columns: 1fr;
     }
   }

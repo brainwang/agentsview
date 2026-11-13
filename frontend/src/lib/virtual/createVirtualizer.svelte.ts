@@ -1,3 +1,4 @@
+import { untrack } from "svelte";
 import {
   Virtualizer,
   type VirtualizerOptions,
@@ -90,10 +91,23 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
     }
     lastMeasureCacheKey = opts.measureCacheKey;
 
+    const getItemKey = opts.getItemKey;
+    const orderChanged =
+      opts.count === instance.options.count &&
+      getItemKey !== undefined &&
+      instance.getVirtualItems().some((item) => item.key !== getItemKey(item.index));
     instance.setOptions(resolvedOpts);
     instance._willUpdate();
+    // A reorder can leave the visible range unchanged, so TanStack won't notify.
+    if (orderChanged) untrack(() => _version++);
 
     postUpdate?.(instance, opts, cacheKeyChanged);
+
+    // setOptions does not notify, and TanStack notifies only when the
+    // rendered index range changes. Without this, a new item count that
+    // keeps the range indexes, or leaves the scroll offset past the new end,
+    // would keep the old rows and total size on screen.
+    untrack(() => _version++);
 
     return () => {
       instance?._willUpdate();
@@ -107,6 +121,15 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
       return instance;
     },
   };
+}
+
+function scrollReconcileState(v: Virtualizer<HTMLElement, HTMLElement>) {
+  // TanStack has no public read of the in-flight scroll target.
+  return v as unknown as { scrollState: { index: number | null } | null };
+}
+
+export function cancelScrollReconcile(v: Virtualizer<HTMLElement, HTMLElement> | undefined) {
+  v?.cancelScroll();
 }
 
 export function createVirtualizer(optsFn: () => ElementOpts) {
@@ -124,6 +147,7 @@ export function createVirtualizer(optsFn: () => ElementOpts) {
     },
     (instance, opts, reset) => {
       const scrollEl = opts.getScrollElement?.() ?? null;
+      if (reset) cancelScrollReconcile(instance);
       if (!scrollEl) return;
       if (reset) {
         scrollEl.scrollTop = 0;
@@ -136,9 +160,7 @@ export function createVirtualizer(optsFn: () => ElementOpts) {
       // leaving the viewport at the wrong position (observed as
       // pinned-message navigation stopping mid-scroll in ascending
       // sort when the target item is not yet rendered).
-      // scrollState is typed private but is a plain public field at runtime.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if ((instance as any).scrollState?.index != null) return;
+      if (scrollReconcileState(instance).scrollState?.index != null) return;
       if (scrollEl.scrollTop > 0) {
         instance.scrollToOffset(scrollEl.scrollTop);
       }

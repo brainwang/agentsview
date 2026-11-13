@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { formatCount } from "../../utils/format.js";
   import {
     Button,
     Card,
     EmptyState,
     Modal,
+    PageHeader,
     SearchInput,
     SegmentedControl,
     Table,
@@ -20,15 +22,17 @@
     RecallExtractProgress,
     RecallExtractProgressState,
     RecallExtractionStatus,
+    RecallReviewAction,
   } from "../../api/types/recall.js";
   import { ApiError, isAbortError, responseTimingOf, type ResponseTiming } from "../../api/runtime.js";
   import { formatDateTime, m } from "../../i18n/index.js";
-  import { ChevronDownIcon, ChevronRightIcon } from "../../icons.js";
+  import { ChevronDownIcon, ChevronRightIcon, SearchIcon } from "../../icons.js";
   import { router } from "../../stores/router.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { LatestRead } from "../../utils/latest-read.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
+  import { LiveQuery } from "../../utils/liveQuery.svelte.js";
   import { queryStepFrom, type QueryStep } from "../../utils/refresh.js";
 
   const ENTRY_TYPES = [
@@ -42,6 +46,7 @@
   ];
   const REVIEW_STATES = [
     "human_reviewed",
+    "human_rejected",
     "unreviewed_auto",
     "calibrated_auto",
     "eval_raw",
@@ -66,6 +71,8 @@
   // an entries load on its own, or the entries and status pair on refresh.
   let queryDurationMs = $state<number | null>(null);
   let querySteps = $state<QueryStep[]>([]);
+  // The query running now, drawn live by the refresh control.
+  const liveQuery = new LiveQuery();
   // What one loader measured when it applied its response. Each loader
   // returns its own record, or null when it failed or a newer load
   // superseded it, so a refresh can only publish the requests it made.
@@ -88,6 +95,9 @@
   let generationAction = $state<GenerationAction | null>(null);
   let generationActionLoading = $state(false);
   let generationActionError = $state("");
+  let reviewingEntryIds = $state<string[]>([]);
+  let reviewErrors = $state<Record<string, string>>({});
+  let archiveEntry = $state<RecallEntry | null>(null);
   let search = $state("");
   let query = $state("");
   let project = $state("");
@@ -153,8 +163,8 @@
     },
     ...REVIEW_STATES.map((name) => ({
       name,
-      label: name,
-      displayLabel: name,
+      label: reviewStateLabel(name),
+      displayLabel: reviewStateLabel(name),
     })),
   ]);
   const progressStateOptions = $derived<SegmentedControlOption[]>([
@@ -184,6 +194,9 @@
     const appending = cursor !== "";
     entriesLoading = true;
     entriesFailed = false;
+    const live = publishTiming ? liveQuery.begin(startedAt) : null;
+    const liveStep = live === null ? 0 : liveQuery.start("entries", startedAt);
+    let load: LoadTiming | null = null;
     try {
       const page = await RecallService.getApiV1RecallEntries({
         limit: 200,
@@ -191,6 +204,7 @@
         project: project || undefined,
         type: entryType || undefined,
         source_run_id: generation || undefined,
+        status: reviewState === "human_rejected" ? "archived" : undefined,
         review_state: reviewState || undefined,
         cursor: cursor || undefined,
       }, { signal });
@@ -201,16 +215,18 @@
       nextCursor = page.next_cursor ?? "";
       resultCap = page.result_cap ?? 0;
       entriesUpdatedAt = Date.now();
-      const load = { seq, startedAt, appliedAt: performance.now(), timing: responseTimingOf(page) };
+      load = { seq, startedAt, appliedAt: performance.now(), timing: responseTimingOf(page) };
       if (publishTiming) {
         queryDurationMs = load.appliedAt - startedAt;
-        querySteps = [queryStepFrom("entries", load.timing, startedAt, load.appliedAt, startedAt)];
+        querySteps = [stepOf("entries", load, startedAt)];
       }
       return load;
     } catch (error) {
       if (isAbortError(error) || !entriesRead.isCurrent(signal)) return null;
       if (appending && error instanceof ApiError && error.status === 409) {
-        return loadEntries("", publishTiming);
+        // Awaited so this call's cleanup runs after the retry has
+        // reported its own step to the live query.
+        return await loadEntries("", publishTiming);
       }
       if (!appending) {
         entries = [];
@@ -220,6 +236,10 @@
       }
       return null;
     } finally {
+      if (live !== null) {
+        settleLive(liveStep, "entries", load, startedAt);
+        liveQuery.end(live);
+      }
       if (entriesRead.finish(signal)) entriesLoading = false;
     }
   }
@@ -282,9 +302,31 @@
     }, 250);
   }
 
+  function stepOf(name: string, load: LoadTiming, originMs: number): QueryStep {
+    return queryStepFrom(name, load.timing, load.startedAt, load.appliedAt, originMs);
+  }
+
+  function settleLive(liveStep: number, name: string, load: LoadTiming | null, originMs: number) {
+    if (load === null) liveQuery.abandon(liveStep);
+    else liveQuery.settle(liveStep, stepOf(name, load, originMs));
+  }
+
   async function refreshRecall() {
     const startedAt = performance.now();
-    const [entriesLoad, statusLoad] = await Promise.all([loadEntries("", false), loadStatus()]);
+    const live = liveQuery.begin(startedAt);
+    const entriesStep = liveQuery.start("entries", startedAt);
+    const statusStep = liveQuery.start("status", startedAt);
+    const [entriesLoad, statusLoad] = await Promise.all([
+      loadEntries("", false).then((load) => {
+        settleLive(entriesStep, "entries", load, startedAt);
+        return load;
+      }),
+      loadStatus().then((load) => {
+        settleLive(statusStep, "status", load, startedAt);
+        return load;
+      }),
+    ]);
+    liveQuery.end(live);
     // Only a refresh whose own two requests both applied, and were not
     // overtaken by a later load while the other was still in flight, counts
     // as a completed query. Otherwise the previous duration and timeline
@@ -296,10 +338,7 @@
       statusLoad.seq === statusLoadSeq
     ) {
       queryDurationMs = performance.now() - startedAt;
-      querySteps = [
-        queryStepFrom("entries", entriesLoad.timing, entriesLoad.startedAt, entriesLoad.appliedAt, startedAt),
-        queryStepFrom("status", statusLoad.timing, statusLoad.startedAt, statusLoad.appliedAt, startedAt),
-      ];
+      querySteps = [stepOf("entries", entriesLoad, startedAt), stepOf("status", statusLoad, startedAt)];
     }
     if (progressExpanded) await loadProgress();
   }
@@ -360,6 +399,66 @@
     }
   }
 
+  function reviewStateLabel(state: string): string {
+    switch (state) {
+      case "human_reviewed":
+        return m.recall_page_review_state_human_reviewed();
+      case "human_rejected":
+        return m.recall_page_review_state_human_rejected();
+      case "unreviewed_auto":
+        return m.recall_page_review_state_unreviewed_auto();
+      case "calibrated_auto":
+        return m.recall_page_review_state_calibrated_auto();
+      case "eval_raw":
+        return m.recall_page_review_state_eval_raw();
+      default:
+        return state;
+    }
+  }
+
+  function isReviewable(entry: RecallEntry): boolean {
+    return entry.status === "accepted" &&
+      entry.review_state === "unreviewed_auto";
+  }
+
+  function keepAfterReview(entry: RecallEntry): boolean {
+    return entry.status === "accepted" &&
+      (!reviewState || entry.review_state === reviewState);
+  }
+
+  async function submitReview(
+    entry: RecallEntry,
+    action: RecallReviewAction,
+  ) {
+    if (reviewingEntryIds.includes(entry.id)) return;
+    reviewingEntryIds = [...reviewingEntryIds, entry.id];
+    reviewErrors = { ...reviewErrors, [entry.id]: "" };
+    try {
+      const updated = await RecallService.postApiV1RecallEntriesByIdReview({ id: entry.id }, { action });
+      const keep = keepAfterReview(updated);
+      entries = keep
+        ? entries.map((item) => item.id === updated.id ? updated : item)
+        : entries.filter((item) => item.id !== updated.id);
+      if (!keep) {
+        expandedEntryIds = expandedEntryIds.filter((id) => id !== updated.id);
+      }
+      archiveEntry = null;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      reviewErrors = {
+        ...reviewErrors,
+        [entry.id]: m.recall_page_review_error({ error: detail }),
+      };
+    } finally {
+      reviewingEntryIds = reviewingEntryIds.filter((id) => id !== entry.id);
+    }
+  }
+
+  function closeArchiveReview() {
+    if (archiveEntry && reviewingEntryIds.includes(archiveEntry.id)) return;
+    archiveEntry = null;
+  }
+
   function progressTimestamp(value: string): string {
     return formatDateTime(value, {
       dateStyle: "medium",
@@ -389,11 +488,11 @@
   }
 
   $effect(() => {
-    query;
-    project;
-    entryType;
-    generation;
-    reviewState;
+    void query;
+    void project;
+    void entryType;
+    void generation;
+    void reviewState;
     void loadEntries();
   });
 
@@ -409,8 +508,8 @@
 
   $effect(() => {
     if (!progressExpanded) return;
-    progressState;
-    status?.fingerprint;
+    void progressState;
+    void status?.fingerprint;
     void loadProgress();
   });
 </script>
@@ -427,8 +526,8 @@
       />
       <Button
         label={generationAction.kind === "activate"
-          ? m.recall_page_generation_activate_title()
-          : m.recall_page_generation_retire_title()}
+          ? m.recall_page_generation_activate()
+          : m.recall_page_generation_retire()}
         tone={generationAction.kind === "activate" ? "info" : "danger"}
         surface="solid"
         disabled={generationActionLoading}
@@ -438,30 +537,54 @@
   {/if}
 {/snippet}
 
-<div class="recall-corpus-panel">
-  <header class="recall-page-header">
-    <div>
-      <h2>{m.recall_page_title()}</h2>
-      <p>{m.recall_page_subtitle()}</p>
-    </div>
-    <div class="header-actions">
-      {#if !entriesLoading && !entriesFailed}
-        <span class="entry-count">
-          {m.recall_page_entries_shown({
-            countLabel: entries.length.toLocaleString(),
-          })}
-        </span>
-      {/if}
-      <RefreshControl
-        {lastUpdatedAt}
-        {queryDurationMs}
-        {querySteps}
-        busy={entriesLoading || statusLoading || progressLoading}
-        onRefresh={refreshRecall}
-        label={m.shared_refresh()}
+{#snippet archiveReviewFooter()}
+  {#if archiveEntry}
+    {@const busy = reviewingEntryIds.includes(archiveEntry.id)}
+    <span class="review-modal-actions">
+      <Button
+        label={m.recall_page_review_cancel()}
+        tone="neutral"
+        surface="outline"
+        disabled={busy}
+        onclick={closeArchiveReview}
       />
-    </div>
-  </header>
+      <Button
+        label={m.recall_page_review_archive()}
+        tone="danger"
+        surface="solid"
+        disabled={busy}
+        onclick={() => submitReview(archiveEntry!, "archive")}
+      />
+    </span>
+  {/if}
+{/snippet}
+
+<div class="recall-corpus-panel">
+  <div class="recall-corpus-heading">
+    <PageHeader
+      title={m.recall_page_title()}
+      level={2}
+    >
+      {#snippet actions()}
+        {#if !entriesLoading && !entriesFailed}
+          <span class="entry-count">
+            {m.recall_page_entries_shown({
+              countLabel: formatCount(entries.length),
+            })}
+          </span>
+        {/if}
+        <RefreshControl
+          {lastUpdatedAt}
+          {queryDurationMs}
+          {querySteps}
+          {liveQuery}
+          busy={entriesLoading || statusLoading || progressLoading}
+          onRefresh={refreshRecall}
+          label={m.shared_refresh()}
+        />
+      {/snippet}
+    </PageHeader>
+  </div>
 
   <Card level="default" padding="none" class="extraction-card">
     <div class="extraction-content">
@@ -501,26 +624,26 @@
       {:else if status.stats}
         <div class="status-metrics">
           <span>{m.recall_page_status_done({
-            countLabel: status.stats.done.toLocaleString(),
+            countLabel: formatCount(status.stats.done),
           })}</span>
           <span>{m.recall_page_status_failed({
-            countLabel: status.stats.failed.toLocaleString(),
+            countLabel: formatCount(status.stats.failed),
           })}</span>
           <span>{m.recall_page_status_eligible({
-            countLabel: (status.eligible_backlog ?? 0).toLocaleString(),
+            countLabel: formatCount(status.eligible_backlog ?? 0),
           })}</span>
           <span>{m.recall_page_status_pending({
-            countLabel: status.stats.pending.toLocaleString(),
+            countLabel: formatCount(status.stats.pending),
           })}</span>
           <span>{m.recall_page_status_partial({
-            countLabel: status.stats.partial.toLocaleString(),
+            countLabel: formatCount(status.stats.partial),
           })}</span>
           <span>{m.recall_page_status_units({
-            doneLabel: status.stats.units_done.toLocaleString(),
-            totalLabel: status.stats.units_total.toLocaleString(),
+            doneLabel: formatCount(status.stats.units_done),
+            totalLabel: formatCount(status.stats.units_total),
           })}</span>
           <span>{m.recall_page_status_entries({
-            countLabel: status.stats.entries.toLocaleString(),
+            countLabel: formatCount(status.stats.entries),
           })}</span>
         </div>
       {/if}
@@ -586,7 +709,7 @@
             <p class="progress-state">{m.recall_page_progress_empty()}</p>
           {:else}
             <div class="progress-table-shell">
-              <Table
+              <Table unsorted
                 ariaLabel={m.recall_page_progress_table_label()}
                 stickyHeader={false}
                 zebra={false}
@@ -647,8 +770,8 @@
                         {/if}
                       </td>
                       <td class="progress-units">
-                        {item.unit_cursor.toLocaleString()} /
-                        {item.units_total.toLocaleString()}
+                        {formatCount(item.unit_cursor)} /
+                        {formatCount(item.units_total)}
                       </td>
                       <td class="progress-updated">
                         {progressTimestamp(item.updated_at)}
@@ -704,6 +827,22 @@
       {#if generationActionError}
         <p class="generation-action-error">{generationActionError}</p>
       {/if}
+    </Modal>
+  {/if}
+
+  {#if archiveEntry}
+    <Modal
+      title={m.recall_page_review_archive_title()}
+      closeLabel={m.recall_page_review_close()}
+      tone="danger"
+      width="460px"
+      closeOnOverlayClick={!reviewingEntryIds.includes(archiveEntry.id)}
+      onclose={closeArchiveReview}
+      footer={archiveReviewFooter}
+    >
+      <p class="review-modal-copy">
+        {m.recall_page_review_archive_message({ title: archiveEntry.title })}
+      </p>
     </Modal>
   {/if}
 
@@ -766,7 +905,7 @@
   {#if resultCap > 0}
     <p class="result-cap">
       {m.recall_page_ranked_result_cap({
-        countLabel: resultCap.toLocaleString(),
+        countLabel: formatCount(resultCap),
       })}
     </p>
   {/if}
@@ -776,10 +915,14 @@
   {:else if entriesFailed}
     <p class="entries-state status-error">{m.recall_page_error()}</p>
   {:else if entries.length === 0}
-    <EmptyState title={m.recall_page_empty()} />
+    <EmptyState align="top" title={m.recall_page_empty()}>
+      {#snippet icon()}
+        <SearchIcon size="24" strokeWidth="1.75" />
+      {/snippet}
+    </EmptyState>
   {:else}
     <div class="recall-table-shell">
-      <Table
+      <Table unsorted
         ariaLabel={m.recall_page_table_label()}
         stickyHeader={false}
         zebra={false}
@@ -823,7 +966,7 @@
               </td>
               <td><span class="entry-type">{entry.type}</span></td>
               <td class="project-cell">{entry.project ?? "—"}</td>
-              <td class="review-cell">{entry.review_state}</td>
+              <td class="review-cell">{reviewStateLabel(entry.review_state)}</td>
             </tr>
             {#if expanded}
               <tr class="entry-detail-row">
@@ -875,6 +1018,48 @@
                         {/each}
                       </div>
                     {/if}
+                    {#if isReviewable(entry)}
+                      {@const busy = reviewingEntryIds.includes(entry.id)}
+                      <div class="entry-review">
+                        <div class="entry-review-actions">
+                          <Button
+                            size="sm"
+                            tone="info"
+                            surface="solid"
+                            label={m.recall_page_review_approve()}
+                            disabled={busy || !entry.provenance_ok}
+                            title={!entry.provenance_ok
+                              ? m.recall_page_review_approve_disabled()
+                              : undefined}
+                            onclick={() => submitReview(entry, "approve")}
+                          />
+                          <Button
+                            size="sm"
+                            tone="danger"
+                            surface="outline"
+                            label={m.recall_page_review_archive()}
+                            disabled={busy}
+                            onclick={() => {
+                              reviewErrors = {
+                                ...reviewErrors,
+                                [entry.id]: "",
+                              };
+                              archiveEntry = entry;
+                            }}
+                          />
+                        </div>
+                        {#if !entry.provenance_ok}
+                          <p class="entry-review-note">
+                            {m.recall_page_review_approve_disabled()}
+                          </p>
+                        {/if}
+                        {#if reviewErrors[entry.id]}
+                          <p class="entry-review-error">
+                            {reviewErrors[entry.id]}
+                          </p>
+                        {/if}
+                      </div>
+                    {/if}
                   </div>
                 </td>
               </tr>
@@ -907,42 +1092,19 @@
     padding: 48px 40px 56px;
   }
 
-  .recall-page-header {
-    display: flex;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: var(--space-6);
+  .recall-corpus-heading {
     margin-bottom: var(--space-6);
   }
 
-  h2,
   h3,
   p {
     margin: 0;
-  }
-
-  .recall-page-header h2 {
-    color: var(--text-primary);
-    font-size: 20px;
-    font-weight: 600;
-  }
-
-  .recall-page-header p {
-    margin-top: var(--space-2);
-    color: var(--text-muted);
-    font-size: 12px;
   }
 
   .entry-count {
     color: var(--text-muted);
     font-family: var(--font-mono);
     font-size: 10px;
-  }
-
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
   }
 
   .extraction-content {
@@ -1057,8 +1219,13 @@
     display: contents;
   }
 
+  .review-modal-actions {
+    display: contents;
+  }
+
   .generation-modal-copy,
-  .generation-action-error {
+  .generation-action-error,
+  .review-modal-copy {
     margin: 0;
     color: var(--text-secondary);
     font-size: 12px;
@@ -1302,6 +1469,30 @@
     font-size: 9px;
   }
 
+  .entry-review {
+    margin-top: var(--space-5);
+    padding-top: var(--space-5);
+    border-top: 1px solid var(--border-default);
+  }
+
+  .entry-review-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+  }
+
+  .entry-review-note,
+  .entry-review-error {
+    margin-top: var(--space-3);
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.5;
+  }
+
+  .entry-review-error {
+    color: var(--slow-fg);
+  }
+
   .load-more {
     display: flex;
     justify-content: center;
@@ -1321,11 +1512,6 @@
   @media (max-width: 640px) {
     .recall-corpus-panel {
       padding: 28px 16px 40px;
-    }
-
-    .recall-page-header {
-      align-items: flex-start;
-      flex-direction: column;
     }
 
     .recall-toolbar {

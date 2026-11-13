@@ -41,7 +41,7 @@ type SessionMeta struct {
 	StartedAt   string // RFC3339 or ""
 	EndedAt     string // RFC3339 or ""
 	IsAutomated bool   // automation flag, independent of delegation
-	IsSubagent  bool   // delegated session, counted separately from conversations
+	IsSubagent  bool   // delegation takes precedence over automation
 }
 
 // ActivityEvent is one timestamped message (backends send only timestamped rows).
@@ -78,14 +78,17 @@ type UsageRow struct {
 	Cost              money.Money
 	CostSource        export.CostSource
 	SessionCost       *money.Money
-	CostAllocated     bool // an authoritative session total was apportioned
-	Priced            bool
-	Contributes       bool
-	Agent             string
-	ClaudeMessageID   string
-	ClaudeRequestID   string
-	SourceUUID        string
-	UsageDedupKey     string
+	// RecordedCost is the cost the agent recorded for this row, when it
+	// recorded one; see UsagePrice.RecordedCost.
+	RecordedCost    *money.Money
+	CostAllocated   bool // an authoritative session total was apportioned
+	Priced          bool
+	Contributes     bool
+	Agent           string
+	ClaudeMessageID string
+	ClaudeRequestID string
+	SourceUUID      string
+	UsageDedupKey   string
 }
 
 // SessionTokenCoverage records the canonical token categories represented for
@@ -285,6 +288,8 @@ type Bucket struct {
 	MaxSubagentAgents    int         `json:"max_subagent_agents"`
 	MaxAutomatedAgents   int         `json:"max_automated_agents"`
 	AgentMinutes         float64     `json:"agent_minutes"`
+	UserMessages         int         `json:"user_messages"`
+	AssistantMessages    int         `json:"assistant_messages"`
 	InputTokens          int         `json:"input_tokens,omitempty"`
 	OutputTokens         int         `json:"output_tokens"`
 	Cost                 money.Money `json:"cost"`
@@ -372,7 +377,10 @@ type interval struct {
 	sessionID string
 	start     time.Time
 	end       time.Time
-	model     string // model attributed to this interval
+	// tail is the start of the interval's last piece, for an interval that
+	// joins touching pieces; bucket membership depends on it.
+	tail  time.Time
+	model string // model attributed to this interval
 }
 
 // parseTS parses an RFC3339(/Nano) timestamp; ok=false on empty/invalid.
@@ -399,6 +407,16 @@ func rangeWindows(p Params) []BucketWindow {
 		return []BucketWindow{{Start: p.RangeStart, End: p.RangeEnd}}
 	}
 	return windows
+}
+
+// QueryWindows returns the bucket windows a report over q sums usage into.
+func QueryWindows(q Query) []BucketWindow {
+	return rangeWindows(Params{RangeStart: q.RangeStart, RangeEnd: q.RangeEnd, Bucket: q.Bucket, Loc: q.Loc})
+}
+
+// WindowIndex returns the index of the window that holds t, or -1.
+func WindowIndex(windows []BucketWindow, t time.Time) int {
+	return windowIndex(windows, t)
 }
 
 // Aggregate builds the range's report from the three input streams.
@@ -504,7 +522,7 @@ func (s SessionMeta) kind() sessionKind {
 }
 
 // ActivityCategory names the session's disjoint activity category for exports.
-// Delegation takes precedence over the independent automation flag.
+// Subagents take precedence over automation, including workers without parents.
 func (s SessionMeta) ActivityCategory() string {
 	switch s.kind() {
 	case subagentSession:
@@ -548,66 +566,110 @@ type usageAgg struct {
 	models       map[string]money.Money // model -> cost (for primary/mixed)
 }
 
+// sessionIntervalAgg sums durations, which add exactly, so a session's
+// minutes do not depend on how its activity was split into intervals.
 type sessionIntervalAgg struct {
-	minutes       float64
-	modelMins     map[string]float64
+	duration      time.Duration
 	modelDuration map[string]time.Duration
 	first, last   time.Time
 	hasIv         bool
 }
 
-type usageDedupToken struct {
-	kind  string
-	value string
+// UsageDedupToken identifies a usage event for deduplication across sources.
+type UsageDedupToken struct {
+	Kind  string
+	Value string
 }
 
+// AddUsageDedupToken inserts a token and reports whether it was new.
+func AddUsageDedupToken(seen map[UsageDedupToken]struct{}, token UsageDedupToken) bool {
+	if _, exists := seen[token]; exists {
+		return false
+	}
+	seen[token] = struct{}{}
+	return true
+}
+
+// claudeUsageSnapshotToken identifies one Claude response. The message ID is
+// required; the request ID is empty when the transcript omits requestId, which
+// Claude Agent SDK transcripts do.
 type claudeUsageSnapshotToken struct {
 	messageID string
 	requestID string
 }
 
-func usageDedupTokenForRow(u UsageRow) (usageDedupToken, bool) {
-	if u.ClaudeMessageID != "" && u.ClaudeRequestID != "" {
-		return usageDedupToken{
-			kind:  "claude",
-			value: u.ClaudeMessageID + ":" + u.ClaudeRequestID,
-		}, true
-	}
-	if u.Agent != "" && u.SourceUUID != "" {
-		return usageDedupToken{
-			kind:  "source",
-			value: u.Agent + ":" + u.SourceUUID,
-		}, true
-	}
-	if u.UsageDedupKey != "" {
-		return usageDedupToken{
-			kind:  "usage",
-			value: u.UsageDedupKey,
-		}, true
-	}
-	return usageDedupToken{}, false
+// UsageIdentity holds the stored identifiers of a usage row.
+type UsageIdentity struct {
+	UsageSource     string
+	Agent           string
+	ClaudeMessageID string
+	ClaudeRequestID string
+	SourceUUID      string
+	UsageDedupKey   string
 }
 
-func sessionUsageDedupTokenForRow(u UsageRow) (usageDedupToken, bool) {
-	if u.ClaudeMessageID != "" && u.ClaudeRequestID != "" {
-		return usageDedupToken{
-			kind:  "claude",
-			value: u.ClaudeMessageID + ":" + u.ClaudeRequestID,
+// UsageIdentity returns the row's stored deduplication identifiers.
+func (row UsageRow) UsageIdentity() UsageIdentity {
+	return UsageIdentity{
+		UsageSource: row.UsageSource, Agent: row.Agent,
+		ClaudeMessageID: row.ClaudeMessageID,
+		ClaudeRequestID: row.ClaudeRequestID,
+		SourceUUID:      row.SourceUUID, UsageDedupKey: row.UsageDedupKey,
+	}
+}
+
+// usageDedupTokenWithoutSourceGate picks the Claude response identity, source UUID, or stored usage key,
+// accepting source UUIDs regardless of UsageSource. SessionUsageDedupTokenForRow
+// restricts source UUIDs to message rows.
+func usageDedupTokenWithoutSourceGate(row UsageIdentity) (UsageDedupToken, bool) {
+	if row.ClaudeMessageID != "" {
+		return UsageDedupToken{
+			Kind: "claude", Value: row.ClaudeMessageID + ":" + row.ClaudeRequestID,
 		}, true
 	}
-	if u.UsageSource == "message" && u.Agent != "" && u.SourceUUID != "" {
-		return usageDedupToken{
-			kind:  "source",
-			value: u.Agent + ":" + u.SourceUUID,
-		}, true
+	if row.Agent != "" && row.SourceUUID != "" {
+		return UsageDedupToken{Kind: "source", Value: row.Agent + ":" + row.SourceUUID}, true
 	}
-	if u.UsageDedupKey != "" {
-		return usageDedupToken{
-			kind:  "usage",
-			value: u.UsageDedupKey,
-		}, true
+	if row.UsageDedupKey != "" {
+		return UsageDedupToken{Kind: "usage", Value: row.UsageDedupKey}, true
 	}
-	return usageDedupToken{}, false
+	return UsageDedupToken{}, false
+}
+
+// SessionUsageDedupTokenForRow restricts source UUID identity to message rows.
+func SessionUsageDedupTokenForRow(row UsageIdentity) (UsageDedupToken, bool) {
+	if row.UsageSource != "message" {
+		row.SourceUUID = ""
+	}
+	return usageDedupTokenWithoutSourceGate(row)
+}
+
+// KeepSessionUsageRow records identified rows and keeps only their first occurrence.
+// Rows without an identity are always kept.
+func KeepSessionUsageRow(seen map[UsageDedupToken]struct{}, row UsageIdentity) bool {
+	key, ok := SessionUsageDedupTokenForRow(row)
+	return !ok || AddUsageDedupToken(seen, key)
+}
+
+// UsageSelectionRow contains the fields needed to select usage survivors.
+type UsageSelectionRow struct {
+	UsageIdentity
+	SessionID         string
+	MessageOrdinal    int64
+	Timestamp         time.Time
+	TimestampValid    bool
+	RawTimestamp      string
+	OutputTokens      int
+	WebSearchRequests int
+}
+
+func usageSelectionRows(rows []UsageRow) []UsageSelectionRow {
+	out := make([]UsageSelectionRow, len(rows))
+	for i, row := range rows {
+		ts, valid := parseTS(row.Timestamp)
+		out[i] = UsageSelectionRow{UsageIdentity: row.UsageIdentity(), SessionID: row.SessionID, MessageOrdinal: row.MessageOrdinal, Timestamp: ts, TimestampValid: valid, RawTimestamp: row.Timestamp, OutputTokens: row.OutputTokens, WebSearchRequests: row.WebSearchRequests}
+	}
+	return out
 }
 
 // ClaudeSnapshotSurvivorSelection also returns the earliest session and the
@@ -628,22 +690,12 @@ func ClaudeSnapshotSurvivorSelection(
 func ClaudeSnapshotSurvivorSelectionContext(
 	ctx context.Context, usage []UsageRow,
 ) (mask []bool, attribution []string, webSearchRequests []int, err error) {
-	mask, attribution, webSearchRequests, _, err = claudeSnapshotSelectionContext(ctx, usage, nil)
+	mask, attribution, webSearchRequests, _, err = claudeSnapshotSelectionContext(ctx, usageSelectionRows(usage), nil)
 	return mask, attribution, webSearchRequests, err
 }
 
-func claudeSnapshotSurvivorSelection(
-	usage []UsageRow, eligible []bool,
-) (mask []bool, attribution []string, webSearchRequests []int) {
-	mask, attribution, webSearchRequests, _, err := claudeSnapshotSelectionContext(context.Background(), usage, eligible)
-	if err != nil {
-		panic(err)
-	}
-	return mask, attribution, webSearchRequests
-}
-
 func claudeSnapshotSelectionContext(
-	ctx context.Context, usage []UsageRow, eligible []bool,
+	ctx context.Context, usage []UsageSelectionRow, eligible []bool,
 ) (
 	mask []bool,
 	attribution []string,
@@ -661,9 +713,13 @@ func claudeSnapshotSelectionContext(
 	for i := range canonical {
 		canonical[i] = -1
 	}
-	best := make(map[claudeUsageSnapshotToken]int)
-	earliest := make(map[claudeUsageSnapshotToken]int)
-	maximumWebSearchRequests := make(map[claudeUsageSnapshotToken]int)
+	type snapshotSelection struct {
+		best, earliest, maximumWebSearchRequests int
+	}
+	// Each snapshot's selection lives in a slice so a row costs one map lookup.
+	groupOf := make(map[claudeUsageSnapshotToken]int)
+	groups := []snapshotSelection{}
+	rowGroup := make([]int, len(usage))
 	for i, u := range usage {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, nil, err
@@ -671,7 +727,7 @@ func claudeSnapshotSelectionContext(
 		if eligible != nil && !eligible[i] {
 			continue
 		}
-		if u.ClaudeMessageID == "" || u.ClaudeRequestID == "" {
+		if u.ClaudeMessageID == "" {
 			mask[i] = true
 			attribution[i] = u.SessionID
 			webSearchRequests[i] = u.WebSearchRequests
@@ -682,24 +738,31 @@ func claudeSnapshotSelectionContext(
 			messageID: u.ClaudeMessageID,
 			requestID: u.ClaudeRequestID,
 		}
-		previous, ok := best[key]
-		if first, exists := earliest[key]; !exists ||
-			earlierClaudeSnapshotAttribution(u, usage[first]) {
-			earliest[key] = i
+		g, ok := groupOf[key]
+		if !ok {
+			g = len(groups)
+			groupOf[key] = g
+			groups = append(groups, snapshotSelection{best: i, earliest: i})
 		}
-		if !ok || laterClaudeSnapshot(u, usage[previous]) {
-			best[key] = i
+		selected := &groups[g]
+		if ok && earlierClaudeSnapshotAttribution(u, usage[selected.earliest]) {
+			selected.earliest = i
 		}
-		maximumWebSearchRequests[key] = max(
-			maximumWebSearchRequests[key], u.WebSearchRequests)
+		if ok && laterClaudeSnapshot(u, usage[selected.best]) {
+			selected.best = i
+		}
+		selected.maximumWebSearchRequests = max(
+			selected.maximumWebSearchRequests, u.WebSearchRequests)
+		rowGroup[i] = g
 	}
-	for key, i := range best {
+	for _, selected := range groups {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, nil, err
 		}
+		i := selected.best
 		mask[i] = true
-		attribution[i] = usage[earliest[key]].SessionID
-		webSearchRequests[i] = maximumWebSearchRequests[key]
+		attribution[i] = usage[selected.earliest].SessionID
+		webSearchRequests[i] = selected.maximumWebSearchRequests
 	}
 	for i, u := range usage {
 		if err := ctx.Err(); err != nil {
@@ -708,13 +771,10 @@ func claudeSnapshotSelectionContext(
 		if eligible != nil && !eligible[i] {
 			continue
 		}
-		if u.ClaudeMessageID == "" || u.ClaudeRequestID == "" {
+		if u.ClaudeMessageID == "" {
 			continue
 		}
-		canonical[i] = best[claudeUsageSnapshotToken{
-			messageID: u.ClaudeMessageID,
-			requestID: u.ClaudeRequestID,
-		}]
+		canonical[i] = groups[rowGroup[i]].best
 	}
 	return mask, attribution, webSearchRequests, canonical, nil
 }
@@ -724,12 +784,12 @@ func claudeSnapshotSelectionContext(
 func CanonicalSessionTokenCoverageContext(
 	ctx context.Context, usage []UsageRow,
 ) (map[string]SessionTokenCoverage, error) {
-	_, _, _, snapshotCanonical, err := claudeSnapshotSelectionContext(ctx, usage, nil)
+	_, _, _, snapshotCanonical, err := claudeSnapshotSelectionContext(ctx, usageSelectionRows(usage), nil)
 	if err != nil {
 		return nil, err
 	}
 	genericCanonical := make(map[int]int, len(usage))
-	seen := make(map[usageDedupToken]int)
+	seen := make(map[UsageDedupToken]int)
 	for i, row := range usage {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -738,7 +798,7 @@ func CanonicalSessionTokenCoverageContext(
 			continue
 		}
 		genericCanonical[i] = i
-		if key, ok := sessionUsageDedupTokenForRow(row); ok {
+		if key, ok := SessionUsageDedupTokenForRow(row.UsageIdentity()); ok {
 			if previous, duplicate := seen[key]; duplicate {
 				genericCanonical[i] = previous
 				continue
@@ -775,14 +835,12 @@ func CanonicalSessionTokenCoverageContext(
 	return coverage, nil
 }
 
-func earlierClaudeSnapshotAttribution(candidate, current UsageRow) bool {
-	candidateTS, candidateErr := time.Parse(time.RFC3339Nano, candidate.Timestamp)
-	currentTS, currentErr := time.Parse(time.RFC3339Nano, current.Timestamp)
-	if candidateErr == nil && currentErr == nil && !candidateTS.Equal(currentTS) {
-		return candidateTS.Before(currentTS)
+func earlierClaudeSnapshotAttribution(candidate, current UsageSelectionRow) bool {
+	if candidate.TimestampValid && current.TimestampValid && !candidate.Timestamp.Equal(current.Timestamp) {
+		return candidate.Timestamp.Before(current.Timestamp)
 	}
-	if (candidateErr == nil) != (currentErr == nil) {
-		return candidateErr == nil
+	if candidate.TimestampValid != current.TimestampValid {
+		return candidate.TimestampValid
 	}
 	if candidate.SessionID != current.SessionID {
 		return candidate.SessionID < current.SessionID
@@ -790,20 +848,18 @@ func earlierClaudeSnapshotAttribution(candidate, current UsageRow) bool {
 	if candidate.MessageOrdinal != current.MessageOrdinal {
 		return candidate.MessageOrdinal < current.MessageOrdinal
 	}
-	return candidateErr != nil && candidate.Timestamp < current.Timestamp
+	return !candidate.TimestampValid && candidate.RawTimestamp < current.RawTimestamp
 }
 
-func laterClaudeSnapshot(candidate, current UsageRow) bool {
+func laterClaudeSnapshot(candidate, current UsageSelectionRow) bool {
 	if candidate.OutputTokens != current.OutputTokens {
 		return candidate.OutputTokens > current.OutputTokens
 	}
-	candidateTS, candidateErr := time.Parse(time.RFC3339Nano, candidate.Timestamp)
-	currentTS, currentErr := time.Parse(time.RFC3339Nano, current.Timestamp)
-	if candidateErr == nil && currentErr == nil && !candidateTS.Equal(currentTS) {
-		return candidateTS.After(currentTS)
+	if candidate.TimestampValid && current.TimestampValid && !candidate.Timestamp.Equal(current.Timestamp) {
+		return candidate.Timestamp.After(current.Timestamp)
 	}
-	if (candidateErr == nil) != (currentErr == nil) {
-		return candidateErr == nil
+	if candidate.TimestampValid != current.TimestampValid {
+		return candidate.TimestampValid
 	}
 	if candidate.SessionID != current.SessionID {
 		return candidate.SessionID > current.SessionID
@@ -811,7 +867,7 @@ func laterClaudeSnapshot(candidate, current UsageRow) bool {
 	if candidate.MessageOrdinal != current.MessageOrdinal {
 		return candidate.MessageOrdinal > current.MessageOrdinal
 	}
-	return candidateErr != nil && candidate.Timestamp > current.Timestamp
+	return !candidate.TimestampValid && candidate.RawTimestamp > current.RawTimestamp
 }
 
 // UsageSurvivorSelection returns the survivor mask, accounting destination,
@@ -821,7 +877,13 @@ func laterClaudeSnapshot(candidate, current UsageRow) bool {
 func UsageSurvivorSelection(
 	start, end, effEnd time.Time, usage []UsageRow,
 ) (mask []bool, attribution []string, webSearchRequests []int) {
-	return usageSurvivorSelection(start, end, effEnd, usage, nil)
+	mask, attribution, webSearchRequests, err := usageSurvivorSelection(
+		context.Background(), start, end, effEnd, usage, nil,
+	)
+	if err != nil {
+		panic(err)
+	}
+	return mask, attribution, webSearchRequests
 }
 
 // UsageSurvivorSelectionForSessions selects complete Claude snapshots across
@@ -829,24 +891,39 @@ func UsageSurvivorSelection(
 // before applying generic first-seen deduplication. This prevents an excluded
 // source-UUID or usage-key duplicate from suppressing an included row.
 func UsageSurvivorSelectionForSessions(
+	ctx context.Context,
 	start, end, effEnd time.Time, usage []UsageRow, sessionIDs []string,
-) (mask []bool, attribution []string, webSearchRequests []int) {
+) (mask []bool, attribution []string, webSearchRequests []int, err error) {
 	allowed := make(map[string]struct{}, len(sessionIDs))
 	for _, id := range sessionIDs {
 		allowed[id] = struct{}{}
 	}
-	return usageSurvivorSelection(start, end, effEnd, usage, allowed)
+	return usageSurvivorSelection(ctx, start, end, effEnd, usage, allowed)
 }
 
 func usageSurvivorSelection(
+	ctx context.Context,
 	start, end, effEnd time.Time,
 	usage []UsageRow,
 	allowed map[string]struct{},
-) (mask []bool, attribution []string, webSearchRequests []int) {
+) (mask []bool, attribution []string, webSearchRequests []int, err error) {
+	return usageSelection(ctx, start, end, effEnd, usageSelectionRows(usage), allowed)
+}
+
+// SelectUsageSurvivorsForSessions selects from compact, timestamp-parsed rows.
+func SelectUsageSurvivorsForSessions(ctx context.Context, start, end, effEnd time.Time, usage []UsageSelectionRow, sessionIDs []string) (mask []bool, attribution []string, webSearchRequests []int, err error) {
+	allowed := make(map[string]struct{}, len(sessionIDs))
+	for _, id := range sessionIDs {
+		allowed[id] = struct{}{}
+	}
+	return usageSelection(ctx, start, end, effEnd, usage, allowed)
+}
+
+func usageSelection(ctx context.Context, start, end, effEnd time.Time, usage []UsageSelectionRow, allowed map[string]struct{}) (mask []bool, attribution []string, webSearchRequests []int, err error) {
 	eligible := make([]bool, len(usage))
 	for i, u := range usage {
-		t, ok := parseTS(u.Timestamp)
-		if !ok || t.Before(start) || !t.Before(end) {
+		t := u.Timestamp
+		if !u.TimestampValid || t.Before(start) || !t.Before(end) {
 			continue
 		}
 		if !t.Before(effEnd) {
@@ -854,11 +931,14 @@ func usageSurvivorSelection(
 		}
 		eligible[i] = true
 	}
-	snapshots, snapshotAttribution, snapshotWebSearchRequests := claudeSnapshotSurvivorSelection(usage, eligible)
+	snapshots, snapshotAttribution, snapshotWebSearchRequests, _, err := claudeSnapshotSelectionContext(ctx, usage, eligible)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	mask = make([]bool, len(usage))
 	attribution = make([]string, len(usage))
 	webSearchRequests = make([]int, len(usage))
-	seen := map[usageDedupToken]struct{}{}
+	seen := map[UsageDedupToken]struct{}{}
 	for i, u := range usage {
 		if !snapshots[i] {
 			continue
@@ -868,17 +948,14 @@ func usageSurvivorSelection(
 				continue
 			}
 		}
-		if k, ok := usageDedupTokenForRow(u); ok {
-			if _, dup := seen[k]; dup {
-				continue
-			}
-			seen[k] = struct{}{}
+		if k, ok := usageDedupTokenWithoutSourceGate(u.UsageIdentity); ok && !AddUsageDedupToken(seen, k) {
+			continue
 		}
 		mask[i] = true
 		attribution[i] = snapshotAttribution[i]
 		webSearchRequests[i] = snapshotWebSearchRequests[i]
 	}
-	return mask, attribution, webSearchRequests
+	return mask, attribution, webSearchRequests, nil
 }
 
 // dedupUsage filters usage rows to the range, keeps the fullest Claude
@@ -889,9 +966,12 @@ func usageSurvivorSelection(
 // at or after effEnd are dropped before they can claim a dedup key, matching
 // the activity/bucket clipping Aggregate applies. For a full range
 // effEnd == end, so nothing extra is excluded.
-func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
+func dedupUsage(ctx context.Context, start, end, effEnd time.Time, usage []UsageRow) ([]UsageRow, error) {
 	out := make([]UsageRow, 0, len(usage))
-	mask, attribution, webSearchRequests := usageSurvivorSelection(start, end, effEnd, usage, nil)
+	mask, attribution, webSearchRequests, err := usageSurvivorSelection(ctx, start, end, effEnd, usage, nil)
+	if err != nil {
+		return nil, err
+	}
 	for i, keep := range mask {
 		if keep {
 			row := usage[i]
@@ -900,18 +980,7 @@ func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
 			out = append(out, row)
 		}
 	}
-	return out
-}
-
-// applyUsage dedups usage rows to the range, then accumulates tokens and cost
-// into r.Totals and the window whose [Start, End) contains each row's
-// timestamp.
-func applyUsage(r *Report, p Params, windows []BucketWindow, start, end time.Time,
-	usage []UsageRow, kindBy map[string]sessionKind,
-) error {
-	survivors := dedupUsage(start, end, p.EffectiveEnd, usage)
-	return applyUsageRows(r, windows, survivors, AllocateUsageCosts(survivors),
-		kindBy)
+	return out, nil
 }
 
 func applyUsageRows(
@@ -1040,7 +1109,7 @@ func buildSessionsTableFromDedupedUsage(
 			Agent: s.Agent, TimingQuality: "untimed", IsAutomated: s.IsAutomated, IsSubagent: s.IsSubagent,
 		}
 		if a := agg[s.SessionID]; a != nil && a.hasIv {
-			mins := a.minutes
+			mins := a.duration.Minutes()
 			row.AgentMinutes = &mins
 			row.TimingQuality = "timed"
 			f := a.first.Format(time.RFC3339)
@@ -1053,8 +1122,8 @@ func buildSessionsTableFromDedupedUsage(
 			if err := addKey(byAgent, s.Agent, mins, money.Money{}, kind); err != nil {
 				return fmt.Errorf("summing activity agent minutes: %w", err)
 			}
-			for m, mm := range a.modelMins {
-				if err := addKey(byModel, m, mm, money.Money{}, kind); err != nil {
+			for m, d := range a.modelDuration {
+				if err := addKey(byModel, m, d.Minutes(), money.Money{}, kind); err != nil {
 					return fmt.Errorf("summing activity model minutes: %w", err)
 				}
 			}

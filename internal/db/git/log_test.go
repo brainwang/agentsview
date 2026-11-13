@@ -9,15 +9,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/testutil"
 )
 
 // skipIfNoGit lets CI environments without git on PATH pass cleanly instead
 // of failing the package.
 func skipIfNoGit(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skipf("git not available on PATH: %v", err)
-	}
+	testutil.IsolateGit(t)
 }
 
 // gitRun executes a git subcommand inside repo and fails the test on error.

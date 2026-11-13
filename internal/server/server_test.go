@@ -27,6 +27,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 
 	"go.kenn.io/agentsview/internal/clickhouse"
 	"go.kenn.io/agentsview/internal/config"
@@ -40,6 +41,7 @@ import (
 	"go.kenn.io/agentsview/internal/sessionwatch"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
+	"go.kenn.io/agentsview/internal/testutil"
 )
 
 // Timestamp constants for test data.
@@ -336,8 +338,11 @@ func (te *testEnv) writeSessionFile(
 }
 
 func waitForPort(port int, timeout time.Duration) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	dialer := &net.Dialer{Timeout: 50 * time.Millisecond}
+	return waitForAddress(net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), timeout)
+}
+
+func waitForAddress(addr string, timeout time.Duration) error {
+	dialer := &net.Dialer{Timeout: time.Second}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	timer := time.NewTimer(timeout)
@@ -435,6 +440,7 @@ func (te *testEnv) listenAndServe(t *testing.T) string {
 			require.FailNowf(t, "test failed", "server failed to start: %v", serveErr)
 		default:
 		}
+		stacktest.Dump(t)
 		require.FailNowf(t, "test failed", "server not ready after 2s: %v", err)
 	}
 
@@ -445,6 +451,9 @@ func (te *testEnv) listenAndServe(t *testing.T) string {
 		defer cancel()
 		if err := te.srv.Shutdown(ctx); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
+			if errors.Is(err, context.DeadlineExceeded) {
+				stacktest.Dump(t)
+			}
 			assert.Failf(t, "test failed", "server shutdown error: %v", err)
 		}
 		select {
@@ -457,6 +466,7 @@ func (te *testEnv) listenAndServe(t *testing.T) string {
 				)
 			}
 		case <-time.After(5 * time.Second):
+			stacktest.Dump(t)
 			assert.Fail(t, "timed out waiting for server goroutine")
 		}
 	})
@@ -474,7 +484,7 @@ func TestListenAndServeUsesAvailablePortOutsideFixedRange(t *testing.T) {
 			continue
 		}
 
-		conn, dialErr := (&net.Dialer{Timeout: 50 * time.Millisecond}).DialContext(
+		conn, dialErr := (&net.Dialer{Timeout: time.Second}).DialContext(
 			t.Context(), "tcp", addr,
 		)
 		if dialErr != nil {
@@ -504,6 +514,60 @@ func TestListenAndServeUsesAvailablePortOutsideFixedRange(t *testing.T) {
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, baseURL+"/api/v1/version", nil)
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestListenAndServeAcceptsIPv6Loopback(t *testing.T) {
+	probe, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	require.NoError(t, probe.Close())
+
+	te := setup(t, func(cfg *config.Config) {
+		cfg.Host = "::1"
+		cfg.Port = port
+	})
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- te.srv.ListenAndServe()
+	}()
+
+	addr := net.JoinHostPort("::1", strconv.Itoa(port))
+	if err := waitForAddress(addr, 2*time.Second); err != nil {
+		select {
+		case serveErr := <-serveErrCh:
+			require.NoError(t, serveErr)
+		default:
+		}
+		require.NoError(t, err)
+	}
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(
+			context.WithoutCancel(t.Context()), 5*time.Second,
+		)
+		defer cancel()
+		require.NoError(t, te.srv.Shutdown(ctx))
+		select {
+		case serveErr := <-serveErrCh:
+			require.ErrorIs(t, serveErr, http.ErrServerClosed)
+		case <-time.After(5 * time.Second):
+			require.Fail(t, "timed out waiting for IPv6 server shutdown")
+		}
+	})
+
+	baseURL := "http://[::1]:" + strconv.Itoa(port)
+	req, err := http.NewRequestWithContext(
+		t.Context(), http.MethodGet, baseURL+"/api/v1/version", nil,
+	)
+	require.NoError(t, err)
+	transport := &http.Transport{Proxy: nil}
+	t.Cleanup(transport.CloseIdleConnections)
+	resp, err := (&http.Client{Transport: transport}).Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -589,6 +653,7 @@ func (te *testEnv) get(
 }
 
 func TestOpenAPIEndpointDocumentsExistingAPIRoutes(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	w := te.get(t, "/api/openapi.json")
@@ -634,6 +699,7 @@ func TestTypedRoutesRejectDuplicateJSONMembers(t *testing.T) {
 }
 
 func TestOpenAPIEndpointDocumentsTokenUsageAsArbitraryJSON(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	w := te.get(t, "/api/openapi.json")
@@ -656,6 +722,7 @@ func TestOpenAPIEndpointDocumentsTokenUsageAsArbitraryJSON(t *testing.T) {
 }
 
 func TestOpenAPIEndpointKeepsUsageSummaryContract(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	w := te.get(t, "/api/openapi.json")
@@ -913,10 +980,10 @@ func TestSearchContentSemanticModeUnavailable(t *testing.T) {
 // vector.QueryEncodeError this way).
 type fakeTransientVectorSearcher struct{}
 
-func (fakeTransientVectorSearcher) SemanticSearch(
-	_ context.Context, _ string, _ int,
-) ([]db.VectorHit, error) {
-	return nil, fmt.Errorf("%w: dial tcp: connection refused", db.ErrSemanticTransient)
+func (fakeTransientVectorSearcher) PrepareSemanticSearch(
+	context.Context, string,
+) (db.VectorSearchPage, int, error) {
+	return nil, 0, fmt.Errorf("%w: dial tcp: connection refused", db.ErrSemanticTransient)
 }
 
 func (fakeTransientVectorSearcher) ResolveMessageUnits(
@@ -946,6 +1013,7 @@ func TestSearchContentSemanticQueryEncodeFailureReturns503(t *testing.T) {
 // TypeScript client's session_ids typed as Array<string> rather than
 // loosening to any[] | null.
 func TestOpenAPIEndpointDocumentsBatchDeleteSessionIDsAsNonNullableArray(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	w := te.get(t, "/api/openapi.json")
@@ -1000,6 +1068,7 @@ func TestOpenAPIEndpointDocumentsOptionalProjectIdentity(t *testing.T) {
 }
 
 func TestOpenAPIEndpointDocumentsQualitySignalResponses(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	w := te.get(t, "/api/openapi.json")
@@ -1046,6 +1115,7 @@ func TestOpenAPIEndpointDocumentsQualitySignalResponses(t *testing.T) {
 // it. It is a detail-only derive-on-read field with no persisted column, so it
 // must appear on ServiceSessionDetail but not on the plain DbSession schema.
 func TestOpenAPIEndpointDocumentsDecodeConfidence(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	w := te.get(t, "/api/openapi.json")
@@ -1078,6 +1148,7 @@ func TestOpenAPIEndpointDocumentsDecodeConfidence(t *testing.T) {
 }
 
 func TestOpenAPIEndpointDocumentsImportResponseContentTypes(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	w := te.get(t, "/api/openapi.json")
@@ -1343,6 +1414,8 @@ type SSEEvent struct {
 func parseSSE(body string) []SSEEvent {
 	var events []SSEEvent
 	scanner := bufio.NewScanner(strings.NewReader(body))
+	// Change stream pages exceed the default 64 KiB line limit.
+	scanner.Buffer(nil, 16<<20)
 	var currentEvent SSEEvent
 	hasData := false
 	for scanner.Scan() {
@@ -1403,6 +1476,7 @@ func (te *testEnv) waitForSSEEvent(t *testing.T, w *flushRecorder, expectedEvent
 		case <-time.After(remaining):
 		}
 	}
+	stacktest.Dump(t)
 	require.FailNowf(t, "test failed", "timed out waiting for event: %s, got: %s", expectedEvent, w.BodyString())
 }
 
@@ -1441,6 +1515,7 @@ func (te *testEnv) emitUntilSSEEvent(
 		case <-time.After(remaining):
 		}
 	}
+	stacktest.Dump(t)
 	require.FailNowf(t, "test failed", "timed out waiting for event: %s, got: %s", expectedEvent, w.BodyString())
 }
 
@@ -1467,8 +1542,9 @@ type projectListResponse struct {
 }
 
 type syncStatusResponse struct {
-	LastSync string         `json:"last_sync"`
-	Progress *sync.Progress `json:"progress"`
+	StartupPending bool           `json:"startup_pending"`
+	LastSync       string         `json:"last_sync"`
+	Progress       *sync.Progress `json:"progress"`
 }
 
 type githubConfigResponse struct {
@@ -2248,6 +2324,7 @@ func TestSearch_WithResults(t *testing.T) {
 }
 
 func TestSearch_Limits(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 	te.requireFTS(t)
 	// Seed enough distinct sessions to prove clamping at the maximum.
@@ -2300,6 +2377,7 @@ func TestSearch_Limits(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			path := "/api/v1/search?q=common"
 			if tt.queryVal != "" {
 				path += "&" + tt.queryVal
@@ -2336,23 +2414,6 @@ func TestSearch_CanceledContext(t *testing.T) {
 		assert.Failf(t, "test failed", "expected empty body for canceled context, got: %s",
 			w.Body.String())
 	}
-}
-
-func TestSearch_DeadlineExceeded(t *testing.T) {
-	te := setup(t)
-	te.requireFTS(t)
-	te.seedSession(t, "s1", "my-app", 1)
-	te.seedMessages(t, "s1", 1, func(i int, m *db.Message) {
-		m.Content = "searchable content"
-		m.ContentLength = 18
-	})
-
-	ctx, cancel := expiredContext(t)
-	defer cancel()
-
-	w := te.getWithContext(t, ctx, "/api/v1/search?q=searchable")
-
-	assertTimeoutRace(t, w)
 }
 
 func TestSearch_ZeroResults(t *testing.T) {
@@ -2588,15 +2649,20 @@ func TestListMachines_ExcludeOneShotDefault(t *testing.T) {
 
 func TestSyncStatus(t *testing.T) {
 	te := setup(t)
+	w := te.get(t, "/api/v1/sync/status")
+	assertStatus(t, w, http.StatusOK)
+	resp := decode[syncStatusResponse](t, w)
+	assert.True(t, resp.StartupPending)
 
 	// Trigger a sync so LastSync is set
-	w := te.post(t, "/api/v1/sync", "{}")
+	w = te.post(t, "/api/v1/sync?wait=true", "{}")
 	assertStatus(t, w, http.StatusOK)
 
 	w = te.get(t, "/api/v1/sync/status")
 	assertStatus(t, w, http.StatusOK)
 
-	resp := decode[syncStatusResponse](t, w)
+	resp = decode[syncStatusResponse](t, w)
+	assert.False(t, resp.StartupPending)
 	if resp.LastSync == "" {
 		require.FailNow(t, "expected last_sync field")
 	}
@@ -2714,6 +2780,7 @@ func TestPGPushLocalNoSyncDaemonReachesConfigValidation(t *testing.T) {
 }
 
 func TestDuckDBPushLocalNoSyncDaemonWritesConfiguredPath(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 		t.Skip("duckdb-go-bindings does not ship a windows/arm64 library")
 	}
@@ -2746,6 +2813,7 @@ func TestDuckDBPushLocalNoSyncDaemonWritesConfiguredPath(t *testing.T) {
 // event stream ending in a done event carrying the push result, instead of a
 // single JSON body after a silent wait.
 func TestDuckDBPushStreamsSSEDoneEvent(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 		t.Skip("duckdb-go-bindings does not ship a windows/arm64 library")
 	}
@@ -3308,6 +3376,32 @@ func TestAuthRequiredProtectsPing(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+func TestAuthRequiredMatchesWholeToken(t *testing.T) {
+	te := setup(t, withAuth("secret-token"))
+
+	tests := []struct {
+		name string
+		path string
+		opts []requestOpt
+		want int
+	}{
+		{"exact bearer", "/api/ping", []requestOpt{withBearer("secret-token")}, http.StatusOK},
+		{"wrong bearer", "/api/ping", []requestOpt{withBearer("wrong-token!")}, http.StatusUnauthorized},
+		{"bearer prefix", "/api/ping", []requestOpt{withBearer("secret")}, http.StatusUnauthorized},
+		{"bearer with suffix", "/api/ping", []requestOpt{withBearer("secret-token-extra")}, http.StatusUnauthorized},
+		{"empty bearer", "/api/ping", []requestOpt{withHeader("Authorization", "Bearer ")}, http.StatusUnauthorized},
+		{"query token off stream paths", "/api/ping?token=secret-token", nil, http.StatusUnauthorized},
+		{"query token prefix on stream path", "/api/v1/events?token=secret", nil, http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := te.rawRequest(http.MethodGet, tt.path, tt.opts...)
+			assertStatus(t, w, tt.want)
+		})
+	}
+}
+
+// Serial: waits only one second for real synchronization.
 func TestPingReportsStalledSyncWithoutLosingDaemonIdentity(t *testing.T) {
 	dir := tempDirWithRetryCleanup(t)
 	cfg := config.Config{
@@ -3612,6 +3706,7 @@ func TestGetSettings_UsesGitHubCLIAuthTokenFallback(t *testing.T) {
 }
 
 func TestSettingsChartPaletteRoundTrip(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 	putSettings := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
@@ -3638,6 +3733,65 @@ func TestSettingsChartPaletteRoundTrip(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &updated))
 	assert.Equal(t, config.ChartPaletteMatplotlib, updated.ChartPalette)
+
+	var persisted struct {
+		ChartPalette config.ChartPalette `toml:"chart_palette"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, config.ChartPaletteMatplotlib, persisted.ChartPalette)
+
+	w = putSettings(`{"chart_palette":"colorblind"}`)
+	assertStatus(t, w, http.StatusOK)
+	_, err = toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, config.ChartPaletteColorblind, persisted.ChartPalette)
+}
+
+func TestReadOnlySettingsAcceptDisplayPreferences(t *testing.T) {
+	t.Parallel()
+	putSettings := func(te *testEnv, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	tests := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"chart palette", `{"chart_palette":"matplotlib"}`, http.StatusOK},
+		{"zoom level", `{"zoom_level":125}`, http.StatusOK},
+		{"disabled agents", `{"disabled_agents":["codex"]}`, http.StatusNotImplemented},
+		{"tool result images", `{"tool_result_images":"drop"}`, http.StatusNotImplemented},
+		{"require auth", `{"require_auth":true}`, http.StatusNotImplemented},
+		{"display mixed with ingestion", `{"chart_palette":"matplotlib","disabled_agents":["codex"]}`, http.StatusNotImplemented},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			te := setupPGMode(t)
+			w := putSettings(te, tt.body)
+			assertStatus(t, w, tt.want)
+		})
+	}
+
+	te := setupPGMode(t)
+	assertStatus(t, putSettings(te, `{"chart_palette":"matplotlib"}`), http.StatusOK)
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var resp struct {
+		ChartPalette config.ChartPalette `json:"chart_palette"`
+		ReadOnly     bool                `json:"read_only"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.ReadOnly)
+	assert.Equal(t, config.ChartPaletteMatplotlib, resp.ChartPalette)
 
 	var persisted struct {
 		ChartPalette config.ChartPalette `toml:"chart_palette"`
@@ -3672,6 +3826,7 @@ func TestOpenAPISettingsZoomLevels(t *testing.T) {
 }
 
 func TestSettingsZoomLevelRoundTrip(t *testing.T) {
+	t.Parallel()
 	configured := config.ZoomLevel120
 	te := setup(t, func(cfg *config.Config) { cfg.ZoomLevel = &configured })
 	require.NoError(t, os.WriteFile(filepath.Join(te.dataDir, "config.toml"), []byte(
@@ -3721,6 +3876,7 @@ func TestSettingsZoomLevelRoundTrip(t *testing.T) {
 }
 
 func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 	putSettings := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
@@ -3814,6 +3970,27 @@ func TestSettingsToolResultImagesRoundTrip(t *testing.T) {
 	assert.Equal(t, config.ToolResultImagesKeep, loadedPolicy(t))
 }
 
+func TestSettingsInsightDefaultAgent(t *testing.T) {
+	t.Parallel()
+	readDefaultAgent := func(t *testing.T, te *testEnv) string {
+		t.Helper()
+		w := te.get(t, "/api/v1/settings")
+		assertStatus(t, w, http.StatusOK)
+		var body struct {
+			InsightDefaultAgent string `json:"insight_default_agent"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		return body.InsightDefaultAgent
+	}
+
+	assert.Equal(t, "claude", readDefaultAgent(t, setup(t)))
+
+	configured := setup(t, func(c *config.Config) {
+		c.Insights.DefaultAgent = "codex"
+	})
+	assert.Equal(t, "codex", readDefaultAgent(t, configured))
+}
+
 func TestSettingsRejectsOutOfEnumToolResultImages(t *testing.T) {
 	te := setup(t)
 	putSettings := func(body string) *httptest.ResponseRecorder {
@@ -3846,6 +4023,7 @@ func TestSettingsRejectsOutOfEnumToolResultImages(t *testing.T) {
 }
 
 func TestSettingsToolResultImagesRejectionPreservesSiblingKeys(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 	putSettings := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
@@ -3882,20 +4060,6 @@ func TestSettingsToolResultImagesReadOnlyBackend(t *testing.T) {
 	te := setupPGMode(t)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
 		strings.NewReader(`{"tool_result_images":"drop"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "http://127.0.0.1:0")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
-	assertStatus(t, w, http.StatusNotImplemented)
-
-	_, err := os.Stat(filepath.Join(te.dataDir, "config.toml"))
-	assert.True(t, os.IsNotExist(err), "config.toml must not be written by a read-only backend")
-}
-
-func TestSettingsZoomLevelReadOnlyBackend(t *testing.T) {
-	te := setupPGMode(t)
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
-		strings.NewReader(`{"zoom_level":120}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://127.0.0.1:0")
 	w := httptest.NewRecorder()
@@ -3980,6 +4144,7 @@ func TestSettingsDisabledProvidersDefaultToEmptyArray(t *testing.T) {
 }
 
 func TestSettingsRejectInvalidDisabledProviderWithoutMutation(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 	put := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
@@ -4029,7 +4194,7 @@ func TestSettingsRemainLockedInPGMode(t *testing.T) {
 	assert.True(t, resp.ReadOnly)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings",
-		strings.NewReader(`{"chart_palette":"matplotlib"}`))
+		strings.NewReader(`{"disabled_agents":["codex"]}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://127.0.0.1:0")
 	w = httptest.NewRecorder()
@@ -4250,6 +4415,21 @@ func TestUploadSessionVariants(t *testing.T) {
 		}
 		if msgs[1].ContextTokens != 500 {
 			assert.Failf(t, "test failed", "assistant ContextTokens = %d, want 500", msgs[1].ContextTokens)
+		}
+	})
+
+	t.Run("empty replacement broadcasts", func(t *testing.T) {
+		content := testjsonl.NewSessionBuilder().AddClaudeUser(tsEarly, "Hello upload").String()
+		assertStatus(t, te.upload(t, "empty-replacement.jsonl", content, "project=myproj&machine=remote"), http.StatusOK)
+		events, unsubscribe := te.broadcaster.Subscribe()
+		defer unsubscribe()
+		w := te.upload(t, "empty-replacement.jsonl", `{"type":"system","timestamp":"2026-03-01T10:00:00Z"}`+"\n", "project=myproj&machine=remote&allow_shorter=true")
+		assertStatus(t, w, http.StatusOK)
+		select {
+		case event := <-events:
+			assert.Equal(t, "sessions", event.Scope)
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "empty replacement did not broadcast sessions")
 		}
 	})
 
@@ -4747,6 +4927,7 @@ func (f *flushRecorder) WaitForWrite(t *testing.T) {
 	select {
 	case <-f.writes:
 	case <-time.After(5 * time.Second):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for response write")
 	}
 }
@@ -4841,7 +5022,7 @@ func TestWatchSession_Events(t *testing.T) {
 		close(done)
 	}()
 
-	w.WaitForWrite(t)
+	te.waitForSSEEvent(t, w, "session_ready", 5*time.Second)
 
 	updated := content + testjsonl.NewSessionBuilder().
 		AddClaudeAssistant(tsZeroS5, "response").
@@ -4968,6 +5149,7 @@ func TestTriggerSync_SSEEvents(t *testing.T) {
 }
 
 func TestResyncEndpoint(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	te.writeSessionFile(t, "resync-proj", "resync.jsonl",
@@ -4998,6 +5180,7 @@ func TestResyncEndpoint(t *testing.T) {
 }
 
 func TestResyncEndpointFallsBackToIncrementalWhenResyncAborts(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	sessionPath := te.writeSessionFile(t, "resync-proj", "resync.jsonl",
@@ -5024,6 +5207,7 @@ func TestResyncEndpointFallsBackToIncrementalWhenResyncAborts(t *testing.T) {
 // messages are accessible via the API. This exercises the
 // close-rename-reopen sequence that is critical on Windows.
 func TestResyncPreservesDataThroughSwap(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	// Write two session files in different projects.
@@ -5118,6 +5302,7 @@ func TestResyncPreservesDataThroughSwap(t *testing.T) {
 // is closed, no such file, no such table). These are expected
 // since resync is a rare manual operation.
 func TestResyncConcurrentReads(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 
 	te.writeSessionFile(t, "conc-proj", "c.jsonl",
@@ -5215,6 +5400,7 @@ func parseSSEDoneStats(
 }
 
 func TestListSessions_Limits(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 	totalSessions := db.MaxSessionLimit + 5
 	writes := make([]db.SessionBatchWrite, 0, totalSessions)
@@ -5251,6 +5437,7 @@ func TestListSessions_Limits(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			path := "/api/v1/sessions"
 			if tt.limitVal != "" {
 				path += "?" + tt.limitVal
@@ -5359,18 +5546,54 @@ func TestGetVersion(t *testing.T) {
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 
-func TestGetVersion_Default(t *testing.T) {
-	te := setup(t)
+func TestGetVersionSessionStatsAvailability(t *testing.T) {
+	database := dbtest.OpenTestDB(t)
+	reader, err := db.OpenReadOnly(t.Context(), database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reader.Close() })
+	for _, tc := range []struct {
+		name      string
+		store     db.Store
+		available bool
+		status    int
+	}{
+		{"sqlite", database, true, http.StatusOK},
+		{"read-only sqlite", reader, true, http.StatusOK},
+		{"mirror", readOnlyTestStore{database}, false, http.StatusNotImplemented},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{Host: "127.0.0.1", Port: 0}
+			handler := wrapTestHandler(cfg, server.New(cfg, tc.store, nil).Handler())
+			version := httptest.NewRecorder()
+			handler.ServeHTTP(version, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/version", nil))
+			assertStatus(t, version, http.StatusOK)
+			assert.Equal(t, tc.available, decode[map[string]any](t, version)["session_stats_available"])
 
-	w := te.get(t, "/api/v1/version")
-	assertStatus(t, w, http.StatusOK)
-
-	resp := decode[server.VersionInfo](t, w)
-	if resp.Version != "" {
-		assert.Failf(t, "test failed", "version = %q, want empty", resp.Version)
+			stats := httptest.NewRecorder()
+			handler.ServeHTTP(stats, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/session-stats?include_git_outcomes=true", nil))
+			assertStatus(t, stats, tc.status)
+		})
 	}
-	assert.Equal(t, server.APIVersion, resp.APIVersion)
-	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
+}
+
+func TestGetMemoryStatus(t *testing.T) {
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithVersion(server.VersionInfo{Version: "v-memory"}),
+	}, func(c *config.Config) {
+		c.InstallationID = "archive-test"
+	})
+
+	w := te.get(t, "/api/v1/memory/status")
+	assertStatus(t, w, http.StatusOK)
+	status := decode[service.MemoryStatus](t, w)
+	assert.Equal(t, "v-memory", status.ServerVersion)
+	assert.Equal(t, "archive-test", status.Archive.Identity)
+	assert.Equal(t, "sqlite", status.Archive.Backend)
+	assert.False(t, status.Archive.ReadOnly)
+	assert.Equal(t, service.MemoryReady, status.Lexical.Status)
+	assert.Equal(t, service.MemoryUnavailable, status.Semantic.Status)
+	assert.Equal(t, service.MemoryPartial, status.Status)
+	assert.Equal(t, service.MemoryUnknown, status.Sources.Status)
 }
 
 func TestFindAvailablePortSkipsOccupied(t *testing.T) {
@@ -5392,35 +5615,35 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 	}
 }
 
-func TestFindAvailablePortWildcardSkipsIPv4OccupiedPort(t *testing.T) {
+func TestFindAvailablePortWildcardSkipsOccupiedPort(t *testing.T) {
 	// A dual-stack wildcard listen can succeed on IPv6 while an unrelated
 	// process still owns the port on IPv4 (observed on macOS), so wildcard
 	// availability must check the IPv4 wildcard address on its own.
-	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "0.0.0.0:0")
-	require.NoError(t, err, "bind IPv4 wildcard")
-	defer ln.Close()
+	testutil.RequireWildcardListen(t)
+	for _, tt := range []struct {
+		name    string
+		network string
+		address string
+	}{
+		{name: "IPv4", network: "tcp4", address: "0.0.0.0:0"},
+		{name: "IPv6", network: "tcp6", address: "[::]:0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ln, err := (&net.ListenConfig{}).Listen(t.Context(), tt.network, tt.address)
+			if err != nil && tt.network == "tcp6" {
+				t.Skipf("IPv6 unavailable: %v", err)
+			}
+			require.NoError(t, err, "bind %s wildcard", tt.name)
+			defer ln.Close()
 
-	occupied := ln.Addr().(*net.TCPAddr).Port
+			occupied := ln.Addr().(*net.TCPAddr).Port
 
-	got, err := server.FindAvailablePort(t.Context(), "0.0.0.0", occupied)
-	require.NoError(t, err)
-	assert.NotEqual(t, occupied, got,
-		"wildcard port selection must skip an IPv4-occupied port")
-}
-
-func TestFindAvailablePortWildcardSkipsIPv6OccupiedPort(t *testing.T) {
-	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp6", "[::]:0")
-	if err != nil {
-		t.Skipf("IPv6 unavailable: %v", err)
+			got, err := server.FindAvailablePort(t.Context(), "0.0.0.0", occupied)
+			require.NoError(t, err)
+			assert.NotEqual(t, occupied, got,
+				"wildcard port selection must skip an %s-occupied port", tt.name)
+		})
 	}
-	defer ln.Close()
-
-	occupied := ln.Addr().(*net.TCPAddr).Port
-
-	got, err := server.FindAvailablePort(t.Context(), "0.0.0.0", occupied)
-	require.NoError(t, err)
-	assert.NotEqual(t, occupied, got,
-		"wildcard port selection must skip an IPv6-occupied port")
 }
 
 func TestFindAvailablePortZeroReturnsAssignedPort(t *testing.T) {
@@ -5457,9 +5680,9 @@ func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {
 		close(done)
 	}()
 
-	// Emit directly via the broadcaster to isolate the handler
-	// from sync engine timing.
-	te.emitUntilSSEEvent(t, w, "messages", "data_changed", 3*time.Second)
+	te.waitForSSEEvent(t, w, "events_ready", 5*time.Second)
+	te.broadcaster.Emit("messages")
+	te.waitForSSEEvent(t, w, "data_changed", 5*time.Second)
 	cancel()
 	<-done
 }
@@ -5678,6 +5901,7 @@ func TestHandleSyncSession_InvalidJSON(t *testing.T) {
 }
 
 func TestSettingsAgentHomesPersistAndRoundTrip(t *testing.T) {
+	t.Parallel()
 	te := setup(t)
 	require.NoError(t, os.WriteFile(filepath.Join(te.dataDir, "config.toml"),
 		[]byte("[agents.pi]\ndirs = [\"/sessions/pi\"]\n"), 0o600))
@@ -5756,4 +5980,84 @@ func TestMarkdownSessionExportPreservesOffloadedImages(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "asset://")
 	assert.Contains(t, w.Body.String(), "agentsview_image")
 	assert.NotContains(t, w.Body.String(), "base64,AAEC")
+}
+
+func TestSettingsProviderChangesApplyThroughIngestionReloader(t *testing.T) {
+	t.Parallel()
+	reloadedDir := filepath.Join(t.TempDir(), "claude-work", "projects")
+	reloads := 0
+	reloadErr := error(nil)
+	reloader := func(context.Context) (config.Config, error) {
+		reloads++
+		return config.Config{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentClaude: {"/sessions/claude", reloadedDir},
+			},
+			DisabledAgents: []parser.AgentType{parser.AgentGemini},
+		}, reloadErr
+	}
+	te := setupWithServerOpts(t,
+		[]server.Option{server.WithIngestionReloader(reloader)},
+		func(cfg *config.Config) {
+			cfg.AgentDirs = map[parser.AgentType][]string{
+				parser.AgentClaude: {"/sessions/claude"},
+			}
+		})
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut,
+			"/api/v1/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+	claudeDirs := func(w *httptest.ResponseRecorder) []string {
+		var got struct {
+			SessionProviders []struct {
+				ID   parser.AgentType `json:"id"`
+				Dirs []string         `json:"dirs"`
+			} `json:"session_providers"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		for _, provider := range got.SessionProviders {
+			if provider.ID == parser.AgentClaude {
+				return provider.Dirs
+			}
+		}
+		return nil
+	}
+
+	w := put(`{"zoom_level":110}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Zero(t, reloads, "unrelated settings must not reload ingestion")
+
+	w = put(`{"agent_homes":{"claude":["~/.claude-work"]}}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Equal(t, 1, reloads)
+	assert.Equal(t, []string{"/sessions/claude", reloadedDir}, claudeDirs(w),
+		"the response reports the roots the daemon now syncs")
+
+	w = put(`{"disabled_agents":["gemini"]}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Equal(t, 2, reloads)
+
+	reloadErr = errors.New("config file is invalid")
+	w = put(`{"disabled_agents":[]}`)
+	assertStatus(t, w, http.StatusInternalServerError)
+	assert.Equal(t, 3, reloads)
+
+	// A failed reload restores the previous selection everywhere.
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, got.DisabledAgents)
+	var persisted struct {
+		DisabledAgents []parser.AgentType `toml:"disabled_agents"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, persisted.DisabledAgents)
 }

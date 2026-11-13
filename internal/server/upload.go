@@ -9,8 +9,10 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/timeutil"
+	"go.kenn.io/kit/atomicfile"
 )
 
 type stagedUpload struct {
@@ -94,7 +96,7 @@ func commitUpload(upload stagedUpload) (committedUpload, error) {
 		}
 		state.backupPath = backupPath
 		state.hadPrevious = true
-		if err := os.Rename(upload.finalPath, backupPath); err != nil {
+		if err := atomicfile.Replace(upload.finalPath, backupPath); err != nil {
 			return state, fmt.Errorf(
 				"backing up existing upload: %w", err,
 			)
@@ -106,9 +108,9 @@ func commitUpload(upload stagedUpload) (committedUpload, error) {
 		)
 	}
 
-	if err := os.Rename(upload.tempPath, upload.finalPath); err != nil {
+	if err := atomicfile.Replace(upload.tempPath, upload.finalPath); err != nil {
 		if state.hadPrevious {
-			if rbErr := os.Rename(state.backupPath, upload.finalPath); rbErr != nil {
+			if rbErr := atomicfile.Replace(state.backupPath, upload.finalPath); rbErr != nil {
 				return state, fmt.Errorf(
 					"committing upload: %w (restore previous upload failed: %w)",
 					err, rbErr,
@@ -151,7 +153,7 @@ func rollbackCommittedUpload(upload committedUpload) error {
 		return fmt.Errorf("removing committed upload: %w", err)
 	}
 	if upload.hadPrevious {
-		if err := os.Rename(upload.backupPath, upload.finalPath); err != nil {
+		if err := atomicfile.Replace(upload.backupPath, upload.finalPath); err != nil {
 			return fmt.Errorf("restoring previous upload: %w", err)
 		}
 	}
@@ -234,10 +236,14 @@ func sessionBatchWriteFromParsed(
 	// the upload path does not run the sync engine's derived-data
 	// pipeline, so zero-valued signal columns and no findings rows are
 	// the expected state for freshly uploaded sessions.
+	// An upload is a full parse of the transcript, so its session total
+	// replaces the stored one, removing it when the upload has none.
 	return db.SessionBatchWrite{
-		Session:         dbSess,
-		Messages:        dbMsgs,
-		ReplaceMessages: true,
+		Session:             dbSess,
+		Messages:            dbMsgs,
+		ReplaceMessages:     true,
+		SessionTotal:        ingest.ConvertSessionTotal(sess.SessionTotal),
+		ReplaceSessionTotal: true,
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/artifact"
-	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/rawsync"
@@ -36,7 +35,7 @@ func preparePGRawSyncServicesIfWritable(
 }
 
 func preparePGRawSyncServices(
-	_ context.Context,
+	ctx context.Context,
 	dataDir string,
 	database *sql.DB,
 ) (server.Option, func() error, error) {
@@ -56,17 +55,18 @@ func preparePGRawSyncServices(
 		dataDir:  dataDir,
 		metadata: metadata,
 		limits:   rawsync.DefaultManifestLimits(),
-		version:  fmt.Sprintf("parser-data-%d", db.CurrentDataVersion()),
+		version:  rawProcessingVersion(),
 	}
 	uploadOption, closeUploads, err := preparePGRawSyncUploads(
-		dataDir, database, custody,
+		ctx, dataDir, database, custody,
 	)
 	if err != nil {
 		return nil, nil, errors.Join(err, custody.Close())
 	}
 	return combinePGRawSyncOptions(
 			server.WithRawSyncServices(auth, custody),
-			server.WithRawSyncStatus(metadata), uploadOption,
+			server.WithRawSyncStatus(metadata),
+			server.WithRawSyncJobHealth(metadata), uploadOption,
 		), func() error {
 			return errors.Join(closeUploads(), custody.Close())
 		}, nil
@@ -79,6 +79,8 @@ type pgRawSyncCustody struct {
 	mu sync.Mutex
 
 	dataDir  string
+	tenant   string
+	objects  rawsync.ObjectStore
 	metadata rawsync.MetadataStore
 	limits   rawsync.ManifestLimits
 	version  string
@@ -94,6 +96,9 @@ func (c *pgRawSyncCustody) MissingObjects(
 	provider parser.AgentType,
 	objects []rawsync.ObjectRef,
 ) ([]rawsync.ObjectRef, error) {
+	if c.tenant != "" && identity.TenantID != c.tenant {
+		return nil, rawsync.ErrUnauthorized
+	}
 	service, err := c.openService(ctx)
 	if err != nil {
 		return nil, err
@@ -108,6 +113,9 @@ func (c *pgRawSyncCustody) FinalizeObject(
 	object rawsync.ObjectRef,
 	body io.Reader,
 ) (rawsync.PutResult, error) {
+	if c.tenant != "" && identity.TenantID != c.tenant {
+		return rawsync.PutResult{}, rawsync.ErrUnauthorized
+	}
 	service, err := c.openService(ctx)
 	if err != nil {
 		return rawsync.PutResult{}, err
@@ -120,6 +128,9 @@ func (c *pgRawSyncCustody) CommitManifest(
 	identity rawsync.AuthIdentity,
 	manifest rawsync.Manifest,
 ) (rawsync.CommitResult, error) {
+	if c.tenant != "" && identity.TenantID != c.tenant {
+		return rawsync.CommitResult{}, rawsync.ErrUnauthorized
+	}
 	service, err := c.openService(ctx)
 	if err != nil {
 		return rawsync.CommitResult{}, err
@@ -154,6 +165,7 @@ func (c *pgRawSyncCustody) openService(ctx context.Context) (*rawsync.Service, e
 	if err != nil {
 		return fail(fmt.Errorf("preparing raw sync custody service: %w", err))
 	}
+	c.objects = objects
 	c.repository = repository
 	c.service = service
 	return service, nil
@@ -171,11 +183,12 @@ func (c *pgRawSyncCustody) Close() error {
 }
 
 func preparePGRawSyncUploads(
+	ctx context.Context,
 	dataDir string,
 	database *sql.DB,
 	custody rawsync.UploadCustody,
 ) (server.Option, func() error, error) {
-	uploadStore, err := postgres.NewRawUploadStore(database, dataDir)
+	uploadStore, err := postgres.NewRawUploadStore(ctx, database, dataDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("preparing raw upload session store: %w", err)
 	}
@@ -197,4 +210,25 @@ func combinePGRawSyncOptions(options ...server.Option) server.Option {
 			option(target)
 		}
 	}
+}
+
+// The worker shares custody's single lazily opened exclusive repository.
+func (c *pgRawSyncCustody) OpenManifest(ctx context.Context, identity rawsync.AuthIdentity, id string) (rawsync.ObjectInfo, rawsync.VerifiedObjectReader, error) {
+	if c.tenant != "" && identity.TenantID != c.tenant {
+		return rawsync.ObjectInfo{}, nil, rawsync.ErrUnauthorized
+	}
+	if _, err := c.openService(ctx); err != nil {
+		return rawsync.ObjectInfo{}, nil, err
+	}
+	return c.objects.OpenManifest(ctx, identity, id)
+}
+
+func (c *pgRawSyncCustody) CopyObject(ctx context.Context, tenant string, ref rawsync.ObjectRef, w io.Writer) (rawsync.ObjectInfo, error) {
+	if c.tenant != "" && tenant != c.tenant {
+		return rawsync.ObjectInfo{}, rawsync.ErrUnauthorized
+	}
+	if _, err := c.openService(ctx); err != nil {
+		return rawsync.ObjectInfo{}, err
+	}
+	return c.objects.CopyObject(ctx, tenant, ref, w)
 }

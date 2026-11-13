@@ -1,7 +1,8 @@
 <!-- ABOUTME: Session Vital Signs panel — replaces ActivityMinimap on the right column. -->
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { onDestroy } from "svelte";
-  import { CopyButton, Tooltip } from "@kenn-io/kit-ui";
+  import { Chip, CopyButton, Tooltip } from "@kenn-io/kit-ui";
   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { liveTick } from "../../stores/liveTick.svelte.js";
   import { getApiV1SessionsByIdTiming as fetchSessionTiming } from "../../api/generated/sessions/sessions.js";
@@ -9,11 +10,11 @@
   import { formatDuration } from "../../utils/duration.js";
   import { categoryToken } from "../../utils/categoryToken.js";
   import { activityToken, type ActivityKind } from "../../utils/activityToken.js";
-  import { turnHasCategory } from "../../utils/timing.js";
+  import { callsHaveTiming, turnHasCategory } from "../../utils/timing.js";
   import { displayToolName } from "../../utils/toolDisplay.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { m } from "../../i18n/index.js";
-  import { formatNumber } from "../../utils/format.js";
+  import { formatNumber, formatCount } from "../../utils/format.js";
   import type {
     DbCallTiming as CallTiming,
     DbSessionTiming as SessionTiming,
@@ -25,16 +26,22 @@
   import CallRow from "./CallRow.svelte";
   import CallGroup from "./CallGroup.svelte";
   import SubagentCalls from "./SubagentCalls.svelte";
-  import { ChevronRightIcon, XIcon } from "../../icons.js";
+  import { ChevronRightIcon, GitPullRequestIcon, XIcon } from "../../icons.js";
+  import { displayPRLinks } from "../../utils/prLinks.js";
   import { LatestRead } from "../../utils/latest-read.js";
   import type { Session } from "../../api/types/core.js";
 
   interface Props {
     sessionId: string;
     session: Session | undefined;
+    /** Called when a label chip is clicked; chips are static without it. */
+    onFilterLabel?: (label: string) => void;
   }
 
-  let { sessionId, session }: Props = $props();
+  let { sessionId, session, onFilterLabel }: Props = $props();
+
+  let prLinks = $derived(displayPRLinks(session?.pr_links));
+  let labels = $derived(session?.labels ?? []);
 
   $effect(() => {
     void sessionTiming.load(sessionId);
@@ -46,6 +53,8 @@
       .filter((call) => call.duration_ms != null)
       .map((call) => call.category),
   ));
+  let measuredRows = $derived(timing?.by_category.filter((cat) => measuredCategories.has(cat.category)) ?? []);
+  let showCallTiming = $derived(!!timing && callsHaveTiming(timing));
   let toolTimeMeasured = $derived(timing?.tool_call_count === 0 || measuredCategories.size > 0);
   let activityKinds: { kind: ActivityKind; label: string }[] = $derived([
     { kind: "tool", label: m.session_vitals_activity_tool() },
@@ -53,6 +62,14 @@
   ]);
 
   let categoryFilter = $state<string | null>(null);
+
+  // The panel stays mounted across sessions. A filter belongs to the session
+  // it was set on; carried over, it could dim a session whose Time spent
+  // section (and its clear control) is hidden.
+  $effect.pre(() => {
+    void sessionId;
+    categoryFilter = null;
+  });
 
   function toggleCategory(cat: string) {
     categoryFilter = categoryFilter === cat ? null : cat;
@@ -377,17 +394,72 @@
               />
             {/if}
           </div>
+          {#if prLinks.length > 0}
+            <div class="context-row">
+              <div class="context-text">
+                <div class="context-label">
+                  {m.session_vitals_pull_requests()}
+                </div>
+                <ul class="context-list">
+                  {#each prLinks as link (link.href)}
+                    <li>
+                      <a
+                        class="context-value context-link"
+                        href={link.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={m.session_vitals_open_pull_request({ pr: link.label })}
+                      >
+                        <GitPullRequestIcon size="11" strokeWidth="2" aria-hidden="true" />
+                        <bdi dir="ltr">{link.label}</bdi>
+                      </a>
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+            </div>
+          {/if}
+          {#if labels.length > 0}
+            <div class="context-row">
+              <div class="context-text">
+                <div class="context-label">
+                  {m.session_vitals_labels()}
+                </div>
+                <div class="context-chips">
+                  {#each labels as label (label)}
+                    {#if onFilterLabel}
+                      <Chip
+                        size="xs"
+                        tone="neutral"
+                        uppercase={false}
+                        interactive
+                        title={m.session_vitals_filter_by_label({ label })}
+                        onclick={() => onFilterLabel(label)}
+                      >{label}</Chip>
+                    {:else}
+                      <Chip
+                        size="xs"
+                        tone="neutral"
+                        uppercase={false}
+                        title={label}
+                      >{label}</Chip>
+                    {/if}
+                  {/each}
+                </div>
+              </div>
+            </div>
+          {/if}
         </div>
       {/if}
       {#if timing}
         <div class="stat-grid">
           <div>
             <div class="lbl">{m.session_vitals_tool_calls()}</div>
-            <div class="val">{timing.tool_call_count}</div>
+            <div class="val">{formatCount(timing.tool_call_count)}</div>
           </div>
           <div>
             <div class="lbl">{m.session_vitals_tool_time()}</div>
-            <div class="val">
+            <div class="val" class:unmeasured={!toolTimeMeasured}>
               {toolTimeMeasured ? formatDuration(timing.tool_duration_ms) : m.session_vitals_not_measured()}
             </div>
           </div>
@@ -404,16 +476,16 @@
                 {displayToolName(slowest)} · {formatDuration(slowest.duration_ms ?? 0)}
               </button>
             {:else}
-              <div class="val slow">—</div>
+              <div class="val empty">—</div>
             {/if}
           </div>
           <div>
             <div class="lbl">{m.session_vitals_turns()}</div>
-            <div class="val">{timing.turn_count}</div>
+            <div class="val">{formatCount(timing.turn_count)}</div>
           </div>
           <div>
             <div class="lbl">{m.session_vitals_subagents()}</div>
-            <div class="val">{timing.subagent_count}</div>
+            <div class="val">{formatCount(timing.subagent_count)}</div>
           </div>
         </div>
       {/if}
@@ -461,7 +533,7 @@
       {/each}
     </section>
 
-    {#if timing.by_category.length > 0}
+    {#if measuredRows.length > 0}
       <section class="v-section">
         <header class="v-h">
           <span>{m.session_vitals_time_spent()}</span>
@@ -476,11 +548,12 @@
                 <XIcon size="10" strokeWidth="2.4" aria-hidden="true" />
               </span>
             </button>
-          {:else}
-            <span class="v-meta">{m.session_vitals_completed_turns_hint()}</span>
           {/if}
         </header>
-        {#each timing.by_category as cat (cat.category)}
+        {#if !categoryFilter}
+          <p class="v-hint">{m.session_vitals_completed_turns_hint()}</p>
+        {/if}
+        {#each measuredRows as cat (cat.category)}
           {@const isActive = categoryFilter === cat.category}
           {@const isDimmed = categoryFilter !== null && !isActive}
           <button
@@ -498,7 +571,7 @@
                 style="width: {(cat.duration_ms / Math.max(timing.tool_duration_ms, 1)) * 100}%; background: {categoryToken(cat.category)};"
               ></span>
             </span>
-            <span class="agg-val">{measuredCategories.has(cat.category) ? formatDuration(cat.duration_ms) : m.session_vitals_not_measured()}</span>
+            <span class="agg-val">{formatDuration(cat.duration_ms)}</span>
           </button>
         {/each}
       </section>
@@ -508,8 +581,8 @@
       <section class="v-section">
         <header class="v-h">
           <span>{m.session_vitals_timeline()}</span>
-          <span class="v-meta">{m.session_vitals_click_marks_to_scroll()}</span>
         </header>
+        <p class="v-hint">{m.session_vitals_click_marks_to_scroll()}</p>
 
         <div class="lane-row">
           <span class="lane-label">{m.session_vitals_turns()}</span>
@@ -611,28 +684,30 @@
             <span class="v-meta">
               {m.session_vitals_calls_summary({
                 count: timing.tool_call_count,
-                countLabel: formatNumber(timing.tool_call_count),
+                countLabel: formatCount(timing.tool_call_count),
                 runningCount: timing.running ? 1 : 0,
               })}
             </span>
           </button>
         </header>
         {#if ui.vitalsCallsExpanded}
-          <div class="scale-axis">
-            <span>0</span>
-            <span>{formatDuration(timing.total_duration_ms / 4)}</span>
-            <span>{formatDuration(timing.total_duration_ms / 2)}</span>
-            <span
-              >{formatDuration(
-                (3 * timing.total_duration_ms) / 4,
-              )}</span
-            >
-            <span class:now={timing.running}
-              >{timing.running
-                ? m.session_vitals_now()
-                : formatDuration(timing.total_duration_ms)}</span
-            >
-          </div>
+          {#if showCallTiming}
+            <div class="scale-axis">
+              <span>0</span>
+              <span>{formatDuration(timing.total_duration_ms / 4)}</span>
+              <span>{formatDuration(timing.total_duration_ms / 2)}</span>
+              <span
+                >{formatDuration(
+                  (3 * timing.total_duration_ms) / 4,
+                )}</span
+              >
+              <span class:now={timing.running}
+                >{timing.running
+                  ? m.session_vitals_now()
+                  : formatDuration(timing.total_duration_ms)}</span
+              >
+            </div>
+          {/if}
           <div class="calls">
             {#each timing.turns as turn (turn.message_id)}
               {@const isLive =
@@ -648,6 +723,7 @@
                   isSlow={isSlowCall(call)}
                   {isLive}
                   liveDurationMs={liveElapsed}
+                  showTiming={showCallTiming}
                   dimmed={categoryFilter !== null &&
                     call.category !== categoryFilter}
                   isSubagentExpanded={!!call.subagent_session_id &&
@@ -675,6 +751,7 @@
                   barScalePct={(c) => callBarPct(c, timing)}
                   {isLive}
                   liveDurationMs={liveElapsed}
+                  showTiming={showCallTiming}
                   isSlow={isSlowCall}
                   dimmed={categoryFilter !== null && !turnHasCategory(turn, categoryFilter)}
                   onCallClick={() => ui.scrollToOrdinal(turn.ordinal)}
@@ -702,7 +779,7 @@
       </section>
     {/if}
   {:else if sessionTiming.error}
-    <p class="v-error">{sessionTiming.error}</p>
+    <p class="v-error" {@attach errorTelemetry("session")}>{sessionTiming.error}</p>
   {/if}
 </div>
 
@@ -765,22 +842,41 @@
 
   .v-h {
     color: var(--text-muted);
-    font-size: 9px;
+    font-size: 10.5px;
     text-transform: uppercase;
-    letter-spacing: 0.6px;
+    letter-spacing: 0.05em;
     margin-bottom: 9px;
-    font-weight: 500;
+    font-weight: 600;
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .v-h > span:first-child {
+    white-space: nowrap;
   }
 
   .v-meta {
     color: var(--text-muted);
-    font-size: 9px;
-    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 400;
+    font-family: var(--font-sans);
+    font-variant-numeric: tabular-nums;
     text-transform: none;
     letter-spacing: 0;
+    text-align: right;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* A section hint gets its own line under the heading and wraps, so the
+     whole instruction stays readable in the narrow panel. */
+  .v-hint {
+    margin: -4px 0 8px;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.4;
   }
   .v-meta.live {
     color: var(--running-fg);
@@ -793,7 +889,6 @@
     margin-bottom: 12px;
     padding-bottom: 11px;
     border-bottom: 1px solid var(--border-muted);
-    font-family: var(--font-mono);
   }
 
   .context-row {
@@ -813,18 +908,20 @@
     opacity: 1;
   }
 
+  /* Labels and values read as sans text: the repository, worktree, and
+     pull requests share one face with the counts below them, so the value
+     column does not switch between mono and sans. */
   .context-label {
     color: var(--text-muted);
-    font-size: 9px;
-    margin-bottom: 2px;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
+    font-size: 11px;
+    margin-bottom: 1px;
   }
 
   .context-value {
     overflow: hidden;
     color: var(--text-primary);
-    font-size: 10px;
+    font-family: var(--font-sans);
+    font-size: 12px;
     line-height: 1.35;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -837,6 +934,47 @@
 
   .context-tooltip {
     min-width: 0;
+  }
+
+  .context-list {
+    display: grid;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .context-link {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--accent-blue);
+    text-decoration: none;
+  }
+
+  .context-link :global(svg) {
+    flex-shrink: 0;
+  }
+
+  .context-link bdi {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .context-link:hover,
+  .context-link:focus-visible {
+    text-decoration: underline;
+  }
+
+  .context-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .context-chips :global(.kit-chip) {
+    max-width: 100%;
   }
 
   .context-tooltip :global(.kit-tooltip-trigger) {
@@ -854,18 +992,34 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: var(--space-4);
-    font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 12px;
   }
   .stat-grid .lbl {
     color: var(--text-muted);
-    font-size: 9px;
-    margin-bottom: 2px;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
+    font-size: 11px;
+    margin-bottom: 1px;
   }
-  .stat-grid .val { color: var(--text-primary); }
+  /* The label strings are lowercase; show them in sentence case. */
+  .stat-grid .lbl::first-letter,
+  .context-label::first-letter {
+    text-transform: uppercase;
+  }
+  /* Values share one face: the UI sans with tabular figures. Monospace
+     stays for identifiers and paths (repository, worktree, tool names). */
+  .stat-grid .val {
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-variant-numeric: tabular-nums;
+  }
   .stat-grid .val.slow { color: var(--slow-fg); }
+  .stat-grid .val.empty { color: var(--text-muted); }
+  /* "Not measured" is an absence, not a reading: muted sans text, so it
+     does not pass for a value. */
+  .stat-grid .val.unmeasured {
+    color: var(--text-muted);
+    font-family: var(--font-sans);
+    font-weight: 400;
+  }
   .stat-grid .val-link {
     background: transparent;
     border: 0;
@@ -892,10 +1046,10 @@
   /* Time spent — aggregate rows */
   .agg-row {
     display: grid;
-    grid-template-columns: 48px 1fr 56px;
+    grid-template-columns: 52px 1fr auto;
     align-items: center;
     gap: 8px;
-    font-size: 10px;
+    font-size: 11px;
     margin-bottom: 5px;
     cursor: pointer;
     padding: 2px 4px;
@@ -922,7 +1076,10 @@
   .agg-name {
     font-family: var(--font-mono);
     color: var(--text-primary);
-    font-size: 9px;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .agg-bar {
     height: 7px;
@@ -937,16 +1094,20 @@
     border-radius: 1px;
   }
   .agg-val {
-    font-family: var(--font-mono);
-    font-size: 10px;
+    min-width: 56px;
+    font-family: var(--font-sans);
+    font-size: 11px;
     color: var(--text-muted);
     text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
   }
 
   .activity-hint {
     color: var(--text-muted);
-    font-size: 10px;
-    margin: 0 0 8px;
+    font-size: 11px;
+    line-height: 1.4;
+    margin: -4px 0 8px;
   }
   .activity-totals {
     display: flex;

@@ -212,20 +212,38 @@ func (s *CodexCollectingSink) SetCallSubagentSessionID(
 // ApplyTokenUsageToLastAssistant applies normalized token usage to the
 // last assistant message without usage, scanning back to the current
 // turn's user boundary. Returns false when no target exists.
+//
+// System rows such as compaction boundaries are skipped. A reasoning row is
+// a target only while it is the newest assistant row: Codex writes reasoning
+// before the message or call of the same response, which then takes the
+// usage, so an older reasoning row never absorbs a later call's usage. A
+// response that produced only reasoning keeps its usage on that row.
+// IncrementalInfo.PendingUsageOrdinal applies the same rule to the
+// committed prefix.
 func (s *CodexCollectingSink) ApplyTokenUsageToLastAssistant(
 	raw string,
 ) bool {
+	newerResponse := false
 	for i := len(s.messages) - 1; i >= 0; i-- {
-		if s.messages[i].Role == RoleUser {
+		msg := &s.messages[i]
+		if msg.Role == RoleUser {
 			break
 		}
-		if s.messages[i].Role == RoleAssistant &&
-			s.messages[i].TokenUsage == nil {
-			applyCodexTokenUsage(&s.messages[i], raw)
+		if msg.Role != RoleAssistant || msg.IsSystem {
+			continue
+		}
+		if msg.TokenUsage == nil && (!newerResponse || !codexReasoningOnly(msg)) {
+			applyCodexTokenUsage(msg, raw)
 			return true
 		}
+		newerResponse = true
 	}
 	return false
+}
+
+// codexReasoningOnly reports a thinking row written for a reasoning item.
+func codexReasoningOnly(msg *ParsedMessage) bool {
+	return msg.HasThinking && !msg.HasToolUse
 }
 
 func (s *CodexCollectingSink) InsertOrphanMessage(
@@ -275,15 +293,16 @@ func hasEquivalentCallResultEvent(
 
 // applyCodexTokenUsage normalizes Codex token usage fields into the
 // Anthropic-style shape expected by the usage and cost queries. Codex
-// reports input_tokens as the full input count (cached portion included),
+// reports input_tokens as the full input count, with both cached reads and
+// cache writes included (codex-rs/protocol/src/protocol.rs TokenUsage),
 // while the downstream cost formula treats input_tokens as the uncached
-// remainder and bills cache_read_input_tokens separately. Subtracting
-// cached here prevents double-counting the cached portion at the full
-// input rate.
+// remainder and bills cache reads and writes separately. Subtracting both
+// here prevents billing them at the full input rate.
 //
-//	input_tokens - cached_input_tokens -> input_tokens  (uncached)
-//	output_tokens                      -> output_tokens
-//	cached_input_tokens                -> cache_read_input_tokens
+//	input_tokens - cached_input_tokens - cache_write_input_tokens -> input_tokens
+//	output_tokens            -> output_tokens
+//	cached_input_tokens      -> cache_read_input_tokens
+//	cache_write_input_tokens -> cache_creation_input_tokens (omitted when 0)
 func applyCodexTokenUsage(msg *ParsedMessage, raw string) {
 	usage := gjson.Parse(raw)
 	totalInput := int(usage.Get("input_tokens").Int())
@@ -291,11 +310,17 @@ func applyCodexTokenUsage(msg *ParsedMessage, raw string) {
 	output := int(usage.Get("output_tokens").Int())
 
 	uncached := max(totalInput-cached, 0)
+	cacheWrite := min(max(int(usage.Get("cache_write_input_tokens").Int()), 0), uncached)
+	uncached -= cacheWrite
 
 	normalized := map[string]int{
 		"input_tokens":            uncached,
 		"output_tokens":           output,
 		"cache_read_input_tokens": cached,
+	}
+	// Writes sit inside Codex's input count; zero keeps older rows byte-identical.
+	if cacheWrite > 0 {
+		normalized["cache_creation_input_tokens"] = cacheWrite
 	}
 	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
@@ -304,6 +329,6 @@ func applyCodexTokenUsage(msg *ParsedMessage, raw string) {
 	msg.TokenUsage = j
 	msg.OutputTokens = output
 	msg.HasOutputTokens = output > 0
-	msg.ContextTokens = uncached + cached
+	msg.ContextTokens = uncached + cacheWrite + cached
 	msg.HasContextTokens = totalInput > 0 || cached > 0
 }

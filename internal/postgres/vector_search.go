@@ -9,15 +9,10 @@ import (
 	"sync"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
 	"go.kenn.io/agentsview/internal/vector"
+	kitvec "go.kenn.io/kit/vector"
 )
-
-// QueryEncodeFunc embeds a single query string into the generation's vector
-// space. It is the read-side counterpart of the build-time encoder, supplied
-// by pg serve when it wires the searcher; a returned error means the
-// embeddings endpoint failed for this request (transient), not that semantic
-// search is unconfigured.
-type QueryEncodeFunc func(ctx context.Context, text string) ([]float32, error)
 
 // vectorSearcher is the PG-backed db.VectorSearcher: chunk-level KNN over one
 // generation's pgvector chunk table, doc-level rollup, and hydration against
@@ -28,7 +23,7 @@ type vectorSearcher struct {
 	genID         int64
 	dimension     int
 	maxInputChars int
-	encode        QueryEncodeFunc
+	encode        storage.VectorQueryEncoder
 	chunkTable    string
 
 	// schemaMu guards the lazily resolved, quoted pgvector extension schema.
@@ -45,7 +40,7 @@ type vectorSearcher struct {
 // phase created; maxInputChars is the build-time chunk size, threaded into
 // vector.DocAnchor so anchor/snippet re-splitting matches how chunks were cut.
 func NewVectorSearcher(
-	pg *sql.DB, genID int64, dimension, maxInputChars int, encode QueryEncodeFunc,
+	pg *sql.DB, genID int64, dimension, maxInputChars int, encode storage.VectorQueryEncoder,
 ) db.VectorSearcher {
 	return &vectorSearcher{
 		pg:            pg,
@@ -74,51 +69,68 @@ func (v *vectorSearcher) resolveExtSchema(ctx context.Context) (string, error) {
 	return v.extSchema, nil
 }
 
-// SemanticSearch embeds query, runs chunk-level KNN over the generation's
-// chunk table, rolls chunks up to one hit per document (best chunk wins,
-// score order preserved), truncates to limit documents, and hydrates each
-// against vector_documents. It mirrors vector.Index.Search + searcherAdapter:
-// an encoder failure is wrapped in db.ErrSemanticTransient; a document that
-// vanished (or was parked at a negative-ordinal tombstone) between KNN and
-// hydration is dropped rather than erroring.
-func (v *vectorSearcher) SemanticSearch(
-	ctx context.Context, query string, limit int,
-) ([]db.VectorHit, error) {
+// PrepareSemanticSearch implements db.VectorSearcher. It embeds query once.
+// Each page call runs chunk-level KNN over the generation's chunk table,
+// rolls chunks up to one hit per document (best chunk wins, score order
+// preserved), truncates to limit documents, and hydrates each against
+// vector_documents. It mirrors the SQLite searcherAdapter: an encoder failure
+// is wrapped in db.ErrSemanticTransient; a document that vanished (or was
+// parked at a negative-ordinal tombstone) between KNN and hydration is
+// dropped rather than erroring.
+func (v *vectorSearcher) PrepareSemanticSearch(
+	ctx context.Context, query string,
+) (db.VectorSearchPage, int, error) {
 	vec, err := v.encode(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", db.ErrSemanticTransient, err)
+		return nil, 0, fmt.Errorf("%w: %w", db.ErrSemanticTransient, err)
 	}
 	if len(vec) != v.dimension {
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"query embedding has %d dimensions, generation expects %d",
 			len(vec), v.dimension)
 	}
 	extSchema, err := v.resolveExtSchema(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	chunks, err := v.knnChunks(ctx, vec, extSchema, limit)
-	if err != nil {
-		return nil, err
-	}
-	docs := rollupChunkHits(chunks, limit)
-	if len(docs) == 0 {
-		return nil, nil
-	}
-	return v.hydrateHits(ctx, docs)
+	return func(ctx context.Context, limit int) ([]db.VectorHit, bool, error) {
+		chunks, rowCap, err := v.knnChunks(ctx, vec, extSchema, limit)
+		if err != nil {
+			return nil, false, err
+		}
+		exhausted := knnExhausted(len(chunks), limit, rowCap)
+		docs, err := kitvec.RollupByDocument(chunks)
+		if err != nil {
+			return nil, false, fmt.Errorf("rolling up vector hits: %w", err)
+		}
+		if limit >= 0 && len(docs) > limit {
+			docs = docs[:limit]
+		}
+		if len(docs) == 0 {
+			return nil, exhausted, nil
+		}
+		hits, err := v.hydrateHits(ctx, docs)
+		return hits, exhausted, err
+	}, 0, nil
+}
+
+// knnExhausted reports whether a KNN that asked for limit rows and returned
+// rows read every chunk. Only an HNSW index scan stops at rowCap below limit;
+// a sequential scan has no cap. A short result therefore proves exhaustion
+// unless it is exactly the cap, which a capped index scan also returns when
+// more rows remain.
+func knnExhausted(rows, limit, rowCap int) bool {
+	return rows < limit && (rowCap >= limit || rows != rowCap)
 }
 
 // chunkHit is one chunk-level KNN neighbor: the document it belongs to, which
 // chunk matched, and its cosine similarity (1 - cosine distance, higher is
 // better).
-type chunkHit struct {
-	docKey     string
-	chunkIndex int
-	score      float32
-}
+type chunkHit = kitvec.Hit[string]
 
 // knnChunks runs the chunk-level KNN, returning up to exactly limit neighbors
-// ordered best (nearest) first. Fetching exactly `limit` chunks matches the
+// ordered best (nearest) first, and the most rows the scan could return (see
+// tuneHNSWRecall). Fetching exactly `limit` chunks matches the
 // local sqlite-vec searcher's candidate pool (kit's queryGenerationSQL also
 // runs its KNN with LIMIT k before rollup), per the backend-parity rule: after
 // rollup the doc pool can be smaller than `limit` when a high-ranking run doc
@@ -138,11 +150,11 @@ type chunkHit struct {
 // ceiling, and past that ceiling iterative scan keeps filling.
 func (v *vectorSearcher) knnChunks(
 	ctx context.Context, vec []float32, extSchema string, limit int,
-) ([]chunkHit, error) {
+) ([]chunkHit, int, error) {
 	k := max(limit, 0)
 	literal, err := halfvecLiteral(vec)
 	if err != nil {
-		return nil, fmt.Errorf("query embedding: %w", err)
+		return nil, 0, fmt.Errorf("query embedding: %w", err)
 	}
 	dist := fmt.Sprintf("embedding OPERATOR(%s.<=>) $1::%s.halfvec", extSchema, extSchema)
 	q := fmt.Sprintf(`
@@ -153,16 +165,17 @@ SELECT doc_key, chunk_index, 1 - (%s) AS score
 
 	tx, err := v.pg.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, fmt.Errorf("begin chunk knn tx: %w", err)
+		return nil, 0, fmt.Errorf("begin chunk knn tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := tuneHNSWRecall(ctx, tx, k); err != nil {
-		return nil, err
+	rowCap, err := tuneHNSWRecall(ctx, tx, k)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	rows, err := tx.QueryContext(ctx, q, literal, k)
 	if err != nil {
-		return nil, fmt.Errorf("chunk knn query: %w", err)
+		return nil, 0, fmt.Errorf("chunk knn query: %w", err)
 	}
 	defer rows.Close()
 	defer func() { _ = rows.Close() }()
@@ -171,16 +184,16 @@ SELECT doc_key, chunk_index, 1 - (%s) AS score
 	for rows.Next() {
 		var h chunkHit
 		var score float64
-		if err := rows.Scan(&h.docKey, &h.chunkIndex, &score); err != nil {
-			return nil, fmt.Errorf("scanning chunk knn row: %w", err)
+		if err := rows.Scan(&h.Doc, &h.ChunkIndex, &score); err != nil {
+			return nil, 0, fmt.Errorf("scanning chunk knn row: %w", err)
 		}
-		h.score = float32(score)
+		h.Score = float32(score)
 		hits = append(hits, h)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating chunk knn rows: %w", err)
+		return nil, 0, fmt.Errorf("iterating chunk knn rows: %w", err)
 	}
-	return hits, nil
+	return hits, rowCap, nil
 }
 
 // tuneHNSWRecall raises pgvector's per-scan HNSW candidate pool for the current
@@ -198,7 +211,8 @@ SELECT doc_key, chunk_index, 1 - (%s) AS score
 // going past ef_search. Older pgvector lacks that GUC and would abort the tx on
 // an unknown-GUC error, so it is probed first with current_setting(..., true)
 // (missing_ok), which yields NULL instead of erroring; a NULL result skips the
-// setting and leaves the 1000-row cap in place.
+// setting and leaves the 1000-row cap in place. tuneHNSWRecall returns the
+// most rows the scan can return: k, or 1000 when that cap stays in place.
 // hnswEfSearch clamps the KNN candidate-pool size k to pgvector's usable
 // hnsw.ef_search range [40, 1000]: never below the stock default 40 (so small-k
 // searches keep default recall) and never above pgvector's 1000 ceiling (past
@@ -208,50 +222,29 @@ func hnswEfSearch(k int) int {
 	return min(max(k, 40), 1000)
 }
 
-func tuneHNSWRecall(ctx context.Context, tx *sql.Tx, k int) error {
+func tuneHNSWRecall(ctx context.Context, tx *sql.Tx, k int) (int, error) {
 	efSearch := hnswEfSearch(k)
 	if _, err := tx.ExecContext(ctx,
 		fmt.Sprintf("SET LOCAL hnsw.ef_search = %d", efSearch)); err != nil {
-		return fmt.Errorf("setting hnsw.ef_search: %w", err)
+		return 0, fmt.Errorf("setting hnsw.ef_search: %w", err)
 	}
-	if k <= 1000 {
-		return nil
+	if k <= efSearch {
+		return k, nil
 	}
 	var current sql.NullString
 	if err := tx.QueryRowContext(ctx,
 		`SELECT current_setting('hnsw.iterative_scan', true)`,
 	).Scan(&current); err != nil {
-		return fmt.Errorf("probing hnsw.iterative_scan: %w", err)
+		return 0, fmt.Errorf("probing hnsw.iterative_scan: %w", err)
 	}
 	if !current.Valid {
-		return nil
+		return efSearch, nil
 	}
 	if _, err := tx.ExecContext(ctx,
 		"SET LOCAL hnsw.iterative_scan = 'relaxed_order'"); err != nil {
-		return fmt.Errorf("setting hnsw.iterative_scan: %w", err)
+		return 0, fmt.Errorf("setting hnsw.iterative_scan: %w", err)
 	}
-	return nil
-}
-
-// rollupChunkHits collapses chunk hits to one hit per document, keeping the
-// first (best) chunk seen per doc_key and preserving order, then truncates to
-// limit documents. hits must already be ordered best-first (the KNN query
-// orders by distance), so first-seen equals best-scoring — matching kit's
-// RollupByDocument intent without a re-sort.
-func rollupChunkHits(hits []chunkHit, limit int) []chunkHit {
-	seen := make(map[string]struct{}, len(hits))
-	out := make([]chunkHit, 0, len(hits))
-	for _, h := range hits {
-		if _, ok := seen[h.docKey]; ok {
-			continue
-		}
-		seen[h.docKey] = struct{}{}
-		out = append(out, h)
-	}
-	if limit >= 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
+	return k, nil
 }
 
 // vectorDoc is the subset of a vector_documents row needed to hydrate a chunk
@@ -277,7 +270,7 @@ func (v *vectorSearcher) hydrateHits(
 ) ([]db.VectorHit, error) {
 	docKeys := make([]string, len(hits))
 	for i, h := range hits {
-		docKeys[i] = h.docKey
+		docKeys[i] = h.Doc
 	}
 	docs, err := v.lookupDocs(ctx, docKeys)
 	if err != nil {
@@ -286,19 +279,19 @@ func (v *vectorSearcher) hydrateHits(
 
 	out := make([]db.VectorHit, 0, len(hits))
 	for _, h := range hits {
-		doc, ok := docs[h.docKey]
+		doc, ok := docs[h.Doc]
 		if !ok {
 			continue
 		}
 		anchorOrdinal, snippet := vector.DocAnchor(
-			doc.content, doc.offsets, doc.ordinal, h.chunkIndex, v.maxInputChars)
+			doc.content, doc.offsets, doc.ordinal, h.ChunkIndex, v.maxInputChars)
 		out = append(out, db.VectorHit{
 			SessionID:    doc.sessionID,
 			Ordinal:      anchorOrdinal,
 			OrdinalStart: doc.ordinal,
 			OrdinalEnd:   doc.ordinalEnd,
 			Subordinate:  doc.subordinate,
-			Score:        h.score,
+			Score:        h.Score,
 			Snippet:      snippet,
 		})
 	}
@@ -319,9 +312,11 @@ func (v *vectorSearcher) lookupDocs(
 		return docs, nil
 	}
 	rows, err := v.pg.QueryContext(ctx, `
-SELECT doc_key, session_id, ordinal, ordinal_end, subordinate, offsets, content
-  FROM vector_documents
- WHERE ordinal >= 0 AND doc_key = ANY($1)`, docKeys)
+SELECT d.doc_key, d.session_id, d.ordinal, d.ordinal_end,
+       d.subordinate OR `+db.SubordinateSessionSQL("s")+`, d.offsets, d.content
+  FROM vector_documents d
+  LEFT JOIN sessions s ON s.id = d.session_id
+ WHERE d.ordinal >= 0 AND d.doc_key = ANY($1)`, docKeys)
 	if err != nil {
 		return nil, fmt.Errorf("looking up search hit documents: %w", err)
 	}
@@ -363,10 +358,12 @@ func (v *vectorSearcher) ResolveMessageUnits(
 		return out, nil
 	}
 	stmt, err := v.pg.PrepareContext(ctx, `
-SELECT doc_key, ordinal, ordinal_end, subordinate
-  FROM vector_documents
- WHERE session_id = $1 AND ordinal >= 0 AND ordinal <= $2
- ORDER BY ordinal DESC LIMIT 1`)
+SELECT d.doc_key, d.ordinal, d.ordinal_end,
+       d.subordinate OR `+db.SubordinateSessionSQL("s")+`
+  FROM vector_documents d
+  LEFT JOIN sessions s ON s.id = d.session_id
+ WHERE d.session_id = $1 AND d.ordinal >= 0 AND d.ordinal <= $2
+ ORDER BY d.ordinal DESC LIMIT 1`)
 	if err != nil {
 		return nil, fmt.Errorf("resolve message units: %w", err)
 	}
@@ -396,25 +393,25 @@ SELECT doc_key, ordinal, ordinal_end, subordinate
 // SetVectorSearcher wires (or, with nil, clears) the PG semantic search
 // backend. Safe to call concurrently with SearchContent/HasSemantic.
 func (s *Store) SetVectorSearcher(searcher db.VectorSearcher) {
-	s.vectorMu.Lock()
-	defer s.vectorMu.Unlock()
-	s.vectorSearcher = searcher
+	s.runtimeState().vectorMu.Lock()
+	defer s.runtimeState().vectorMu.Unlock()
+	s.runtimeState().vectorSearcher = searcher
 }
 
 // getVectorSearcher returns the currently wired PG vector searcher, or nil.
 func (s *Store) getVectorSearcher() db.VectorSearcher {
-	s.vectorMu.RLock()
-	defer s.vectorMu.RUnlock()
-	return s.vectorSearcher
+	s.runtimeState().vectorMu.RLock()
+	defer s.runtimeState().vectorMu.RUnlock()
+	return s.runtimeState().vectorSearcher
 }
 
 // SetSemanticUnavailableReason records a human explanation for why semantic
 // search could not be wired (extension missing, no matching generation, stale
 // build), surfaced by semanticUnavailableError. Safe to call concurrently.
 func (s *Store) SetSemanticUnavailableReason(reason string) {
-	s.vectorMu.Lock()
-	defer s.vectorMu.Unlock()
-	s.semanticUnavailableReason = reason
+	s.runtimeState().vectorMu.Lock()
+	defer s.runtimeState().vectorMu.Unlock()
+	s.runtimeState().semanticUnavailableReason = reason
 }
 
 // semanticUnavailableError wraps db.ErrSemanticUnavailable with the recorded
@@ -422,11 +419,29 @@ func (s *Store) SetSemanticUnavailableReason(reason string) {
 // can explain why semantic search is off; without a reason it returns the
 // bare sentinel.
 func (s *Store) semanticUnavailableError() error {
-	s.vectorMu.RLock()
-	reason := s.semanticUnavailableReason
-	s.vectorMu.RUnlock()
+	s.runtimeState().vectorMu.RLock()
+	reason := s.runtimeState().semanticUnavailableReason
+	s.runtimeState().vectorMu.RUnlock()
 	if reason == "" {
 		return db.ErrSemanticUnavailable
 	}
 	return db.NewSemanticUnavailableError(reason)
+}
+
+// SemanticReadiness reports the already-negotiated PG semantic capability.
+// PG serve wires a searcher after finding a compatible generation, without
+// measuring archive coverage, so coverage counts remain unavailable.
+func (s *Store) SemanticReadiness(ctx context.Context) (db.SemanticReadiness, error) {
+	_ = ctx
+	s.runtimeState().vectorMu.RLock()
+	searcher := s.runtimeState().vectorSearcher
+	reason := s.runtimeState().semanticUnavailableReason
+	s.runtimeState().vectorMu.RUnlock()
+	if searcher != nil {
+		return db.SemanticReadiness{State: "ready", Reason: "counts_unavailable"}, nil
+	}
+	if reason == "" {
+		reason = "not_configured"
+	}
+	return db.SemanticReadiness{State: "unavailable", Reason: reason}, nil
 }

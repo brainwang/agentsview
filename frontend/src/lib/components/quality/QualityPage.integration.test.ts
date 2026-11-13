@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { analytics } from "../../stores/analytics.svelte.js";
@@ -521,9 +523,44 @@ describe("QualityPage evidence navigation", () => {
     router.params = {};
   });
 
+  it("labels pattern columns and keeps each grade count beside its letter", async () => {
+    component = mount(QualityPage, { target: document.body });
+    await flushEffects();
+
+    const card = document.querySelector<HTMLElement>(".pattern-card")!;
+    const head = Array.from(card.querySelectorAll(".driver-head span"), (cell) =>
+      cell.textContent?.trim(),
+    );
+    expect(head).toEqual(["Signal", "Count", "Sessions", "Outcome"]);
+
+    const row = card.querySelector<HTMLButtonElement>(".driver-row")!;
+    const [label, ...values] = Array.from(row.children, (cell) => cell.textContent?.trim());
+    expect(values).toEqual(["2", "2", "Examples only"]);
+    expect(row.getAttribute("aria-label")).toBe(`${label}: 2, 2 sessions, Examples only`);
+
+    const grades = Array.from(document.querySelectorAll(".grade-bar"), (bar) =>
+      Array.from(bar.children, (cell) => cell.textContent?.trim()).slice(0, 2),
+    );
+    expect(grades.slice(0, 2)).toEqual([
+      ["A", "1"],
+      ["B", "1"],
+    ]);
+  });
+
+  it("reports the analytics kind when signal evidence fails", async () => {
+    vi.spyOn(AnalyticsService, "getApiV1AnalyticsSignalSessions").mockRejectedValueOnce(
+      new Error("Evidence failed"),
+    );
+    component = mount(QualityPage, { target: document.body });
+    await flushEffects();
+    document.querySelector<HTMLButtonElement>(".driver-row")!.click();
+    await vi.waitFor(() => expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics"));
+  });
+
   it("navigates with the clicked example's session and message ordinal", async () => {
     vi.spyOn(AnalyticsService, "getApiV1AnalyticsSignalSessions").mockResolvedValue({
       signal: "short_prompt_count",
+      total: 2,
       sessions: [
         {
           session_id: "first-session",

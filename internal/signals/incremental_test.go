@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // newTestRand returns a deterministic RNG so failures reproduce.
@@ -57,6 +59,11 @@ func parityRow(rng *rand.Rand, ordinal int) ToolCallRow {
 		InputJSON:      input,
 		MessageOrdinal: ordinal,
 		EventStatus:    parityResultStatuses[rng.Intn(len(parityResultStatuses))],
+	}
+	if rng.Intn(5) == 0 {
+		// Archives that omit tool content keep the target path but no input.
+		row.FilePath = parser.ResolveFilePathFromJSON(row.InputJSON)
+		row.InputJSON = ""
 	}
 	if row.EventStatus == "" && rng.Intn(8) == 0 {
 		// Content-based failure for pending Bash calls.
@@ -350,6 +357,30 @@ func TestIncrementalFoldRetryAcrossSeed(t *testing.T) {
 		// Calls 0..(2+step) share name+input: a run of step+3 calls
 		// yields runLen-1 = step+2 retries.
 		assert.Equal(t, step+2, got.RetryCount, "step %d", step)
+		row = ToolHealthRow{RetryCount: got.RetryCount}
+		state = next
+	}
+}
+
+// TestIncrementalFoldMissingInputIsNotRetry pins retry folding for archives
+// that drop tool inputs: calls that share only a name never form a run.
+func TestIncrementalFoldMissingInputIsNotRetry(t *testing.T) {
+	mk := func(ordinal int) ToolCallRow {
+		return ToolCallRow{
+			ToolName: "Bash", Category: "Bash",
+			MessageOrdinal: ordinal, EventStatus: "completed",
+		}
+	}
+	state := SeedIncrementalState(
+		[]ToolCallRow{mk(0), mk(1)}, nil, "", "", nil, nil, 0, 0, 0,
+	)
+	row := ToolHealthRow{}
+	for step := range 4 {
+		next, got, ok := state.FoldToolHealth(
+			[]ToolCallRow{mk(2 + step)}, nil, row,
+		)
+		require.True(t, ok)
+		assert.Zero(t, got.RetryCount, "step %d", step)
 		row = ToolHealthRow{RetryCount: got.RetryCount}
 		state = next
 	}
@@ -665,7 +696,7 @@ func TestFoldRunawayWindowCrossingNewRetainedBoundaryLatches(t *testing.T) {
 func TestIncrementalStateUnmarshalInitializesMutableMaps(t *testing.T) {
 	var state IncrementalState
 	require.NoError(t, state.UnmarshalBinary([]byte(
-		`{"codec_version":3,"total_calls":0}`,
+		fmt.Sprintf(`{"codec_version":%d,"total_calls":0}`, IncrementalStateCodecVersion),
 	)))
 	require.NotNil(t, state.EditLast)
 	require.NotNil(t, state.ModelCounts)

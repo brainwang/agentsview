@@ -57,33 +57,6 @@ func collectLiveActivityTargets(
 	return targets, errors.Join(targetErrors...)
 }
 
-func newLiveActivityLookup(database *db.DB) agentsync.LiveActivityLookup {
-	return func(
-		ctx context.Context,
-		fullSessionID string,
-	) (agentsync.LiveActivitySource, bool, error) {
-		session, err := database.GetSessionFull(ctx, fullSessionID)
-		if err != nil {
-			return agentsync.LiveActivitySource{}, false, err
-		}
-		if session == nil || session.FilePath == nil || *session.FilePath == "" {
-			return agentsync.LiveActivitySource{}, false, nil
-		}
-		source := agentsync.LiveActivitySource{Path: *session.FilePath}
-		if session.FileSize != nil && session.FileMtime != nil {
-			source.StoredSize = *session.FileSize
-			source.StoredMTimeNS = *session.FileMtime
-			source.HasStoredStat = true
-		}
-		if session.FileInode != nil && session.FileDevice != nil {
-			source.StoredInode = *session.FileInode
-			source.StoredDevice = *session.FileDevice
-			source.HasStoredIdentity = true
-		}
-		return source, true, nil
-	}
-}
-
 func trackLiveActivitySync(
 	idleTracker *server.IdleTracker,
 	syncPaths agentsync.LiveActivitySync,
@@ -101,11 +74,11 @@ func trackLiveActivitySync(
 func startLiveActivityRun(
 	ctx context.Context,
 	cancel context.CancelFunc,
-	poller *agentsync.LiveActivityPoller,
+	run func(context.Context),
 ) func() {
 	var workers sync.WaitGroup
 	workers.Go(func() {
-		poller.Run(ctx)
+		run(ctx)
 	})
 	var once sync.Once
 	return func() {
@@ -124,15 +97,22 @@ func startLiveActivityPoller(
 	idleTracker *server.IdleTracker,
 ) func() {
 	runCtx, cancel := context.WithCancel(ctx)
-	targets, err := collectLiveActivityTargets(runCtx, cfg)
-	if err != nil {
-		log.Printf("live activity target discovery: %v", err)
-	}
-	poller := agentsync.NewLiveActivityPoller(
-		targets,
-		newLiveActivityLookup(database),
-		trackLiveActivitySync(idleTracker, engine.SyncPathsContext),
-		log.Printf,
-	)
-	return startLiveActivityRun(runCtx, cancel, poller)
+	return startLiveActivityRun(runCtx, cancel, func(ctx context.Context) {
+		targets, err := collectLiveActivityTargets(ctx, cfg)
+		if err != nil {
+			log.Printf("live activity target discovery: %v", err)
+		}
+		poller := agentsync.NewLiveActivityPoller(
+			targets,
+			agentsync.DBLiveActivityLookup(database),
+			trackLiveActivitySync(idleTracker, engine.SyncPathsContext),
+			log.Printf,
+		)
+		poller.SetRecentLookup(
+			agentsync.DBRecentSessionLookup(
+				database, cfg.InstallationID, cfg.SourceMachines,
+			),
+		)
+		poller.Run(ctx)
+	})
 }

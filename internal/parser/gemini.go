@@ -140,7 +140,7 @@ func parseGeminiJSONObject(
 	return buildGeminiSession(
 		path, project, machine, info,
 		sessionID, startTime, lastUpdated,
-		firstMessage, messages,
+		firstMessage, root.Get("summary").Str, messages,
 	), messages, nil
 }
 
@@ -154,6 +154,7 @@ func parseGeminiJSONL(
 		startTime    time.Time
 		lastUpdated  time.Time
 		firstMessage string
+		summary      string
 		records      = make([]gjson.Result, 0)
 		recordIDs    = make(map[string]int)
 	)
@@ -186,11 +187,18 @@ func parseGeminiJSONL(
 			); ts.After(lastUpdated) {
 				lastUpdated = ts
 			}
+			if value := rec.Get("summary"); value.Exists() {
+				summary = value.Str
+			}
 		}
 		if ts := parseTimestamp(
 			rec.Get("$set.lastUpdated").Str,
 		); ts.After(lastUpdated) {
 			lastUpdated = ts
+		}
+		// saveSummary appends {"$set":{"summary":...}}; the latest wins.
+		if value := rec.Get("$set.summary"); value.Exists() {
+			summary = value.Str
 		}
 
 		msgType := rec.Get("type").Str
@@ -234,7 +242,7 @@ func parseGeminiJSONL(
 	return buildGeminiSession(
 		path, project, machine, info,
 		sessionID, startTime, lastUpdated,
-		firstMessage, messages,
+		firstMessage, summary, messages,
 	), messages, nil
 }
 
@@ -251,7 +259,7 @@ func parseGeminiMessage(
 		role = RoleAssistant
 	}
 	content, hasThinking, hasToolUse, tcs, trs := extractGeminiContent(msg)
-	if strings.TrimSpace(content) == "" {
+	if strings.TrimSpace(content) == "" && role != RoleAssistant {
 		return ParsedMessage{}, false
 	}
 
@@ -261,7 +269,7 @@ func parseGeminiMessage(
 	if tokResult.Exists() {
 		tokenUsage = normalizedGeminiTokenUsage(tok)
 	}
-	return ParsedMessage{
+	parsed := ParsedMessage{
 		Ordinal:       ordinal,
 		Role:          role,
 		Content:       content,
@@ -280,7 +288,11 @@ func parseGeminiMessage(
 		HasOutputTokens: tokResult.Get("output").Exists() ||
 			tokResult.Get("thoughts").Exists(),
 		tokenPresenceKnown: true,
-	}, true
+	}
+	if strings.TrimSpace(content) == "" {
+		return usageOnlyMessage(parsed)
+	}
+	return parsed, true
 }
 
 func applyGeminiCumulativeDeltas(messages []ParsedMessage) {
@@ -331,10 +343,15 @@ func buildGeminiSession(
 	info os.FileInfo,
 	sessionID string,
 	startTime, lastUpdated time.Time,
-	firstMessage string,
+	firstMessage, summary string,
 	messages []ParsedMessage,
 ) *ParsedSession {
 	applyGeminiCumulativeDeltas(messages)
+	// Gemini CLI shows its generated summary as the session's name.
+	sessionName := strings.TrimSpace(summary)
+	if firstMessage == "" {
+		firstMessage = truncate(sessionName, 300)
+	}
 	var userCount int
 	for _, m := range messages {
 		if m.Role == RoleUser && m.Content != "" {
@@ -348,6 +365,7 @@ func buildGeminiSession(
 		Machine:          machine,
 		Agent:            AgentGemini,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startTime,
 		EndedAt:          lastUpdated,
 		MessageCount:     len(messages),

@@ -273,6 +273,76 @@ func TestPlanChangedPathsUnprovenPathsUseOwningProviderFallback(t *testing.T) {
 	}
 }
 
+func TestPlanChangedPathsPiArtifactBoundary(t *testing.T) {
+	for _, agent := range []parser.AgentType{parser.AgentPi, parser.AgentOMO, parser.AgentStepCode} {
+		for _, tc := range []struct {
+			name       string
+			path       string
+			rootOrder  string
+			wantSource bool
+		}{
+			{name: "artifact", path: "project/subagent-artifacts/outputs/copy.jsonl"},
+			{name: "nested artifact", path: "project/parent/run/subagent-artifacts/copy.jsonl"},
+			{name: "nested session", path: "project/parent/run/session.jsonl", wantSource: true},
+			{name: "similar directory", path: "project/subagent-artifacts-copy/session.jsonl", wantSource: true},
+			{name: "explicit root", path: "project/subagent-artifacts/session.jsonl", rootOrder: "only", wantSource: true},
+			{name: "broad root first", path: "project/subagent-artifacts/session.jsonl", rootOrder: "broad", wantSource: true},
+			{name: "explicit root first", path: "project/subagent-artifacts/session.jsonl", rootOrder: "explicit", wantSource: true},
+		} {
+			t.Run(string(agent)+"/"+tc.name, func(t *testing.T) {
+				root := t.TempDir()
+				artifactRoot := filepath.Join(root, "project", "subagent-artifacts")
+				roots := []string{root}
+				switch tc.rootOrder {
+				case "only":
+					roots = []string{artifactRoot}
+				case "broad":
+					roots = []string{root, artifactRoot}
+				case "explicit":
+					roots = []string{artifactRoot, root}
+				}
+				path := filepath.Join(root, filepath.FromSlash(tc.path))
+				for _, candidate := range []string{path, filepath.Join(root, "unrelated.jsonl")} {
+					require.NoError(t, os.MkdirAll(filepath.Dir(candidate), 0o755))
+					require.NoError(t, os.WriteFile(candidate, []byte(
+						"{\"type\":\"session\",\"id\":\"fixture\",\"cwd\":\"/work\"}\n",
+					), 0o600))
+				}
+				engine := NewEngine(t.Context(), dbtest.OpenTestDB(t), EngineConfig{
+					AgentDirs: map[parser.AgentType][]string{agent: roots},
+					Machine:   "remote",
+				})
+				t.Cleanup(engine.Close)
+
+				plan, err := engine.PlanChangedPathsContext(t.Context(), []string{path})
+				require.NoError(t, err)
+				type plannedWork struct {
+					Paths             []string
+					FallbackProviders []parser.AgentType
+				}
+				got := plannedWork{FallbackProviders: plan.FallbackProviders}
+				for _, file := range plan.Files {
+					got.Paths = append(got.Paths, file.Path)
+				}
+				want := plannedWork{}
+				if tc.wantSource {
+					want.Paths = []string{path}
+				}
+				assert.Equal(t, want, got)
+				if tc.wantSource {
+					return
+				}
+				result, err := engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+				require.NoError(t, err)
+				assert.Equal(t, ChangedPathSyncResult{
+					CachedSourceKeys:        map[string]struct{}{},
+					CachedFallbackProviders: map[parser.AgentType]int{},
+				}, result)
+			})
+		}
+	}
+}
+
 func TestPlanChangedPathsClaudeProcessesOnlyChangedSession(t *testing.T) {
 	root := t.TempDir()
 	projectDir := filepath.Join(root, "project-a")
@@ -744,7 +814,7 @@ func TestPlanChangedPathsRejectsUntrustedInputAndOwnership(t *testing.T) {
 
 	mismatched := factory
 	mismatched.agent = "different-owner"
-	engine.providerFactories[factory.agent] = mismatched
+	engine.sources().providerFactories[factory.agent] = mismatched
 	plan, err = engine.PlanChangedPathsContext(
 		t.Context(), []string{filepath.Join(root, "changed.jsonl")},
 	)
@@ -829,13 +899,96 @@ func TestDiscoverChangedPathFallbackIsProviderBounded(t *testing.T) {
 		factoryA.agent: {rootA}, factoryB.agent: {rootB},
 	}, factoryA, factoryB)
 
-	files, counts, err := engine.discoverChangedPathFallbackProviders(
+	discovery, err := engine.discoverChangedPathFallbackProviders(
 		t.Context(), []parser.AgentType{factoryA.agent},
 	)
 	require.NoError(t, err)
-	require.Len(t, files, 1)
-	assert.Equal(t, source, files[0].Path)
-	assert.Equal(t, map[parser.AgentType]int{factoryA.agent: 1}, counts)
+	require.Len(t, discovery.files, 1)
+	assert.Equal(t, source, discovery.files[0].Path)
+	assert.Equal(t, map[parser.AgentType]int{factoryA.agent: 1}, discovery.counts)
 	assert.Equal(t, 1, discoveriesA)
 	assert.Zero(t, discoveriesB)
+}
+
+func TestPlanChangedPathsAntigravityCompanions(t *testing.T) {
+	for _, provider := range []struct {
+		agent parser.AgentType
+		dir   string
+	}{
+		{parser.AgentAntigravityCLI, "antigravity-cli"},
+		{parser.AgentAntigravity, "antigravity"},
+	} {
+		for _, count := range []int{1, 64} {
+			t.Run(fmt.Sprintf("%s_sessions_%d", provider.agent, count), func(t *testing.T) {
+				root := t.TempDir()
+				nestedRoot := filepath.Join(root, provider.dir)
+				conversations := filepath.Join(nestedRoot, "conversations")
+				require.NoError(t, os.MkdirAll(conversations, 0o700))
+				for i := range count {
+					path := filepath.Join(conversations, fmt.Sprintf("session-%d.db", i))
+					require.NoError(t, os.WriteFile(path, nil, 0o600))
+				}
+				source := filepath.Join(conversations, "session-0.db")
+				engine := NewEngine(t.Context(), dbtest.OpenTestDB(t), EngineConfig{
+					AgentDirs: map[parser.AgentType][]string{
+						parser.AgentGemini: {root},
+						provider.agent:     {nestedRoot},
+					},
+					Machine: "remote",
+				})
+				t.Cleanup(engine.Close)
+
+				for _, suffix := range []string{"", "-wal", "-shm"} {
+					t.Run(suffix, func(t *testing.T) {
+						path := source + suffix
+						require.NoError(t, os.WriteFile(path, nil, 0o600))
+						plan, err := engine.PlanChangedPathsContext(t.Context(), []string{path})
+						require.NoError(t, err)
+						assert.Empty(t, plan.FallbackProviders,
+							"SQLite companions must not rescan overlapping roots")
+						if suffix == "-shm" {
+							assert.Empty(t, plan.Files, "a WAL index contains no session changes")
+						} else if assert.Len(t, plan.Files, 1) {
+							assert.Equal(t, source, plan.Files[0].Path)
+							assert.Equal(t, provider.agent, plan.Files[0].Agent)
+						}
+					})
+				}
+
+				require.NoError(t, os.Remove(source+"-shm"))
+				plan, err := engine.PlanChangedPathsContext(t.Context(), []string{source + "-shm"})
+				require.NoError(t, err)
+				assert.Empty(t, plan.Files)
+				assert.Empty(t, plan.FallbackProviders, "removed SHM files are also non-data")
+
+				plan, err = engine.PlanChangedPathsContext(t.Context(),
+					[]string{filepath.Join(conversations, "unknown.bin")})
+				require.NoError(t, err)
+				assert.Equal(t, []parser.AgentType{provider.agent}, plan.FallbackProviders,
+					"unknown nested inputs must retain their conservative fallback")
+			})
+		}
+	}
+}
+
+func TestPlanChangedPathsAntigravityTitleStoreIndex(t *testing.T) {
+	root := t.TempDir()
+	ideRoot := filepath.Join(root, "antigravity")
+	require.NoError(t, os.MkdirAll(ideRoot, 0o700))
+	engine := NewEngine(t.Context(), dbtest.OpenTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentGemini:      {root},
+			parser.AgentAntigravity: {ideRoot},
+		},
+		Machine: "remote",
+	})
+	t.Cleanup(engine.Close)
+
+	path := filepath.Join(ideRoot, parser.AntigravitySummariesDBName+"-shm")
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+	plan, err := engine.PlanChangedPathsContext(t.Context(), []string{path})
+	require.NoError(t, err)
+	assert.Empty(t, plan.Files)
+	assert.Empty(t, plan.FallbackProviders,
+		"reading titles rewrites their WAL index without changing any session")
 }
