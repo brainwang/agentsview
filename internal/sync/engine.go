@@ -7088,7 +7088,7 @@ func reconciliationSourceIdentity(agent parser.AgentType, source parser.SourceRe
 
 func isOpenCodeFormatAgent(agent parser.AgentType) bool {
 	switch agent {
-	case parser.AgentOpenCode, parser.AgentKilo, parser.AgentMiMoCode, parser.AgentIcodemate:
+	case parser.AgentOpenCode, parser.AgentKilo, parser.AgentMiMoCode, parser.AgentIcodemate, parser.AgentCodefreeO:
 		return true
 	default:
 		return false
@@ -20947,6 +20947,8 @@ func resolveOpenCodeFormatSource(
 		return parser.ResolveMiMoCodeSource(dir)
 	case parser.AgentIcodemate:
 		return parser.ResolveIcodemateSource(dir)
+	case parser.AgentCodefreeO:
+		return parser.ResolveCodefreeOSource(dir)
 	default:
 		return parser.OpenCodeSource{}
 	}
@@ -20964,6 +20966,8 @@ func openCodeFormatSourceMtime(ctx context.Context,
 		return parser.MiMoCodeSourceMtime(ctx, path)
 	case parser.AgentIcodemate:
 		return parser.IcodemateSourceMtime(ctx, path)
+	case parser.AgentCodefreeO:
+		return parser.CodefreeOSourceMtime(ctx, path)
 	default:
 		return 0, fmt.Errorf("unknown OpenCode-format agent: %s", agent)
 	}

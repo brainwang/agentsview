@@ -105,7 +105,8 @@ func IsOpenCodeFormatStorageAgent(agent parser.AgentType) bool {
 	return agent == parser.AgentOpenCode ||
 		agent == parser.AgentKilo ||
 		agent == parser.AgentIcodemate ||
-		agent == parser.AgentMiMoCode
+		agent == parser.AgentMiMoCode ||
+		agent == parser.AgentCodefreeO
 }
 
 // OpenCodeFormatDBName returns the provider's OpenCode-format container name.
@@ -119,6 +120,8 @@ func OpenCodeFormatDBName(agent parser.AgentType) string {
 		return "mimocode.db"
 	case parser.AgentIcodemate:
 		return "icodemate.db"
+	case parser.AgentCodefreeO:
+		return "codefree.db"
 	default:
 		return ""
 	}

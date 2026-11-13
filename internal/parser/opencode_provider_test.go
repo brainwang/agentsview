@@ -2105,6 +2105,7 @@ func TestSQLiteContainerListsWatermarkOnlyNilKeepsFullFidelity(t *testing.T) {
 func TestOpenCodeFamilyVariantsHonorWatermarkListing(t *testing.T) {
 	for _, agent := range []AgentType{
 		AgentOpenCode, AgentKilo, AgentMiMoCode, AgentIcodemate,
+		AgentCodefreeO,
 	} {
 		t.Run(string(agent), func(t *testing.T) {
 			root := t.TempDir()

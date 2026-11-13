@@ -9,15 +9,15 @@ on:
   workflow_call:
   workflow_dispatch:
   # macOS builds live in desktop-macos-main.yml.
-  push:
-    branches: [main]
-    paths:
-      - 'desktop/**'
-      - 'frontend/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/desktop-artifacts.yml'
-      - '.github/actions/build-desktop-artifact/**'
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'desktop/**'
+  #     - 'frontend/**'
+  #     - 'go.mod'
+  #     - 'go.sum'
+  #     - '.github/workflows/desktop-artifacts.yml'
+  #     - '.github/actions/build-desktop-artifact/**'
 permissions:
   contents: read
 
@@ -71,20 +71,20 @@ jobs:
             target_triple: ""
             artifact_name: agentsview-desktop-windows
             artifact_dir: desktop/src-tauri/target/release/bundle/nsis/
-          - name: Linux
-            os: ubuntu-latest
-            timeout: 74
-            bundle: appimage
-            target_triple: ""
-            artifact_name: agentsview-desktop-linux
-            artifact_dir: desktop/src-tauri/target/release/bundle/appimage/
-          - name: Linux (arm64)
-            os: ubuntu-22.04-arm
-            timeout: 23
-            bundle: appimage
-            target_triple: aarch64-unknown-linux-gnu
-            artifact_name: agentsview-desktop-linux-arm64
-            artifact_dir: desktop/src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/
+          # - name: Linux
+          #   os: ubuntu-latest
+          #   timeout: 74
+          #   bundle: appimage
+          #   target_triple: ""
+          #   artifact_name: agentsview-desktop-linux
+          #   artifact_dir: desktop/src-tauri/target/release/bundle/appimage/
+          # - name: Linux (arm64)
+          #   os: ubuntu-22.04-arm
+          #   timeout: 23
+          #   bundle: appimage
+          #   target_triple: aarch64-unknown-linux-gnu
+          #   artifact_name: agentsview-desktop-linux-arm64
+          #   artifact_dir: desktop/src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/
     steps:
       - uses: actions/checkout@v7.0.1
         with:

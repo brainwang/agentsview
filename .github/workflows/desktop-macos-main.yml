@@ -7,15 +7,17 @@ env:
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'desktop/**'
-      - 'frontend/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/desktop-macos-main.yml'
-      - '.github/actions/build-desktop-artifact/**'
+  # macOS self-hosted workflows are push-only for main. The organization
+  # runner-group policy must pin access to their exact workflow paths on main.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'desktop/**'
+  #     - 'frontend/**'
+  #     - 'go.mod'
+  #     - 'go.sum'
+  #     - '.github/workflows/desktop-macos-main.yml'
+  #     - '.github/actions/build-desktop-artifact/**'
 
 permissions:
   contents: read

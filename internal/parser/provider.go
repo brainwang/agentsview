@@ -1308,6 +1308,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newMiMoCodeProviderFactory(def)
 	case AgentIcodemate:
 		return newIcodemateProviderFactory(def)
+	case AgentCodefreeO:
+		return newCodefreeOProviderFactory(def)
 	case AgentOpenHands:
 		return newOpenHandsProviderFactory(def)
 	case AgentOpenCode:
@@ -1380,6 +1382,10 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newClineProviderFactory(def)
 	case AgentCodebuff:
 		return newCodebuffProviderFactory(def)
+	case AgentTeleAgent:
+		return newTeleAgentProviderFactory(def)
+	case AgentCodeFree:
+		return newCodeFreeProviderFactory(def)
 	default:
 		panic("missing provider factory for " + string(def.Type))
 	}

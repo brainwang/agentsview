@@ -126,6 +126,13 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "Charm Crush",
   },
   { name: "muse", color: "var(--accent-sky)", label: "Muse Code" },
+  {
+    name: "codefree-o",
+    color: "var(--accent-purple)",
+    label: "Codefree-O",
+  },
+  { name: "teleagent", color: "var(--accent-amber)", label: "TeleAgent" },
+  { name: "codefree", color: "var(--accent-purple)", label: "CodeFree" },
 ];
 
 const agentColorMap = new Map(KNOWN_AGENTS.map((a) => [a.name, a.color]));

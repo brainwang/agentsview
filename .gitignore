@@ -91,3 +91,9 @@ graphify-out/
 
 # gotestsum JSON events and rerun reports written by CI test targets
 /gotestsum/
+
+# AI
+.opencode/
+opencode.json
+.codefree/
+.codefree-ide/specs/*/snapshots/**/*

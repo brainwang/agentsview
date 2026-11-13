@@ -5737,3 +5737,116 @@ schemas keep their existing ordering behavior.
 [grok-subagent-resume]: https://github.com/xai-org/grok-build/blob/d71f6e0c1f5acc5469e503e192fe14824e6f8c90/crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs#L1180-L1195
 [omo-configuration-paths]: https://github.com/code-yeongyu/senpi/blob/b50f58c8a21b0e94b12c4269a9a8c608e03d308c/packages/coding-agent/src/config.ts
 [omo-session-manager]: https://github.com/code-yeongyu/senpi/blob/b50f58c8a21b0e94b12c4269a9a8c608e03d308c/packages/coding-agent/src/core/session-manager.ts
+
+## TeleAgent (`teleagent`)
+
+- **Format:** Per-user SQLite archive at
+  `<data_dir>/users/<user_id>/teleagent.db` with three normalized tables:
+  `session` (id, title, directory, parent_id, time_created, time_updated,
+  plus project_id/slug/version/share_url/summary_* columns the parser does
+  not read), `message` (id, session_id, data JSON, time_created,
+  time_updated), and `part` (id, session_id, message_id, data JSON,
+  time_created, time_updated). The `message.data` JSON carries role,
+  model, provider, time, tokens, cost, and finish fields; the `part.data`
+  JSON carries a `type` enum (`text`, `reasoning`, `tool`, `step-start`,
+  `step-finish`, `compaction`, `file`). Tool parts are self-contained:
+  `callID` + `tool` + `state.{status,input,error}` + `output` +
+  `metadata.filepath` pack the call and its result in one row.
+
+- **Evidence:** `documentation`.
+
+- **Upstream:** TeleAgent (TeleAI 星辰超级智能体) is a local Electron
+  desktop agent. The schema reference at
+  `ref/teleagent-task-share/references/db-schema.md` documents the
+  three-table layout, the `part.data.type` enum, the self-contained `tool`
+  part structure, the `message.data` token/cost block, and the
+  `_SYS_MEMORY_*` session filter. No first-party source code is published;
+  the reference was produced from the export/import workflow documented in
+  `ref/teleagent-task-share/SKILL.md` and checked 2026-09-18 against a real
+  archive.
+
+- **Observation:** A real archive on this machine
+  (`v1_public_1903020978903908355`, observed 2026-09-18) contained 246
+  sessions, 4233 messages, 14527 parts, and 54 MB. 177 of 246 sessions
+  were `_SYS_MEMORY_DAILY_LOG_` (118) and `_SYS_MEMORY_MERGE_` (59)
+  system-maintenance rows filtered at discovery and parse time; 69 of 246
+  were real user sessions (56 top-level + 13 subagent-spawned via the
+  `task` tool with `parent_id` set). The `finish` field carried both
+  `tool_calls` (2384 messages) and `tool-calls` (785 messages) spellings,
+  confirming a TeleAgent client-version transition; the parser normalizes
+  both to `tool_calls`. 47 distinct tool names were observed, including
+  17 `cua-driver_*` and 8 `playwright_browser_*` family members mapped by
+  prefix.
+
+- **Usage and cost:** AgentsView maps `data.tokens.input` +
+  `data.tokens.cache.read` to `ContextTokens`, `data.tokens.output` to
+  `OutputTokens`, and preserves the raw `data.tokens` JSON on
+  `TokenUsage`. Session rollups use `accumulateMessageTokenUsageContext`.
+  `data.cost` is carried in the tokens JSON for downstream attribution
+  but not separately parsed in Phase 1.
+
+- **Agentsview:** `internal/parser/teleagent.go` (parse loop and
+  per-message builders), `internal/parser/teleagent_sqlite.go`
+  (read-only SQLite store with per-session meta listing, row loading,
+  fingerprint helper, and `VirtualSourcePath` integration), and
+  `internal/parser/teleagent_provider.go` (Provider interface
+  implementation with `Discover`/`FindSource`/`Fingerprint`/`Parse`/
+  `WatchPlan`/`SourcesForChangedPath`, two `SourceKind`s
+  `teleagentSourceSQLiteDB` and `teleagentSourceSQLiteSession`, modeled
+  on `kiro_provider.go`). `_SYS_` sessions are filtered at the SQL level
+  (`title NOT LIKE '_SYS\_%' ESCAPE '\' AND title != ''`). Configured
+  roots point at the `users/` parent; the provider auto-discovers the
+  first user subdirectory that contains a `teleagent.db`. Subagent
+  lineage is mapped via `parent_id` to `ParentSessionID` +
+  `RelSubagent`. The SQLite container is a persistent archive: a
+  vanished DB file preserves stored rows (skip without `ForceReplace`),
+  while a vanished row in a present DB force-replaces (tombstones the
+  stored session). `TestTeleAgentProvider_VanishedDBPreservesRows` and
+  `TestTeleAgentProvider_VanishedRowForceReplaces` verify both paths.
+
+## Codefree-O (`codefree-o`)
+
+- **Format:** OpenCode-compatible storage: JSON under
+  `<root>/.local/share/storage/session`, `storage/message`, and
+  `storage/part`, plus an OpenCode-shaped SQLite container at
+  `<root>/.local/share/codefree.db` whose `session`, `message`, and `part`
+  tables hold the same JSON payloads.
+- **Evidence:** `no-public-source`.
+- **Upstream:** Codefree-O is a fork of OpenCode with its own root
+  (`.codefree-o/.local/share`) and container name (`codefree.db`). First-party
+  source and documentation were searched 2026-11-13 without finding a public
+  repository or schema reference; the layout matches the OpenCode format
+  pinned in the `opencode` entry of this inventory.
+- **Usage and cost:** Assistant message data carries the same input, output,
+  reasoning, and cache-read/cache-write token fields as OpenCode. Agentsview
+  reads those fields and catalog-prices the tokens instead of trusting a
+  stored currency total.
+- **Agentsview:** `internal/parser/codefreeo.go` registers the agent and
+  relabels `internal/parser/opencode_provider.go` results from the `opencode:`
+  prefix to `codefree-o:`.
+
+## CodeFree (`codefree`)
+
+- **Format:** Per-session SQLite databases at
+  `<root>/agentSessionData/<sessionId>/session.db`, indexed by
+  `<root>/agentSessionData/__catalog__/session.db`. The catalog's
+  `session_metadata` table holds `codefree.catalog.v1`; each session DB holds
+  `codefree.state.v1` with the `session` block (sessionId, startTime,
+  modifiedTime, summary, workingDirectory) and `completedTurns`/`inFlightTurns`
+  whose `history.parts` carry `text` and `toolCall` entries and whose `usage`
+  block carries token counts and a model name.
+- **Evidence:** `no-public-source`.
+- **Upstream:** CodeFree IDE (研发云 CodeFree) is a closed-source Electron AI
+  coding assistant. First-party source and documentation were searched
+  2026-11-13 without a published result; the layout above was observed from a
+  local installation.
+- **Usage and cost:** Each completed turn's `usage` carries `inputTokens`,
+  `outputTokens`, `cacheReadTokens`, and a model name. Agentsview maps the
+  token fields and catalog-prices them instead of trusting the reported model
+  string.
+- **Agentsview:** `internal/parser/codefree.go` parses the state JSON,
+  `internal/parser/codefree_logs.go` and `codefree_logtools.go` recover
+  per-turn and per-tool-call timestamps from `agenthost.log`,
+  `internal/parser/codefree_sqlite.go` reads the catalog and session
+  containers, and `internal/parser/codefree_provider.go` implements discovery,
+  fingerprinting, parsing, and watch planning.

@@ -86,6 +86,7 @@ const (
 	AgentReasonix       AgentType = "reasonix"
 	AgentEvener         AgentType = "evener"
 	AgentIcodemate      AgentType = "icodemate"
+	AgentCodefreeO      AgentType = "codefree-o"
 	AgentRooCode        AgentType = "roocode"
 	AgentCline          AgentType = "cline"
 	AgentPoolside       AgentType = "poolside"
@@ -94,6 +95,8 @@ const (
 	AgentFreebuff       AgentType = "freebuff"
 	AgentCrush          AgentType = "crush"
 	AgentMuse           AgentType = "muse"
+	AgentTeleAgent      AgentType = "teleagent"
+	AgentCodeFree       AgentType = "codefree"
 )
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
@@ -338,6 +341,27 @@ var Registry = []AgentDef{
 		},
 		FileBased:      true,
 		WatchRootsFunc: ResolveOpenCodeWatchRoots,
+	},
+	{
+		// Codefree-O is a fork of OpenCode with an identical storage
+		// layout but a different root (".codefree-o/.local/share" so
+		// the on-disk tree is .codefree-o/.local/share/storage/session
+		// and the SQLite fallback is codefree.db) and a codefree-o:
+		// ID prefix. The OpenCode-format provider owns parsing and
+		// relabels results through relabelOpenCodeSessionAsCodefreeO.
+		Type:        AgentCodefreeO,
+		DisplayName: "Codefree-O",
+		EnvVar:      "CODEFREE_O_DIR",
+		ConfigKey:   "codefree_o_dirs",
+		DefaultDirs: []string{".codefree-o/.local/share"},
+		IDPrefix:    "codefree-o:",
+		WatchSubdirs: []string{
+			"storage/session",
+			"storage/message",
+			"storage/part",
+		},
+		FileBased:      true,
+		WatchRootsFunc: ResolveCodefreeOWatchRoots,
 	},
 	{
 		Type:        AgentOpenCodeReview,
@@ -1248,6 +1272,53 @@ var Registry = []AgentDef{
 		DefaultDirs:       []string{".local/share/muse/sessions"},
 		IDPrefix:          "muse:",
 		FileBased:         true,
+	},
+	{
+		// TeleAgent (TeleAI 星辰超级智能体) is a local Electron desktop
+		// agent that stores every session in a per-user SQLite archive at
+		// <data_dir>/users/<user_id>/teleagent.db. Configured roots point
+		// at the users/ parent; the provider auto-discovers the first
+		// user subdirectory that contains a teleagent.db. The 3-table
+		// (session/message/part) schema is parsed by teleagent.go; the
+		// SQLite container pattern mirrors Kiro's provider architecture.
+		Type:        AgentTeleAgent,
+		DisplayName: "TeleAgent",
+		EnvVar:      "TELEAGENT_DIR",
+		ConfigKey:   "teleagent_dirs",
+		DefaultDirs: []string{
+			// Windows
+			".local/share/TeleAgent/users",
+			// macOS
+			"Library/Application Support/TeleAgent/users",
+			".local/share/TeleAgent/users",
+			// Linux
+			".local/share/TeleAgent/users",
+			".config/TeleAgent/users",
+		},
+		IDPrefix:  "teleagent:",
+		FileBased: false,
+	},
+	{
+		// CodeFree IDE is a local Electron-based AI coding assistant
+		// (研发云 CodeFree). Session data is stored in per-session
+		// SQLite databases under agentSessionData/<sessionId>/session.db.
+		// The __catalog__/session.db index lists registered sessions.
+		// The provider reads codefree.state.v1 from each session DB,
+		// which contains the full conversation state as JSON.
+		Type:        AgentCodeFree,
+		DisplayName: "CodeFree",
+		EnvVar:      "CODEFREE_DIR",
+		ConfigKey:   "codefree_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Roaming/CodeFree/agentSessionData",
+			// macOS
+			"Library/Application Support/CodeFree/agentSessionData",
+			// Linux
+			".config/CodeFree/agentSessionData",
+		},
+		IDPrefix:  "codefree:",
+		FileBased: false,
 	},
 }
 

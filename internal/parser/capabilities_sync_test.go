@@ -137,6 +137,18 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			UnchangedResults:                    UnchangedResultMTimeAndHash,
 			FingerprintHashRequiredForFreshness: true,
 		},
+		AgentCodefreeO: {
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentTeleAgent: {
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentCodeFree: {
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
+		},
 		AgentOmnigent: {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
