@@ -9,8 +9,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/tidwall/gjson"
 )
 
 // codefreeTurnTimestamps holds the start and end times for a single
@@ -48,20 +46,13 @@ var codefreeLogTurnTerminalRe = regexp.MustCompile(
 // of every agenthost.log line: "2026-11-09 16:32:05.354".
 const codefreeLogTimestampLayout = "2006-01-02 15:04:05.000"
 
-// codefreeLogTimezone is the timezone used by CodeFree agenthost.log
-// timestamps. The log writes local wall-clock time, which is GMT+8
-// (Asia/Shanghai) in the deployment environment. time.Parse without a
-// zone returns UTC, so we must re-interpret the parsed time in the
-// correct zone and convert to UTC for storage.
-var codefreeLogTimezone = func() *time.Location {
-	loc, err := time.LoadLocation("Asia/Shanghai")
-	if err != nil {
-		// Fallback: fixed offset of +8 hours if the timezone
-		// database is not available.
-		return time.FixedZone("CST", 8*3600)
-	}
-	return loc
-}()
+// codefreeLogTimezoneDefault returns a default timezone for CodeFree log
+// parsing when no explicit location is provided. It uses the three-tier
+// resolution from resolveCodeFreeLogLocation with no anchor information,
+// which falls back to time.Local or a fixed +8 zone.
+func codefreeLogTimezoneDefault() *time.Location {
+	return resolveCodeFreeLogLocation("", "", 0)
+}
 
 // loadCodeFreeLogTimestamps scans all agenthost.log files under the
 // logs directory sibling to the agentSessionData root and builds a
@@ -78,7 +69,12 @@ var codefreeLogTimezone = func() *time.Location {
 //
 // If the logs directory does not exist or no log files are found, an
 // empty map and nil error are returned.
-func loadCodeFreeLogTimestamps(root string) (codefreeLogTimestampMap, error) {
+func loadCodeFreeLogTimestamps(
+	root string, loc *time.Location,
+) (codefreeLogTimestampMap, error) {
+	if loc == nil {
+		loc = codefreeLogTimezoneDefault()
+	}
 	logsDir := codefreeLogsDirForRoot(root)
 	if logsDir == "" {
 		return nil, nil
@@ -107,7 +103,7 @@ func loadCodeFreeLogTimestamps(root string) (codefreeLogTimestampMap, error) {
 			continue
 		}
 		logPath := filepath.Join(logsDir, entry.Name(), "agenthost.log")
-		if err := codefreeScanLogForTurnTimestamps(logPath, m); err != nil {
+		if err := codefreeScanLogForTurnTimestamps(logPath, loc, m); err != nil {
 			// A single unreadable log file should not prevent
 			// parsing. Skip it and continue with what we have.
 			continue
@@ -130,7 +126,7 @@ func codefreeLogsDirForRoot(root string) string {
 // codefreeScanLogForTurnTimestamps reads one agenthost.log file and
 // populates the map with Turn started / Turn terminal timestamps.
 func codefreeScanLogForTurnTimestamps(
-	logPath string, m codefreeLogTimestampMap,
+	logPath string, loc *time.Location, m codefreeLogTimestampMap,
 ) error {
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -145,7 +141,7 @@ func codefreeScanLogForTurnTimestamps(
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		codefreeParseLogLineForTurnTimestamp(line, m)
+		codefreeParseLogLineForTurnTimestamp(line, loc, m)
 	}
 	return scanner.Err()
 }
@@ -155,32 +151,17 @@ func codefreeScanLogForTurnTimestamps(
 // entry. The timestamp is parsed from the first 23 characters of the
 // line.
 func codefreeParseLogLineForTurnTimestamp(
-	line string, m codefreeLogTimestampMap,
+	line string, loc *time.Location, m codefreeLogTimestampMap,
 ) {
 	// Fast path: skip lines that don't contain the marker.
 	if !strings.Contains(line, "[CodeFree] Turn ") {
 		return
 	}
 
-	// Extract timestamp from the beginning of the line.
-	// Format: "2026-11-09 16:32:05.354 ..."
-	if len(line) < 23 {
+	ts, ok := codefreeParseLogTimestamp(line, loc)
+	if !ok {
 		return
 	}
-	ts, err := time.Parse(codefreeLogTimestampLayout, line[:23])
-	if err != nil {
-		return
-	}
-	// The log writes local wall-clock time (GMT+8). time.Parse
-	// without a zone returns UTC, which would make the stored
-	// timestamp 8 hours too late. Re-interpret the parsed
-	// wall-clock components in the correct zone, then convert to
-	// UTC for storage.
-	ts = time.Date(
-		ts.Year(), ts.Month(), ts.Day(),
-		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(),
-		codefreeLogTimezone,
-	).UTC()
 
 	// Try "Turn started" first.
 	if m2 := codefreeLogTurnStartedRe.FindStringSubmatch(line); m2 != nil {
@@ -204,122 +185,6 @@ func codefreeParseLogLineForTurnTimestamp(
 		entry.Terminal = ts
 		m[key] = entry
 	}
-}
-
-// codefreeToolOutputDir is the subdirectory under a session's working
-// directory where CodeFree writes tool call output files. Each terminal-
-// type tool call produces a file named "<toolCallId>-run_in_terminal.txt".
-const codefreeToolOutputDir = ".codefree" + string(filepath.Separator) + "tooloutput"
-
-// codefreeToolOutputSuffix is the filename suffix for terminal tool call
-// output files.
-const codefreeToolOutputSuffix = "-run_in_terminal.txt"
-
-// loadCodeFreeToolOutputTimestamps scans the working directory's
-// .codefree/tooloutput/ folder for files named
-// "<toolCallId>-run_in_terminal.txt" and uses their modification time
-// as a fallback timestamp source for turns that lack an agenthost.log
-// entry.
-//
-// The mtime of a tooloutput file approximates when the tool call was
-// executed, which is close to the turn's start time. When a turn has
-// multiple tool calls with output files, the earliest mtime is used
-// (closest to the turn start).
-//
-// This function only returns entries for turns that have at least one
-// matching tooloutput file. The caller should merge these into the log
-// timestamp map, giving log timestamps priority.
-//
-// If workingDir is empty or the tooloutput directory does not exist,
-// an empty map and nil error are returned.
-func loadCodeFreeToolOutputTimestamps(
-	workingDir, sessionID string, turns []gjson.Result,
-) codefreeLogTimestampMap {
-	if workingDir == "" || sessionID == "" || len(turns) == 0 {
-		return nil
-	}
-
-	toolOutputDir := filepath.Join(workingDir, codefreeToolOutputDir)
-
-	m := make(codefreeLogTimestampMap)
-
-	for _, turn := range turns {
-		turnID := turn.Get("history.turnId").Str
-		if turnID == "" {
-			continue
-		}
-		key := codefreeLogTimestampKey(sessionID, turnID)
-
-		parts := turn.Get("history.parts")
-		if !parts.IsArray() {
-			continue
-		}
-
-		var earliest time.Time
-		for _, part := range parts.Array() {
-			if part.Get("type").Str != "toolCall" {
-				continue
-			}
-			toolCallID := part.Get("toolCallId").Str
-			if toolCallID == "" {
-				continue
-			}
-
-			filename := toolCallID + codefreeToolOutputSuffix
-			filePath := filepath.Join(toolOutputDir, filename)
-			info, err := os.Stat(filePath)
-			if err != nil {
-				// File doesn't exist or is inaccessible — skip.
-				continue
-			}
-
-			mtime := info.ModTime()
-			if earliest.IsZero() || mtime.Before(earliest) {
-				earliest = mtime
-			}
-		}
-
-		if !earliest.IsZero() {
-			// Only set Started; Terminal is left zero since we
-			// can't determine turn end from tooloutput files.
-			m[key] = codefreeTurnTimestamps{Started: earliest}
-		}
-	}
-
-	if len(m) == 0 {
-		return nil
-	}
-	return m
-}
-
-// mergeToolOutputTimestamps adds entries from the tooloutput map only
-// for keys that do not already exist in the log map (log timestamps
-// take priority). The log map is modified in place.
-func mergeToolOutputTimestamps(
-	logTS, toolOutputTS codefreeLogTimestampMap,
-) codefreeLogTimestampMap {
-	if len(toolOutputTS) == 0 {
-		return logTS
-	}
-	if logTS == nil {
-		logTS = make(codefreeLogTimestampMap)
-	}
-	for key, ts := range toolOutputTS {
-		if existing, ok := logTS[key]; !ok || existing.Started.IsZero() {
-			// Only fill if the log map doesn't already have a
-			// valid Started timestamp for this turn.
-			if !ok {
-				logTS[key] = ts
-			} else {
-				// Key exists but Started is zero — fill in
-				// the Started from tooloutput, preserve
-				// any existing Terminal.
-				existing.Started = ts.Started
-				logTS[key] = existing
-			}
-		}
-	}
-	return logTS
 }
 
 // lookupTurnTimestamp returns the start timestamp for a turn from the

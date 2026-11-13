@@ -527,8 +527,9 @@ func TestCodefreeLogTimestampMap_Parse(t *testing.T) {
 		"2026-11-09 16:46:11.295 [info] [CodeFree] Turn started session=sess-2 turn=request_ccc authRevision=5 stage=preflight",
 		"some other log line without turn info",
 	}
+	loc := codefreeLogTimezoneDefault()
 	for _, line := range lines {
-		codefreeParseLogLineForTurnTimestamp(line, m)
+		codefreeParseLogLineForTurnTimestamp(line, loc, m)
 	}
 
 	// Turn aaa: started at 16:32:05.354 GMT+8, converted to 08:32:05.354 UTC.
@@ -568,7 +569,7 @@ func TestLoadCodeFreeLogTimestamps_NoLogsDir(t *testing.T) {
 	root := filepath.Join(tmp, "agentSessionData")
 	require.NoError(t, os.MkdirAll(root, 0o755))
 
-	m, err := loadCodeFreeLogTimestamps(root)
+	m, err := loadCodeFreeLogTimestamps(root, nil)
 	require.NoError(t, err)
 	assert.Empty(t, m)
 }
@@ -588,7 +589,7 @@ func TestLoadCodeFreeLogTimestamps_WithLogFile(t *testing.T) {
 	logPath := filepath.Join(logDir, "agenthost.log")
 	require.NoError(t, os.WriteFile(logPath, []byte(logContent), 0o644))
 
-	m, err := loadCodeFreeLogTimestamps(root)
+	m, err := loadCodeFreeLogTimestamps(root, nil)
 	require.NoError(t, err)
 	require.Len(t, m, 2)
 
@@ -619,7 +620,7 @@ func TestLoadCodeFreeLogTimestamps_TimezoneConversion(t *testing.T) {
 		filepath.Join(logDir, "agenthost.log"), []byte(logContent), 0o644,
 	))
 
-	m, err := loadCodeFreeLogTimestamps(root)
+	m, err := loadCodeFreeLogTimestamps(root, nil)
 	require.NoError(t, err)
 	require.Len(t, m, 1)
 
@@ -861,204 +862,301 @@ func TestLoadCodeFreeSession_PartialLogTimestamps(t *testing.T) {
 }
 
 // codefreeLogTimeToUTC parses a CodeFree agenthost.log timestamp string
-// (GMT+8 wall-clock time) and returns the equivalent UTC time. This
-// mirrors the conversion in codefreeParseLogLineForTurnTimestamp:
-// time.Parse returns UTC, so we must re-interpret the wall-clock
-// components in the GMT+8 zone and then convert to UTC.
+// (wall-clock time in the default log timezone) and returns the
+// equivalent UTC time. This mirrors the conversion in
+// codefreeParseLogTimestamp: time.Parse returns UTC, so we must
+// re-interpret the wall-clock components in the correct zone and then
+// convert to UTC.
 func codefreeLogTimeToUTC(t *testing.T, s string) time.Time {
 	ts, err := time.Parse(codefreeLogTimestampLayout, s)
 	require.NoError(t, err)
+	loc := codefreeLogTimezoneDefault()
 	return time.Date(
 		ts.Year(), ts.Month(), ts.Day(),
 		ts.Hour(), ts.Minute(), ts.Second(), ts.Nanosecond(),
-		codefreeLogTimezone,
+		loc,
 	).UTC()
 }
 
-// --- tooloutput mtime timestamp tests ---
+// --- tool-call-level timestamp tests ---
 
-func TestLoadCodeFreeToolOutputTimestamps_WithFile(t *testing.T) {
-	tmp := t.TempDir()
-	workingDir := filepath.Join(tmp, "project")
-	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
-	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
+func TestCodefreeParseLogTimestamp_Timezone(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600) // GMT+8
 
-	// Create a tooloutput file for toolCallId "tc-001".
-	toolCallID := "tc-001"
-	outFile := filepath.Join(toolOutputDir, toolCallID+codefreeToolOutputSuffix)
-	require.NoError(t, os.WriteFile(outFile, []byte("output"), 0o644))
-
-	// Set a known mtime on the file.
-	expectedMTime := time.Date(2026, 11, 10, 14, 30, 0, 0, time.UTC)
-	require.NoError(t, os.Chtimes(outFile, expectedMTime, expectedMTime))
-
-	// Build a turn JSON with a toolCall part referencing tc-001.
-	turnJSON := `{"history": {"turnId": "turn-mtime-1", "parts": [
-		{"type": "toolCall", "toolCallId": "tc-001", "toolId": "run_in_terminal"}
-	]}}`
-	turns := []gjson.Result{gjson.Parse(turnJSON)}
-
-	m := loadCodeFreeToolOutputTimestamps(workingDir, "sess-mtime", turns)
-	require.NotNil(t, m)
-	require.Len(t, m, 1)
-
-	ts, ok := m.lookupTurnTimestamp("sess-mtime", "turn-mtime-1")
+	// A wall-clock time of 08:05:13.159 in GMT+8 should be 00:05:13.159 UTC.
+	ts, ok := codefreeParseLogTimestamp("2026-11-11 08:05:13.159 [info] some event", loc)
 	require.True(t, ok)
-	assert.True(t, ts.Equal(expectedMTime),
-		"timestamp should match file mtime; got %v want %v", ts, expectedMTime)
+	assert.Equal(t, "2026-11-11T00:05:13.159Z", ts.UTC().Format(time.RFC3339Nano))
+
+	// Negative assertion: time.Parse without zone would give 08:05:13.159
+	// "UTC" (wrong by 8 hours). ts (00:05 UTC) is 8 hours earlier than
+	// raw (08:05 UTC), so raw.Sub(ts) == 8h.
+	raw, err := time.Parse(codefreeLogTimestampLayout, "2026-11-11 08:05:13.159")
+	require.NoError(t, err)
+	assert.Equal(t, 8*time.Hour, raw.Sub(ts),
+		"correctly parsed time should differ from naive UTC parse by exactly 8 hours")
+
+	// Short line — should fail.
+	_, ok = codefreeParseLogTimestamp("short", loc)
+	assert.False(t, ok)
+
+	// Bad timestamp — should fail.
+	_, ok = codefreeParseLogTimestamp("not-a-timestamp at all here!!!!", loc)
+	assert.False(t, ok)
 }
 
-func TestLoadCodeFreeToolOutputTimestamps_NoFile(t *testing.T) {
+func TestCodefreeCalibrateTimezoneFromAnchor(t *testing.T) {
 	tmp := t.TempDir()
-	workingDir := filepath.Join(tmp, "project")
-	// tooloutput dir exists but has no matching file.
-	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
-	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
+	// codefreeLogsDirForRoot(root) computes filepath.Dir(root)/"logs".
+	// We pass an "agentSessionData" subdirectory so that
+	// filepath.Dir(agentSessionData)/logs = tmp/logs.
+	agentSessionData := filepath.Join(tmp, "agentSessionData")
+	logsDir := filepath.Join(tmp, "logs", "20261111T080511")
+	require.NoError(t, os.MkdirAll(logsDir, 0o755))
 
-	turnJSON := `{"history": {"turnId": "turn-no-file", "parts": [
-		{"type": "toolCall", "toolCallId": "tc-missing", "toolId": "run_in_terminal"}
-	]}}`
-	turns := []gjson.Result{gjson.Parse(turnJSON)}
+	// session.startTime epoch = 2026-11-11T00:05:11.722Z (UTC).
+	// In GMT+8 wall-clock that is 08:05:11.722.
+	// Log first event: 08:05:11.723 (1ms later).
+	// offset = startTimeEpochMs - wallAsUTCMs = +8h (rounded to 15min multiples = +8h).
+	// residual = 1ms, well within 10 minutes.
+	startTimeEpochMs := time.Date(2026, 11, 11, 0, 5, 11, 722000000, time.UTC).UnixMilli()
 
-	m := loadCodeFreeToolOutputTimestamps(workingDir, "sess-no-file", turns)
-	// No matching file → nil or empty map.
+	logContent := "2026-11-11 08:05:11.723 [info] [CodeFree] Turn started session=sess-anchor turn=req_abc\n"
+	require.NoError(t, os.WriteFile(
+		filepath.Join(logsDir, "agenthost.log"), []byte(logContent), 0o644,
+	))
+
+	loc := codefreeCalibrateTimezoneFromAnchor(agentSessionData, "sess-anchor", startTimeEpochMs)
+	require.NotNil(t, loc, "anchor calibration should succeed")
+
+	// The offset should be +8 hours. A wall-clock time of 08:05 in a
+	// +8 zone is 00:05 UTC, which is 8 hours earlier than 08:05 UTC.
+	wall := time.Date(2026, 11, 11, 8, 5, 11, 723000000, loc)
+	wallUTC := time.Date(2026, 11, 11, 8, 5, 11, 723000000, time.UTC)
+	offset := wallUTC.Sub(wall)
+	assert.Equal(t, 8*time.Hour, offset, "calibrated offset should be +8 hours")
+
+	// Verify: parsing 08:05:11.723 in this zone gives 00:05:11.723 UTC.
+	ts, ok := codefreeParseLogTimestamp("2026-11-11 08:05:11.723 [info] event", loc)
+	require.True(t, ok)
+	assert.Equal(t, "2026-11-11T00:05:11.723Z", ts.UTC().Format(time.RFC3339Nano))
+}
+
+func TestCodefreeCalibrateTimezoneFromAnchor_ResidualTooLarge(t *testing.T) {
+	tmp := t.TempDir()
+	agentSessionData := filepath.Join(tmp, "agentSessionData")
+	logsDir := filepath.Join(tmp, "logs", "20261111T080511")
+	require.NoError(t, os.MkdirAll(logsDir, 0o755))
+
+	// startTime epoch = 2026-11-11T00:07:11.722Z.
+	// Log first event: 08:05:11.723 (wall-clock as UTC).
+	// offset = wallAsUTCMs - startTimeEpochMs = 7h58m + 1ms.
+	// Truncated to 15-min multiples = 7h45m.
+	// residual = 13m + 1ms > 10min → calibration fails.
+	startTimeEpochMs := time.Date(2026, 11, 11, 0, 7, 11, 722000000, time.UTC).UnixMilli()
+
+	logContent := "2026-11-11 08:05:11.723 [info] [CodeFree] Turn started session=sess-bad turn=req_xyz\n"
+	require.NoError(t, os.WriteFile(
+		filepath.Join(logsDir, "agenthost.log"), []byte(logContent), 0o644,
+	))
+
+	loc := codefreeCalibrateTimezoneFromAnchor(agentSessionData, "sess-bad", startTimeEpochMs)
+	assert.Nil(t, loc, "calibration should fail when residual > 10 minutes")
+}
+
+func TestLoadCodeFreeToolCallTimestamps_FourSources(t *testing.T) {
+	tmp := t.TempDir()
+	// codefreeLogsDirForRoot(root) computes filepath.Dir(root)/"logs".
+	// Pass an "agentSessionData" subdirectory so logs are found at
+	// tmp/logs/...
+	agentSessionData := filepath.Join(tmp, "agentSessionData")
+	logsDir := filepath.Join(tmp, "logs", "20261111T080500")
+	require.NoError(t, os.MkdirAll(logsDir, 0o755))
+
+	loc := time.FixedZone("CST", 8*3600)
+
+	// Source 1: renderer.log "Invoking client tool"
+	winDir := filepath.Join(logsDir, "window1")
+	require.NoError(t, os.MkdirAll(winDir, 0o755))
+	rendererContent := `2026-11-11 08:14:47.967 [info] [AgentHost] Invoking client tool: run_in_terminal (toolCallId=chatcmpl-tool-b65e37963593f3bb, runtimeToolName=run_in_terminal)
+`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(winDir, "renderer.log"), []byte(rendererContent), 0o644,
+	))
+
+	// Source 2+3: agenthost.log code_search.dispatch_started / operation_completed
+	// Source 4: overlap lines
+	agenthostContent := `2026-11-12 08:05:59.810 [info] [code-search] event=code_search.dispatch_started requestId=req_123 toolCallId=chatcmpl-tool-acaeaab3601404f9 status=running durationMs=0.00
+2026-11-12 08:05:59.855 [info] [code-search] event=code_search.operation_completed requestId=req_123 toolCallId=chatcmpl-tool-acaeaab3601404f9 status=completed durationMs=42.36
+2026-11-11 08:06:01.240 [info] [codeFree] sibling tool invokes overlapped: 3 calls in 47ms (ids=chatcmpl-tool-a370abc,chatcmpl-tool-b4acdef,chatcmpl-tool-89a3ghi)
+`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(logsDir, "agenthost.log"), []byte(agenthostContent), 0o644,
+	))
+
+	m := loadCodeFreeToolCallTimestamps(agentSessionData, loc)
+
+	// Source 1: Invoking client tool.
+	tc, ok := m["chatcmpl-tool-b65e37963593f3bb"]
+	require.True(t, ok, "renderer.log toolCall should be found")
+	assert.False(t, tc.Start.IsZero(), "Start should be set")
+	expectedStart := time.Date(2026, 11, 11, 0, 14, 47, 967000000, time.UTC)
+	assert.True(t, tc.Start.Equal(expectedStart),
+		"renderer Start: got %v want %v", tc.Start, expectedStart)
+
+	// Source 2+3: dispatch_started + operation_completed.
+	tc, ok = m["chatcmpl-tool-acaeaab3601404f9"]
+	require.True(t, ok, "code_search toolCall should be found")
+	assert.False(t, tc.Start.IsZero(), "Start should be set from dispatch_started")
+	assert.False(t, tc.End.IsZero(), "End should be set from operation_completed")
+	expectedDispatch := time.Date(2026, 11, 12, 0, 5, 59, 810000000, time.UTC)
+	expectedCompleted := time.Date(2026, 11, 12, 0, 5, 59, 855000000, time.UTC)
+	assert.True(t, tc.Start.Equal(expectedDispatch),
+		"dispatch Start: got %v want %v", tc.Start, expectedDispatch)
+	assert.True(t, tc.End.Equal(expectedCompleted),
+		"completed End: got %v want %v", tc.End, expectedCompleted)
+
+	// Source 4: overlap line — all 3 IDs share the same timestamp.
+	expectedOverlap := time.Date(2026, 11, 11, 0, 6, 1, 240000000, time.UTC)
+	for _, id := range []string{"chatcmpl-tool-a370abc", "chatcmpl-tool-b4acdef", "chatcmpl-tool-89a3ghi"} {
+		tc, ok := m[id]
+		require.True(t, ok, "overlap ID %s should be found", id)
+		assert.True(t, tc.Start.Equal(expectedOverlap),
+			"overlap Start for %s: got %v want %v", id, tc.Start, expectedOverlap)
+	}
+}
+
+func TestLoadCodeFreeToolCallTimestamps_MissingDir(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	m := loadCodeFreeToolCallTimestamps("/nonexistent/path", loc)
+	assert.NotNil(t, m)
 	assert.Empty(t, m)
 }
 
-func TestLoadCodeFreeToolOutputTimestamps_EmptyWorkingDir(t *testing.T) {
-	turnJSON := `{"history": {"turnId": "turn-empty-cwd", "parts": [
-		{"type": "toolCall", "toolCallId": "tc-001", "toolId": "run_in_terminal"}
-	]}}`
-	turns := []gjson.Result{gjson.Parse(turnJSON)}
+func TestCodefreeResolvePartTimestamps_Interpolation(t *testing.T) {
+	sessionStart := time.Date(2026, 11, 11, 0, 5, 0, 0, time.UTC)
+	sessionEnd := time.Date(2026, 11, 11, 1, 0, 0, 0, time.UTC)
+	turnStart := time.Date(2026, 11, 11, 0, 10, 0, 0, time.UTC)
+	turnEnd := time.Date(2026, 11, 11, 0, 15, 0, 0, time.UTC)
 
-	m := loadCodeFreeToolOutputTimestamps("", "sess-empty", turns)
-	assert.Nil(t, m)
+	// 5 parts: text, toolCall(real), text, toolCall(no log), toolCall(real)
+	partsJSON := `[
+		{"type": "text", "text": "hello"},
+		{"type": "toolCall", "toolCallId": "tc-real-1", "toolId": "run_in_terminal"},
+		{"type": "text", "text": "working..."},
+		{"type": "toolCall", "toolCallId": "tc-blind", "toolId": "read_file"},
+		{"type": "toolCall", "toolCallId": "tc-real-2", "toolId": "edit_file"}
+	]`
+	parts := gjson.Parse(partsJSON).Array()
+
+	toolCallTS := codefreeToolCallTimeMap{
+		"tc-real-1": {Start: time.Date(2026, 11, 11, 0, 11, 0, 0, time.UTC)},
+		"tc-real-2": {Start: time.Date(2026, 11, 11, 0, 14, 0, 0, time.UTC)},
+	}
+
+	result := codefreeResolvePartTimestamps(parts, turnStart, turnEnd, toolCallTS, sessionStart, sessionEnd)
+	require.Len(t, result, 5)
+
+	// Part 0 (text, no anchor before first real): gets first anchor time.
+	assert.Equal(t, toolCallTS["tc-real-1"].Start, result[0])
+	// Part 1 (toolCall, real): exact timestamp.
+	assert.Equal(t, toolCallTS["tc-real-1"].Start, result[1])
+	// Part 2 (text, between anchors): interpolated.
+	// Anchors at index 1 (00:11) and index 4 (00:14), gap=3, step=1min.
+	// Index 2 = 00:11 + 1min = 00:12.
+	expected2 := time.Date(2026, 11, 11, 0, 12, 0, 0, time.UTC)
+	assert.Equal(t, expected2, result[2])
+	// Part 3 (toolCall, blind): interpolated.
+	// Index 3 = 00:11 + 2min = 00:13.
+	expected3 := time.Date(2026, 11, 11, 0, 13, 0, 0, time.UTC)
+	assert.Equal(t, expected3, result[3])
+	// Part 4 (toolCall, real): exact timestamp.
+	assert.Equal(t, toolCallTS["tc-real-2"].Start, result[4])
+
+	// Monotonic non-decreasing.
+	for i := 1; i < len(result); i++ {
+		assert.False(t, result[i].Before(result[i-1]),
+			"result[%d] must not be before result[%d]", i, i-1)
+	}
 }
 
-func TestLoadCodeFreeToolOutputTimestamps_MultipleToolCalls_EarliestMTime(t *testing.T) {
-	tmp := t.TempDir()
-	workingDir := filepath.Join(tmp, "project")
-	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
-	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
+func TestCodefreeResolvePartTimestamps_NoAnchors(t *testing.T) {
+	sessionStart := time.Date(2026, 11, 11, 0, 5, 0, 0, time.UTC)
+	sessionEnd := time.Date(2026, 11, 11, 1, 0, 0, 0, time.UTC)
+	turnStart := time.Date(2026, 11, 11, 0, 10, 0, 0, time.UTC)
+	turnEnd := time.Date(2026, 11, 11, 0, 15, 0, 0, time.UTC)
 
-	// Create two tooloutput files with different mtimes.
-	file1 := filepath.Join(toolOutputDir, "tc-a"+codefreeToolOutputSuffix)
-	file2 := filepath.Join(toolOutputDir, "tc-b"+codefreeToolOutputSuffix)
-	require.NoError(t, os.WriteFile(file1, []byte("a"), 0o644))
-	require.NoError(t, os.WriteFile(file2, []byte("b"), 0o644))
+	partsJSON := `[
+		{"type": "text", "text": "hello"},
+		{"type": "toolCall", "toolCallId": "tc-blind", "toolId": "read_file"}
+	]`
+	parts := gjson.Parse(partsJSON).Array()
 
-	earlier := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
-	later := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
-	require.NoError(t, os.Chtimes(file1, earlier, earlier))
-	require.NoError(t, os.Chtimes(file2, later, later))
+	// No tool-call timestamps at all.
+	toolCallTS := codefreeToolCallTimeMap{}
 
-	// Turn has two tool calls; the earliest mtime should be used.
-	turnJSON := `{"history": {"turnId": "turn-multi", "parts": [
+	result := codefreeResolvePartTimestamps(parts, turnStart, turnEnd, toolCallTS, sessionStart, sessionEnd)
+	require.Len(t, result, 2)
+
+	// All parts should get turnStart (clamped).
+	assert.Equal(t, turnStart, result[0])
+	assert.Equal(t, turnStart, result[1])
+}
+
+func TestCodefreeClampTimestamp(t *testing.T) {
+	lo := time.Date(2026, 11, 11, 0, 5, 0, 0, time.UTC)
+	hi := time.Date(2026, 11, 11, 1, 0, 0, 0, time.UTC)
+
+	// Within range — unchanged.
+	mid := time.Date(2026, 11, 11, 0, 30, 0, 0, time.UTC)
+	assert.Equal(t, mid, codefreeClampTimestamp(mid, lo, hi))
+
+	// Before lo — clamped to lo.
+	before := time.Date(2026, 11, 11, 0, 1, 0, 0, time.UTC)
+	assert.Equal(t, lo, codefreeClampTimestamp(before, lo, hi))
+
+	// After hi — clamped to hi.
+	after := time.Date(2026, 11, 11, 2, 0, 0, 0, time.UTC)
+	assert.Equal(t, hi, codefreeClampTimestamp(after, lo, hi))
+
+	// Zero hi — only lower bound enforced.
+	assert.Equal(t, mid, codefreeClampTimestamp(mid, lo, time.Time{}))
+	assert.Equal(t, lo, codefreeClampTimestamp(before, lo, time.Time{}))
+}
+
+func TestCodefreeTurnStartFromToolCalls(t *testing.T) {
+	turnJSON := `{"history": {"turnId": "turn-1", "parts": [
+		{"type": "text", "text": "hello"},
 		{"type": "toolCall", "toolCallId": "tc-a", "toolId": "run_in_terminal"},
-		{"type": "toolCall", "toolCallId": "tc-b", "toolId": "run_in_terminal"}
+		{"type": "toolCall", "toolCallId": "tc-b", "toolId": "read_file"}
 	]}}`
-	turns := []gjson.Result{gjson.Parse(turnJSON)}
+	turn := gjson.Parse(turnJSON)
 
-	m := loadCodeFreeToolOutputTimestamps(workingDir, "sess-multi", turns)
-	require.NotNil(t, m)
+	// No tool-call timestamps.
+	_, ok := codefreeTurnStartFromToolCalls(turn, codefreeToolCallTimeMap{})
+	assert.False(t, ok)
 
-	ts, ok := m.lookupTurnTimestamp("sess-multi", "turn-multi")
+	// With timestamps — should return the earliest.
+	tsA := time.Date(2026, 11, 11, 0, 10, 0, 0, time.UTC)
+	tsB := time.Date(2026, 11, 11, 0, 9, 0, 0, time.UTC) // earlier
+	toolCallTS := codefreeToolCallTimeMap{
+		"tc-a": {Start: tsA},
+		"tc-b": {Start: tsB},
+	}
+	result, ok := codefreeTurnStartFromToolCalls(turn, toolCallTS)
 	require.True(t, ok)
-	assert.True(t, ts.Equal(earlier),
-		"should use earliest mtime; got %v want %v", ts, earlier)
+	assert.Equal(t, tsB, result, "should return earliest tool-call Start")
 }
 
-func TestMergeToolOutputTimestamps_LogPriority(t *testing.T) {
-	logTS := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
-	toolTS := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
-
-	logMap := codefreeLogTimestampMap{
-		"s/turn-log": {Started: logTS},
-		"s/turn-gap": {}, // exists but Started is zero
-	}
-
-	toolMap := codefreeLogTimestampMap{
-		"s/turn-log": {Started: toolTS}, // should NOT overwrite log
-		"s/turn-gap": {Started: toolTS}, // should fill the gap
-		"s/turn-new": {Started: toolTS}, // should be added
-	}
-
-	merged := mergeToolOutputTimestamps(logMap, toolMap)
-
-	// turn-log: log timestamp preserved.
-	ts, ok := merged.lookupTurnTimestamp("s", "turn-log")
-	require.True(t, ok)
-	assert.Equal(t, logTS, ts, "log timestamp must take priority over tooloutput")
-
-	// turn-gap: filled from tooloutput.
-	ts, ok = merged.lookupTurnTimestamp("s", "turn-gap")
-	require.True(t, ok)
-	assert.Equal(t, toolTS, ts, "gap should be filled from tooloutput")
-
-	// turn-new: added from tooloutput.
-	ts, ok = merged.lookupTurnTimestamp("s", "turn-new")
-	require.True(t, ok)
-	assert.Equal(t, toolTS, ts, "new entry should be added from tooloutput")
-}
-
-func TestLoadCodeFreeSession_WithToolOutputMTime(t *testing.T) {
-	tmp := t.TempDir()
-	root := filepath.Join(tmp, "agentSessionData")
-	require.NoError(t, os.MkdirAll(root, 0o755))
-
-	// No logs directory — log timestamps will be empty.
-
-	// Create a working directory with a tooloutput file.
-	workingDir := filepath.Join(tmp, "myproject")
-	toolOutputDir := filepath.Join(workingDir, ".codefree", "tooloutput")
-	require.NoError(t, os.MkdirAll(toolOutputDir, 0o755))
-	toolCallID := "tc-mtime-session"
-	outFile := filepath.Join(toolOutputDir, toolCallID+codefreeToolOutputSuffix)
-	require.NoError(t, os.WriteFile(outFile, []byte("terminal output"), 0o644))
-
-	// Set a known mtime.
-	expectedMTime := time.Date(2026, 11, 10, 15, 45, 0, 0, time.UTC)
-	require.NoError(t, os.Chtimes(outFile, expectedMTime, expectedMTime))
-
-	// Encode workingDir as a file:// URI (as CodeFree stores it).
-	cwdURI := "file:///" + filepath.ToSlash(workingDir)
-
-	// Create a session DB with a turn that has a toolCall part.
-	sessionDir := filepath.Join(root, "uuid-mtime")
-	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
-	dbPath := filepath.Join(sessionDir, codefreeSQLiteDBName)
-	_, db := newCodeFreeSQLiteTestDBAt(t, dbPath)
-	stateJSON := `{
-		"session": {"sessionId": "uuid-mtime", "startTime": 1000, "modifiedTime": 9999999999999, "summary": "MTime test", "workingDirectory": "` + cwdURI + `"},
-		"chats": [{"agent": {"uri": "codefree-agent://builtin/spec"}}],
-		"completedTurns": [
-			{"history": {"turnId": "turn-mtime", "userMessage": {"text": "run cmd"}, "parts": [
-				{"type": "text", "text": "running..."},
-				{"type": "toolCall", "toolCallId": "` + toolCallID + `", "toolId": "run_in_terminal"}
-			]}}
-		],
-		"inFlightTurns": []
-	}`
-	seedCodeFreeMetadata(t, db, codefreeStateKey, stateJSON)
-	db.Close()
-
-	store, err := OpenCodeFreeSQLiteStore(dbPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { store.Close() })
-
-	sess, msgs, err := loadCodeFreeSession(
-		context.Background(), store.db, dbPath, "uuid-mtime", "m", root,
-	)
-	require.NoError(t, err)
-	require.NotNil(t, sess)
-	require.Len(t, msgs, 2, "1 turn x 2 messages")
-
-	// The timestamp should come from the tooloutput file mtime, not
-	// from session-level interpolation (which would be time.UnixMilli(1000)).
-	assert.True(t, msgs[0].Timestamp.Equal(expectedMTime),
-		"user message should use tooloutput mtime; got %v want %v",
-		msgs[0].Timestamp, expectedMTime)
-	assert.True(t, msgs[1].Timestamp.Equal(expectedMTime),
-		"assistant message should use tooloutput mtime; got %v want %v",
-		msgs[1].Timestamp, expectedMTime)
+func TestResolveCodeFreeLogLocation_Fallback(t *testing.T) {
+	// No anchor info → should fall back to time.Local or fixed +8.
+	loc := resolveCodeFreeLogLocation("", "", 0)
+	require.NotNil(t, loc)
+	// Verify it produces a valid offset by constructing a time in
+	// this zone and comparing with UTC.
+	wall := time.Date(2026, 11, 11, 12, 0, 0, 0, loc)
+	wallUTC := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	offset := wall.Sub(wallUTC)
+	assert.GreaterOrEqual(t, offset, -12*time.Hour)
+	assert.LessOrEqual(t, offset, 14*time.Hour)
 }

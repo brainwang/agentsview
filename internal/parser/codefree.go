@@ -68,16 +68,25 @@ func loadCodeFreeSession(
 		return nil, nil, nil
 	}
 
-	// Try to load real per-turn timestamps from agenthost.log files.
-	// This is best-effort: if logs are unavailable or the turn is not
-	// found, the caller falls back to session-level interpolation.
-	logTS, err := loadCodeFreeLogTimestamps(root)
+	// Extract session startTime epoch for timezone anchor calibration.
+	startTimeEpochMs := gjson.Get(stateJSON, "session.startTime").Int()
+
+	// Resolve the timezone for parsing log wall-clock timestamps.
+	// Three-tier: anchor calibration → time.Local → fixed +8.
+	loc := resolveCodeFreeLogLocation(root, sessionID, startTimeEpochMs)
+
+	// Load turn-level timestamps from agenthost.log (Turn started /
+	// Turn terminal lines).
+	logTS, err := loadCodeFreeLogTimestamps(root, loc)
 	if err != nil {
-		// Log loading failures are non-fatal; proceed with empty map.
 		logTS = nil
 	}
 
-	return parseCodeFreeStateJSON(ctx, stateJSON, sessionID, machine, logTS)
+	// Load tool-call-level timestamps from agenthost.log and
+	// window*/renderer.log (four event types).
+	toolCallTS := loadCodeFreeToolCallTimestamps(root, loc)
+
+	return parseCodeFreeStateJSON(ctx, stateJSON, sessionID, machine, logTS, toolCallTS)
 }
 
 // parseCodeFreeStateJSON parses the codefree.state.v1 JSON value into
@@ -91,6 +100,7 @@ func parseCodeFreeStateJSON(
 	ctx context.Context,
 	stateJSON, sessionID, machine string,
 	logTS codefreeLogTimestampMap,
+	toolCallTS codefreeToolCallTimeMap,
 ) (*ParsedSession, []ParsedMessage, error) {
 	root := gjson.Parse(stateJSON)
 	session := root.Get("session")
@@ -120,12 +130,10 @@ func parseCodeFreeStateJSON(
 
 	// CodeFree state JSON does not carry per-turn or per-message
 	// timestamps — only session-level startTime and modifiedTime.
-	// We try to fill real per-turn timestamps from multiple sources,
-	// resolved in priority order:
-	//   1. Use agenthost.log timestamps for turns that have them.
-	//   2. For turns without a log entry, try the modification time
-	//      of tooloutput files (<cwd>/.codefree/tooloutput/
-	//      <toolCallId>-run_in_terminal.txt) as a fallback.
+	// We resolve timestamps in priority order:
+	//   1. Use agenthost.log Turn started/terminal timestamps.
+	//   2. For turns without a log entry, try the earliest tool-call
+	//      Start from the tool-call-level map.
 	//   3. Fill remaining missing turns from the nearest known
 	//      neighbour (linear interpolation).
 	//   4. If no timestamps exist at all, distribute the session
@@ -152,15 +160,30 @@ func parseCodeFreeStateJSON(
 		}
 	}
 
-	// Supplement log timestamps with tooloutput file mtimes for
-	// turns that lack a log entry. The working directory (sess.Cwd)
-	// is the session's workingDirectory decoded to a native path.
-	// Log timestamps take priority; tooloutput mtime only fills gaps.
-	if sess.Cwd != "" {
-		toolOutputTS := loadCodeFreeToolOutputTimestamps(
-			sess.Cwd, sessionID, allTurns,
-		)
-		logTS = mergeToolOutputTimestamps(logTS, toolOutputTS)
+	// Supplement log timestamps with tool-call-level timestamps for
+	// turns that lack a log entry. The earliest tool-call Start in a
+	// turn approximates the turn start time.
+	if toolCallTS != nil && len(allTurns) > 0 {
+		for i, turn := range allTurns {
+			turnID := allTurnIDs[i]
+			if turnID == "" {
+				continue
+			}
+			key := codefreeLogTimestampKey(sessionID, turnID)
+			if existing, ok := logTS[key]; ok && !existing.Started.IsZero() {
+				continue // log timestamp already present
+			}
+			if ts, ok := codefreeTurnStartFromToolCalls(turn, toolCallTS); ok {
+				if logTS == nil {
+					logTS = make(codefreeLogTimestampMap)
+				}
+				entry := logTS[key]
+				if entry.Started.IsZero() {
+					entry.Started = ts
+					logTS[key] = entry
+				}
+			}
+		}
 	}
 
 	turnTimestamps := resolveTurnTimestamps(
@@ -174,9 +197,27 @@ func parseCodeFreeStateJSON(
 			if err := contextErrEvery(ctx, i); err != nil {
 				return nil, nil, err
 			}
-			turnTime := turnTimestamps[i]
-			emitted := codefreeEmitTurnMessages(&messages, &ordinal, turn, turnTime)
-			_ = emitted
+			turnStart := turnTimestamps[i]
+			// Determine turn end: use log Terminal if available,
+			// otherwise the next turn's start, otherwise session end.
+			var turnEnd time.Time
+			turnID := turn.Get("history.turnId").Str
+			if turnID != "" {
+				key := codefreeLogTimestampKey(sessionID, turnID)
+				if entry, ok := logTS[key]; ok && !entry.Terminal.IsZero() {
+					turnEnd = entry.Terminal
+				}
+			}
+			if turnEnd.IsZero() && i+1 < len(turnTimestamps) {
+				turnEnd = turnTimestamps[i+1]
+			}
+			if turnEnd.IsZero() || !turnEnd.After(turnStart) {
+				turnEnd = sess.EndedAt
+			}
+			codefreeEmitTurnMessages(
+				&messages, &ordinal, turn, turnStart, turnEnd,
+				toolCallTS, sess.StartedAt, sess.EndedAt,
+			)
 		}
 	}
 
@@ -187,8 +228,18 @@ func parseCodeFreeStateJSON(
 			if err := contextErrEvery(ctx, i); err != nil {
 				return nil, nil, err
 			}
-			turnTime := turnTimestamps[totalCompleted+i]
-			codefreeEmitTurnMessages(&messages, &ordinal, turn, turnTime)
+			turnStart := turnTimestamps[totalCompleted+i]
+			var turnEnd time.Time
+			if totalCompleted+i+1 < len(turnTimestamps) {
+				turnEnd = turnTimestamps[totalCompleted+i+1]
+			}
+			if turnEnd.IsZero() || !turnEnd.After(turnStart) {
+				turnEnd = sess.EndedAt
+			}
+			codefreeEmitTurnMessages(
+				&messages, &ordinal, turn, turnStart, turnEnd,
+				toolCallTS, sess.StartedAt, sess.EndedAt,
+			)
 		}
 	}
 
@@ -215,20 +266,23 @@ func parseCodeFreeStateJSON(
 }
 
 // codefreeEmitTurnMessages emits user and assistant messages for one
-// CodeFree turn. turnTime is the timestamp assigned to every message
-// in this turn (CodeFree state JSON has no per-message timestamps, so
-// the caller distributes the session duration across turns). Returns
-// true if at least one message was emitted.
+// CodeFree turn. turnStart is the timestamp for the user message and
+// the baseline for assistant parts. Part-level timestamps are resolved
+// from tool-call-level data where available, with interpolation for
+// parts without real timestamps. Returns true if at least one message
+// was emitted.
 func codefreeEmitTurnMessages(
 	messages *[]ParsedMessage,
 	ordinal *int,
 	turn gjson.Result,
-	turnTime time.Time,
+	turnStart, turnEnd time.Time,
+	toolCallTS codefreeToolCallTimeMap,
+	sessionStart, sessionEnd time.Time,
 ) bool {
 	emitted := false
 	history := turn.Get("history")
 
-	// 1. User message.
+	// 1. User message — uses turn start time.
 	userText := history.Get("userMessage.text").Str
 	if userText != "" {
 		*messages = append(*messages, ParsedMessage{
@@ -236,7 +290,7 @@ func codefreeEmitTurnMessages(
 			Role:          RoleUser,
 			Content:       userText,
 			ContentLength: len(userText),
-			Timestamp:     turnTime,
+			Timestamp:     codefreeClampTimestamp(turnStart, sessionStart, sessionEnd),
 		})
 		*ordinal++
 		emitted = true
@@ -245,9 +299,10 @@ func codefreeEmitTurnMessages(
 	// 2. Assistant message from parts.
 	parts := history.Get("parts")
 	if parts.IsArray() {
+		partsArr := parts.Array()
 		var textParts []string
 		var toolCalls []ParsedToolCall
-		for _, part := range parts.Array() {
+		for _, part := range partsArr {
 			partType := part.Get("type").Str
 			switch partType {
 			case "text":
@@ -263,12 +318,26 @@ func codefreeEmitTurnMessages(
 
 		content := strings.Join(textParts, "\n")
 		if content != "" || len(toolCalls) > 0 {
+			// Resolve part-level timestamps for the assistant message.
+			// The assistant message timestamp uses the first part's
+			// resolved time (or turnStart if no parts have real
+			// timestamps).
+			partTimestamps := codefreeResolvePartTimestamps(
+				partsArr, turnStart, turnEnd,
+				toolCallTS, sessionStart, sessionEnd,
+			)
+			msgTS := turnStart
+			if len(partTimestamps) > 0 {
+				msgTS = partTimestamps[0]
+			}
+			msgTS = codefreeClampTimestamp(msgTS, sessionStart, sessionEnd)
+
 			msg := ParsedMessage{
 				Ordinal:       *ordinal,
 				Role:          RoleAssistant,
 				Content:       content,
 				ContentLength: len(content),
-				Timestamp:     turnTime,
+				Timestamp:     msgTS,
 			}
 			if len(toolCalls) > 0 {
 				msg.HasToolUse = true
