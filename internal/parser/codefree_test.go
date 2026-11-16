@@ -58,6 +58,55 @@ func TestCodefreeDecodeWorkingDir(t *testing.T) {
 	}
 }
 
+func TestParseCodeFreeStateJSON_Project(t *testing.T) {
+	// Force the lexical fallback so the expectation does not depend on
+	// whether the fixture working directory sits inside a Git repository
+	// on the host running the test.
+	origProbe := probeGitRootForCwd
+	t.Cleanup(func() { probeGitRootForCwd = origProbe })
+	probeGitRootForCwd = func(string) bool { return false }
+
+	cases := []struct {
+		name string
+		uri  string
+		want string
+	}{
+		{
+			name: "windows working directory",
+			uri:  "file:///d%3A/Temp/Download/sub-exam",
+			want: "sub_exam",
+		},
+		{
+			name: "windows drive root project",
+			uri:  "file:///d%3A/Temp/project",
+			want: "project",
+		},
+		{
+			name: "empty working directory falls back to unknown",
+			uri:  "",
+			want: "unknown",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stateJSON := `{
+				"session": {"sessionId": "uuid-project", "startTime": 1, "modifiedTime": 2, "summary": "Project", "workingDirectory": "` + tc.uri + `"},
+				"completedTurns": [
+					{"history": {"userMessage": {"text": "hi"}, "parts": [{"type": "text", "text": "hello"}]}}
+				],
+				"inFlightTurns": []
+			}`
+
+			sess, _, err := parseCodeFreeStateJSON(
+				context.Background(), stateJSON, "uuid-project", "m", nil, nil,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+			assert.Equal(t, tc.want, sess.Project)
+		})
+	}
+}
+
 func TestLoadCodeFreeSession_UserAndAssistant(t *testing.T) {
 	dbPath, db := newCodeFreeSQLiteTestDB(t)
 	stateJSON := `{

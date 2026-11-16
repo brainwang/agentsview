@@ -5834,7 +5834,8 @@ schemas keep their existing ordering behavior.
   `codefree.state.v1` with the `session` block (sessionId, startTime,
   modifiedTime, summary, workingDirectory) and `completedTurns`/`inFlightTurns`
   whose `history.parts` carry `text` and `toolCall` entries and whose `usage`
-  block carries token counts and a model name.
+  block carries token counts and a model name. `workingDirectory` supplies both
+  `Cwd` and, through the shared project resolver, `Project`.
 - **Evidence:** `no-public-source`.
 - **Upstream:** CodeFree IDE (研发云 CodeFree) is a closed-source Electron AI
   coding assistant. First-party source and documentation were searched

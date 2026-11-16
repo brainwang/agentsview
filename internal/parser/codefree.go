@@ -117,13 +117,23 @@ func parseCodeFreeStateJSON(
 		return nil, nil, nil
 	}
 
+	cwd := codefreeDecodeWorkingDir(session.Get("workingDirectory").Str)
+	// Mirror the TeleAgent provider: derive the project name from the
+	// decoded working directory so exports and the session list carry a
+	// real project label instead of an empty string.
+	project := ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
+	if project == "" {
+		project = "unknown"
+	}
+
 	sess := &ParsedSession{
 		ID:              "codefree:" + sessionID,
 		SourceSessionID: sessionID,
 		Agent:           AgentCodeFree,
+		Project:         project,
 		Machine:         machine,
 		SessionName:     session.Get("summary").Str,
-		Cwd:             codefreeDecodeWorkingDir(session.Get("workingDirectory").Str),
+		Cwd:             cwd,
 		StartedAt:       time.UnixMilli(session.Get("startTime").Int()),
 		EndedAt:         time.UnixMilli(session.Get("modifiedTime").Int()),
 	}
