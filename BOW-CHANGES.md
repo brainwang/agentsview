@@ -192,12 +192,13 @@ v0.43.0 的 `downloadAuthenticatedExport` 在本地连接（无 token）时使�
 ### 4. About 模态框新增 Bow 作者归属
 
 **功能描述：**
-在 About 模态框的作者行下方新增一行 "Bow (Codefree)" 归属。
+在 About 模态框的作者行下方新增一行 "BoWang@CT(Codefree-O+TeleAgent+CodefreeSpace)" 归属。
 
 **修改文件：**
 
 - `frontend/src/lib/components/modals/AboutModal.svelte`
-  - 在 "Kenn Software LLC" 作者行后新增空 label 行，值为 "Bow (Codefree)"
+  - 在 "Kenn Software LLC" 作者行后新增空 label 行，值为
+    "BoWang@CT(Codefree-O+TeleAgent+CodefreeSpace)"
 
 ---
 
