@@ -400,3 +400,13 @@ DeepSeek Harness 会话在界面（侧栏、会话面包屑）上显示为 "stan
 为 CodeFree 会话的消息和工具调用添加 per-turn 时间戳：优先从 CodeFree 运行日志（agenthost.log）提取真实时间戳，找不到时用相邻已知 turn 线性插值，全部缺失时用 session 级时间均匀插值。
 使用CodeFree SDD Spec: docs\specs\SPEC-AV-001
 
+## 20261116:CodeFree 会话 Project 提取修复
+
+CodeFree 解析器（`internal/parser/codefree.go`）从未给 `ParsedSession` 设置 `Project`，于是导出文件名退化成 `-<日期>.html`，会话列表与侧边栏也没有项目标签。改为照抄 TeleAgent provider 的做法：用已解码的 `workingDirectory` 经共享项目解析器推导项目名（在 Git 仓库内取仓库目录名，否则取路径末段），推导为空时回退 `unknown`。
+存量会话的 `project` 字段仍是空串，需要强制重解析（`agentsview source sync --full`）后才会补上。
+
+## 20261116:About 模态框作者归属文案更新
+
+About 模态框（`frontend/src/lib/components/modals/AboutModal.svelte`）的作者归属行由 "Bow (Codefree-O+TeleAgent)" 改为 "BoWang@CT(Codefree-O+TeleAgent+CodefreeSpace)"。
+前端为嵌入式打包，需重新构建前端资源后才会显示新文案。
+
